@@ -95,6 +95,7 @@ async def chunks_endpoint(repo_url: str, preview: int = 300):
                 "end_line": c.end_line,
                 "token_count": c.token_count,
                 "preview": c.embedding_text[:preview],
+                "embedding": c.embedding,
             }
             for i, c in enumerate(chunks)
         ],

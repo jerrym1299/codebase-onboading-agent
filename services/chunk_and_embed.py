@@ -13,6 +13,7 @@ import tree_sitter_javascript as tsjavascript
 import tree_sitter_typescript as tstypescript
 from tree_sitter import Language, Parser
 from dataclasses import dataclass, field
+from openai import OpenAI
 import tiktoken
 
 PY_LANGUAGE = Language(tspython.language())
@@ -33,7 +34,7 @@ MAX_TOKENS = 7500
 OVERLAP_LINES = 5  # lines of overlap when splitting oversized chunks
 
 encoder = tiktoken.encoding_for_model("text-embedding-3-small")
-
+client = OpenAI()
 
 @dataclass
 class CodeChunk:
@@ -45,6 +46,7 @@ class CodeChunk:
     start_line: int = 0
     end_line: int = 0
     metadata: dict = field(default_factory=dict)
+    embedding: list[float] | None = None
 
     @property
     def embedding_text(self) -> str:
@@ -480,4 +482,15 @@ def chunk_file_list(file_paths: list[str]) -> list[CodeChunk]:
         raw_chunks = _dispatch_extract(source, file_path=path)
         for chunk in raw_chunks:
             all_chunks.extend(split_oversized(chunk))
+
+    BATCH_SIZE = 100
+    for i in range(0, len(all_chunks), BATCH_SIZE):
+        batch = all_chunks[i:i + BATCH_SIZE]
+        resp = client.embeddings.create(
+            input=[c.embedding_text for c in batch],
+            model="text-embedding-3-small",
+        )
+        for chunk, datum in zip(batch, resp.data):
+            chunk.embedding = datum.embedding
+
     return all_chunks
