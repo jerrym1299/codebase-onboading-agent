@@ -1,0 +1,81 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: codebase_agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  temporal:
+    image: temporalio/auto-setup:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=postgres
+      - POSTGRES_PWD=postgres
+      - POSTGRES_SEEDS=postgres
+    ports:
+      - "7233:7233"
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  temporal-ui:
+    image: temporalio/ui:latest
+    restart: unless-stopped
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    ports:
+      - "8080:8080"
+    networks:
+      - backend
+
+  fastapi:
+    build:
+      context: .
+      dockerfile: dockerfile
+    restart: unless-stopped
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    depends_on:
+      temporal:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      - TEMPORAL_HOST=temporal:7233
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/codebase_agent
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - .:/app
+    networks:
+      - backend
+
+networks:
+  backend:
+    driver: bridge
+
+volumes:
+  postgres_data:

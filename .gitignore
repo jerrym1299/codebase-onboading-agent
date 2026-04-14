@@ -1,0 +1,29 @@
+                                                                    
+# Python
+__pycache__/                                                         
+*.pyc                                   
+*.pyo
+*.pyd                                                                
+.Python
+*.egg-info/                                                          
+.pytest_cache/  
+                                            
+# Virtual environments                  
+environment/
+venv/                                                                
+.venv/
+env/                                                                 
+                
+# Secrets and env files
+.env
+.env.local
+.env.*.local                                
+                                        
+# IDE
+.vscode/                                                             
+.idea/
+*.swp                                                                
+.DS_Store       
+                                            
+# Docker                                
+*.log
