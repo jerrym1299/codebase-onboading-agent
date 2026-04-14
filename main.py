@@ -11,6 +11,7 @@ from workflows import OnboardWorkflow
 from services.clone_repo import clone_repo
 from services.walk_repo import walk_repo, collect_file_paths
 from services.chunk_and_embed import chunk_file_list, py_parser, js_parser, ts_parser, tsx_parser
+from services.db import init_schema, store_chunks, close_pool
 
 _AST_PARSERS = {
     ".py": py_parser, ".js": js_parser, ".jsx": js_parser,
@@ -30,6 +31,7 @@ def _ast_dump(node, src: bytes, depth: int = 0, max_depth: int = 3) -> list[str]
 
 @asynccontextmanager
 async def lifespan(app):
+    await init_schema()
     client = await Client.connect(
         os.environ.get("TEMPORAL_HOST", "temporal:7233")
     )
@@ -40,8 +42,11 @@ async def lifespan(app):
         workflows=[OnboardWorkflow],
         activities=[onboard_activity],
     )
-    async with worker:
-        yield
+    try:
+        async with worker:
+            yield
+    finally:
+        await close_pool()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -81,9 +86,11 @@ async def chunks_endpoint(repo_url: str, preview: int = 300):
         return {"error": "Failed to clone repository"}
     paths = await collect_file_paths(repo_dir)
     chunks = chunk_file_list(paths)
+    stored = await store_chunks(repo_url, chunks)
     return {
         "file_count": len(paths),
         "chunk_count": len(chunks),
+        "stored": stored,
         "chunks": [
             {
                 "index": i,
