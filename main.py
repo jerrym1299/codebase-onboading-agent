@@ -8,6 +8,8 @@ from temporalio.worker import Worker
 
 from activities import onboard_activity
 from workflows import OnboardWorkflow
+from services.clone_repo import clone_repo
+from services.walk_repo import walk_repo
 
 
 @asynccontextmanager
@@ -43,3 +45,13 @@ async def onboard(name: str):
         task_queue="onboarding-queue",
     )
     return {"response": result}
+
+@app.get("/walkrepo/{repo_url:path}")
+async def walkrepo_endpoint(repo_url: str):
+    repo_dir = f"/repos/{uuid.uuid4()}"
+    cloned =  await clone_repo(repo_url, repo_dir)
+    if(not cloned):
+        return {"error": "Failed to clone repository"}
+    file_tree = await walk_repo(repo_dir)
+    print(file_tree)
+    return {"response": file_tree}
