@@ -16,3 +16,14 @@ async def walk_repo(repo_dir:str):
         for f in filenames:
             file_tree += f"{indent}{f}\n"
     return file_tree.strip()
+
+
+async def collect_file_paths(repo_dir: str) -> list[str]:
+    """Walk the repo and return a flat list of absolute file paths
+    (same filter as walk_repo). This is what chunk_file_list expects."""
+    paths: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(repo_dir):
+        dirpath, dirnames, filenames = keep_only_code_files(dirpath, dirnames, filenames)
+        for f in filenames:
+            paths.append(os.path.join(dirpath, f))
+    return paths
