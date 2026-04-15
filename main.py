@@ -1,9 +1,21 @@
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from temporalio.client import Client
 from agents import Runner
+from agents.exceptions import MaxTurnsExceeded
+
+
+def _raw_query_param(request: Request, key: str) -> str:
+    """Pull `key=...` from the raw query string with `%` treated as a literal char.
+    Only `+` is decoded to space — everything else is kept verbatim."""
+    raw = request.scope.get("query_string", b"").decode("utf-8", errors="replace")
+    prefix = f"{key}="
+    for part in raw.split("&"):
+        if part.startswith(prefix):
+            return part[len(prefix):].replace("+", " ")
+    return ""
 
 from services.clone_repo import ensure_repo_dir
 from services.walk_repo import walk_repo, collect_file_paths
@@ -90,15 +102,22 @@ async def ast_endpoint(repo_url: str, max_depth: int = 3):
 
 
 @app.get("/explore/{repo_url:path}")
-async def explore_endpoint(repo_url: str, query: str):
-    """Explore the codebase with the given query."""
+async def explore_endpoint(repo_url: str, request: Request):
+    """Explore the codebase with the given query. `query` is read raw — `%` is literal."""
+    query = _raw_query_param(request, "query")
+    if not query:
+        return {"error": "Missing 'query' parameter."}
     repo_dir = await ensure_repo_dir(repo_url)
     if repo_dir is None:
         return CLONE_FAILED
-    result = await Runner.run(
-        explorer_agent,
-        f"The codebase is at {repo_dir}. {query}",
-    )
+    try:
+        result = await Runner.run(
+            explorer_agent,
+            f"The codebase is at {repo_dir}. {query}",
+            max_turns=20,
+        )
+    except MaxTurnsExceeded:
+        return {"error": "Agent exceeded max turns — try a more specific query."}
     return {
         "response": str(result.final_output),
         "last_agent": result.last_agent.name,
