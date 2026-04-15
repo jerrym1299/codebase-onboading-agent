@@ -70,8 +70,7 @@ def _http_get(url: str, timeout: int = 180) -> dict:
 
 
 def _encode_query(q: str) -> str:
-    # Spaces → '+'. Keep other characters safe for a path segment.
-    return urllib.parse.quote(q.replace(" ", "+"), safe="+/.,:-_")
+    return q.replace(" ", "+")
 
 
 def index_repo(base: str, repo_url: str) -> None:
@@ -87,7 +86,7 @@ def index_repo(base: str, repo_url: str) -> None:
 
 def run_test(base: str, idx: int, category: str, expected_agent: str,
              question: str, grounding: list[str]) -> tuple[bool, bool, str, str]:
-    url = f"{base}/askQuestion/{REPO_URL}/{_encode_query(question)}"
+    url = f"{base}/askQuestion/{REPO_URL}?query={_encode_query(question)}"
     try:
         data = _http_get(url)
     except Exception as exc:

@@ -1,11 +1,21 @@
 import os
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from temporalio.client import Client
+from temporalio.worker import Worker
 from agents import Runner
 from agents.exceptions import MaxTurnsExceeded
 from agent_defs import router_agent
+
+from activities import (
+    WorkflowParams,
+    clone_repo_activity,
+    index_repo_activity,
+    ask_agent_activity,
+)
+from workflows import CodebaseOnboardingWorkflow
 
 def _raw_query_param(request: Request, key: str) -> str:
     """Pull `key=...` from the raw query string with `%` treated as a literal char.
@@ -29,10 +39,18 @@ CLONE_FAILED = {"error": "Failed to clone repository"}
 @asynccontextmanager
 async def lifespan(app):
     await init_schema()
-    app.state.temporal_client = await Client.connect(
+    client = await Client.connect(
         os.environ.get("TEMPORAL_HOST", "temporal:7233")
     )
-    yield
+    app.state.temporal_client = client
+    worker = Worker(
+        client,
+        task_queue="onboarding-queue",
+        workflows=[CodebaseOnboardingWorkflow],
+        activities=[clone_repo_activity, index_repo_activity, ask_agent_activity],
+    )
+    async with worker:
+        yield
     await close_pool()
 
 
@@ -167,35 +185,15 @@ async def search_endpoint(repo_url: str, request: Request, k: int = 10):
         ]
     }
 
-@app.get("/askQuestion/{repo_url:path}/{query:path}")
-async def askQuestion_endpoint(repo_url: str, query: str):
+@app.get("/askQuestion/{repo_url:path}")
+async def askQuestion_endpoint(repo_url: str, request: Request):
+    query = _raw_query_param(request, "query")
     if not query:
         return {"error": "Missing 'query' parameter."}
-    repo_url = repo_url.rstrip("/")
-    repo_dir = await ensure_repo_dir(repo_url)
-    if repo_dir is None:
-        return CLONE_FAILED
-    try:
-        result = await Runner.run(
-            router_agent,
-            (
-                f"Local codebase path (for list_files/read_file/git_log/search_code/find_references): {repo_dir}\n"
-                f"Indexed repo_url (for search_indexed): {repo_url}\n"
-                f"Question: {query}\n"
-                "Answer concisely, referencing specific files, lines, and functions."
-            ),
-            max_turns=20,
-        )
-    except MaxTurnsExceeded:
-        return {"error": "Agent exceeded max turns — try a more specific query."}
-    return {
-        "response": str(result.final_output),
-        "last_agent": result.last_agent.name,
-        "raw_responses": [
-            {
-                "role": getattr(item, "type", "unknown"),
-                "content": str(item),
-            }
-            for item in result.raw_responses
-        ],
-    }
+    result = await app.state.temporal_client.execute_workflow(
+        CodebaseOnboardingWorkflow.run,
+        WorkflowParams(repo_url=repo_url.rstrip("/"), query=query),
+        id=f"onboard-{uuid.uuid4()}",
+        task_queue="onboarding-queue",
+    )
+    return result
