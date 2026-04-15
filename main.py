@@ -1,40 +1,25 @@
 import os
-import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from temporalio.client import Client
-from temporalio.worker import Worker
 from agents import Runner
 
-from services.clone_repo import clone_repo
+from services.clone_repo import ensure_repo_dir
 from services.walk_repo import walk_repo, collect_file_paths
-from services.chunk_and_embed import chunk_file_list, py_parser, js_parser, ts_parser, tsx_parser
+from services.chunk_and_embed import chunk_file_list, AST_PARSERS, dump_ast
 from services.db import init_schema, store_chunks, close_pool
 from agent_defs import explorer_agent
-_AST_PARSERS = {
-    ".py": py_parser, ".js": js_parser, ".jsx": js_parser,
-    ".ts": ts_parser, ".tsx": tsx_parser,
-}
 
-
-def _ast_dump(node, src: bytes, depth: int = 0, max_depth: int = 3) -> list[str]:
-    if depth > max_depth:
-        return []
-    snippet = src[node.start_byte:node.end_byte].decode(errors="replace").split("\n")[0][:60]
-    lines = [f"{'  ' * depth}{node.type} [{node.start_point[0]}:{node.end_point[0]}]  {snippet!r}"]
-    for child in node.children:
-        lines.extend(_ast_dump(child, src, depth + 1, max_depth))
-    return lines
+CLONE_FAILED = {"error": "Failed to clone repository"}
 
 
 @asynccontextmanager
 async def lifespan(app):
     await init_schema()
-    client = await Client.connect(
+    app.state.temporal_client = await Client.connect(
         os.environ.get("TEMPORAL_HOST", "temporal:7233")
     )
-    app.state.temporal_client = client
     yield
     await close_pool()
 
@@ -47,27 +32,20 @@ def read_root():
     return {"Hello": "world"}
 
 
-
 @app.get("/walkrepo/{repo_url:path}")
 async def walkrepo_endpoint(repo_url: str):
-    repo_name = repo_url.rstrip("/").split("/")[-1].removesuffix(".git")
-    repo_dir = f"/repos/{repo_name}"
-    if not os.path.isdir(repo_dir):
-        if not await clone_repo(repo_url, repo_dir):
-            return {"error": "Failed to clone repository"}
-    file_tree = await walk_repo(repo_dir)
-    print(file_tree)
-    return {"response": file_tree}
+    repo_dir = await ensure_repo_dir(repo_url)
+    if repo_dir is None:
+        return CLONE_FAILED
+    return {"response": await walk_repo(repo_dir)}
 
 
 @app.get("/chunks/{repo_url:path}")
 async def chunks_endpoint(repo_url: str, preview: int = 300):
-    """Clone → collect paths → chunk. Returns chunk metadata + preview."""
-    repo_name = repo_url.rstrip("/").split("/")[-1].removesuffix(".git")
-    repo_dir = f"/repos/{repo_name}"
-    if not os.path.isdir(repo_dir):
-        if not await clone_repo(repo_url, repo_dir):
-            return {"error": "Failed to clone repository"}
+    """Clone → collect paths → chunk → store. Returns chunk metadata + preview."""
+    repo_dir = await ensure_repo_dir(repo_url)
+    if repo_dir is None:
+        return CLONE_FAILED
     paths = await collect_file_paths(repo_dir)
     chunks = chunk_file_list(paths)
     stored = await store_chunks(repo_url, chunks)
@@ -96,34 +74,27 @@ async def chunks_endpoint(repo_url: str, preview: int = 300):
 @app.get("/ast/{repo_url:path}")
 async def ast_endpoint(repo_url: str, max_depth: int = 3):
     """Clone → walk → dump tree-sitter AST for every .py/.js/.jsx/.ts/.tsx file."""
-    repo_name = repo_url.rstrip("/").split("/")[-1].removesuffix(".git")
-    repo_dir = f"/repos/{repo_name}"
-    if not os.path.isdir(repo_dir):
-        if not await clone_repo(repo_url, repo_dir):
-            return {"error": "Failed to clone repository"}
-    paths = await collect_file_paths(repo_dir)
+    repo_dir = await ensure_repo_dir(repo_url)
+    if repo_dir is None:
+        return CLONE_FAILED
 
     asts = {}
-    for path in paths:
-        ext = os.path.splitext(path)[1].lower()
-        parser_ = _AST_PARSERS.get(ext)
+    for path in await collect_file_paths(repo_dir):
+        parser_ = AST_PARSERS.get(os.path.splitext(path)[1].lower())
         if parser_ is None:
             continue
         with open(path, "rb") as f:
             src = f.read()
-        tree = parser_.parse(src)
-        asts[path] = _ast_dump(tree.root_node, src, max_depth=max_depth)
-    print(asts)
+        asts[path] = dump_ast(parser_.parse(src).root_node, src, max_depth=max_depth)
     return {"file_count": len(asts), "asts": asts}
+
 
 @app.get("/explore/{repo_url:path}")
 async def explore_endpoint(repo_url: str, query: str):
     """Explore the codebase with the given query."""
-    repo_name = repo_url.rstrip("/").split("/")[-1].removesuffix(".git")
-    repo_dir = f"/repos/{repo_name}"
-    if not os.path.isdir(repo_dir):
-        if not await clone_repo(repo_url, repo_dir):
-            return {"error": "Failed to clone repository"}
+    repo_dir = await ensure_repo_dir(repo_url)
+    if repo_dir is None:
+        return CLONE_FAILED
     result = await Runner.run(
         explorer_agent,
         f"The codebase is at {repo_dir}. {query}",
@@ -133,7 +104,7 @@ async def explore_endpoint(repo_url: str, query: str):
         "last_agent": result.last_agent.name,
         "raw_responses": [
             {
-                "role": item.type if hasattr(item, "type") else "unknown",
+                "role": getattr(item, "type", "unknown"),
                 "content": str(item),
             }
             for item in result.raw_responses

@@ -21,14 +21,10 @@ DATABASE_URL = os.environ.get(
 _pool: AsyncConnectionPool | None = None
 
 
-async def _configure(conn):
-    await register_vector_async(conn)
-
-
 async def get_pool() -> AsyncConnectionPool:
     global _pool
     if _pool is None:
-        _pool = AsyncConnectionPool(DATABASE_URL, configure=_configure, open=False)
+        _pool = AsyncConnectionPool(DATABASE_URL, configure=register_vector_async, open=False)
         await _pool.open()
     return _pool
 

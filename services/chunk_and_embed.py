@@ -1,6 +1,4 @@
 """
-chunker.py
-
 Takes a list of source file paths, parses each with Tree-sitter (Python/JS/TS/TSX),
 splits markdown by heading, and treats config/shell/markup files as whole-file chunks.
 All chunks are then split as needed to fit within text-embedding-3-small's 8191 token limit.
@@ -16,18 +14,16 @@ from dataclasses import dataclass, field
 from openai import OpenAI
 import tiktoken
 
-PY_LANGUAGE = Language(tspython.language())
-JS_LANGUAGE = Language(tsjavascript.language())
-TS_LANGUAGE = Language(tstypescript.language_typescript())
-TSX_LANGUAGE = Language(tstypescript.language_tsx())
+py_parser = Parser(Language(tspython.language()))
+js_parser = Parser(Language(tsjavascript.language()))
+ts_parser = Parser(Language(tstypescript.language_typescript()))
+tsx_parser = Parser(Language(tstypescript.language_tsx()))
 
-py_parser = Parser(PY_LANGUAGE)
-js_parser = Parser(JS_LANGUAGE)
-ts_parser = Parser(TS_LANGUAGE)
-tsx_parser = Parser(TSX_LANGUAGE)
-
-# Backwards-compat alias for existing callers
-parser = py_parser
+AST_PARSERS = {
+    ".py": py_parser,
+    ".js": js_parser, ".jsx": js_parser,
+    ".ts": ts_parser, ".tsx": tsx_parser,
+}
 
 # text-embedding-3-small limit is 8191, leave buffer for metadata prefix
 MAX_TOKENS = 7500
@@ -35,6 +31,17 @@ OVERLAP_LINES = 5  # lines of overlap when splitting oversized chunks
 
 encoder = tiktoken.encoding_for_model("text-embedding-3-small")
 client = OpenAI()
+
+
+def dump_ast(node, src: bytes, depth: int = 0, max_depth: int | None = 3) -> list[str]:
+    """Flatten a tree-sitter AST into indented `type [start:end]  'snippet'` lines."""
+    if max_depth is not None and depth > max_depth:
+        return []
+    snippet = src[node.start_byte:node.end_byte].decode(errors="replace").split("\n")[0][:60]
+    lines = [f"{'  ' * depth}{node.type} [{node.start_point[0]}:{node.end_point[0]}]  {snippet!r}"]
+    for child in node.children:
+        lines.extend(dump_ast(child, src, depth + 1, max_depth))
+    return lines
 
 @dataclass
 class CodeChunk:
@@ -64,10 +71,6 @@ class CodeChunk:
         return len(encoder.encode(self.embedding_text))
 
 
-def count_tokens(text: str) -> int:
-    return len(encoder.encode(text))
-
-
 def split_oversized(chunk: CodeChunk) -> list[CodeChunk]:
     """
     If a chunk exceeds MAX_TOKENS, split it at line boundaries
@@ -77,17 +80,15 @@ def split_oversized(chunk: CodeChunk) -> list[CodeChunk]:
         return [chunk]
 
     lines = chunk.content.splitlines(keepends=True)
-    pieces = []
+    pieces: list[CodeChunk] = []
     start_idx = 0
 
     while start_idx < len(lines):
-        # Grow the window until we hit the token limit
         end_idx = start_idx
         current_text = ""
 
         while end_idx < len(lines):
             candidate = current_text + lines[end_idx]
-            # Build a temporary chunk to check token count with metadata
             temp = CodeChunk(
                 content=candidate,
                 chunk_type=chunk.chunk_type,
@@ -112,10 +113,9 @@ def split_oversized(chunk: CodeChunk) -> list[CodeChunk]:
             metadata={**chunk.metadata, "part": part_num},
         ))
 
-        # Advance with overlap
-        start_idx = max(end_idx - OVERLAP_LINES, end_idx) if end_idx >= len(lines) else end_idx - OVERLAP_LINES
-        if start_idx <= (end_idx - len(lines)) or start_idx < 0:
-            start_idx = end_idx  # prevent infinite loop on edge cases
+        if end_idx >= len(lines):
+            break
+        start_idx = max(end_idx - OVERLAP_LINES, start_idx + 1)
 
     return pieces
 
@@ -292,18 +292,18 @@ def _extract_class(node, file_path: str) -> list[CodeChunk]:
     return chunks
 
 
-JS_TOP_LEVEL_DECLS = {
-    "function_declaration",
-    "generator_function_declaration",
-    "class_declaration",
-    "lexical_declaration",
-    "variable_declaration",
-    "interface_declaration",
-    "type_alias_declaration",
-    "enum_declaration",
-    "abstract_class_declaration",
+JS_CHUNK_TYPES = {
+    "function_declaration": "function",
+    "generator_function_declaration": "function",
+    "class_declaration": "class",
+    "abstract_class_declaration": "class",
+    "interface_declaration": "interface",
+    "type_alias_declaration": "type",
+    "enum_declaration": "enum",
+    "lexical_declaration": "declaration",
+    "variable_declaration": "declaration",
 }
-
+JS_TOP_LEVEL_DECLS = JS_CHUNK_TYPES.keys()
 JS_IMPORT_TYPES = {"import_statement", "import"}
 
 
@@ -345,17 +345,9 @@ def extract_js_chunks(source: bytes, file_path: str, parser_: Parser) -> list[Co
 
         if target.type in JS_TOP_LEVEL_DECLS:
             name = _js_node_name(target) or "<anonymous>"
-            chunk_type = (
-                "class" if "class" in target.type
-                else "interface" if target.type == "interface_declaration"
-                else "type" if target.type == "type_alias_declaration"
-                else "enum" if target.type == "enum_declaration"
-                else "function" if "function" in target.type
-                else "declaration"
-            )
             chunks.append(CodeChunk(
                 content=node.text.decode(errors="replace"),
-                chunk_type=chunk_type,
+                chunk_type=JS_CHUNK_TYPES[target.type],
                 file_path=file_path,
                 name=name,
                 start_line=node.start_point[0],
@@ -438,32 +430,25 @@ def extract_whole_file_chunk(source: bytes, file_path: str, chunk_type: str) -> 
     )]
 
 
-# Maps file extension → (extractor_fn, extractor_kwargs)
-# Each extractor returns list[CodeChunk]; oversized ones are split downstream.
-def _dispatch_extract(source: bytes, file_path: str) -> list[CodeChunk]:
-    ext = os.path.splitext(file_path)[1].lower()
+_JS_EXT_PARSERS = {".js": js_parser, ".jsx": js_parser, ".ts": ts_parser, ".tsx": tsx_parser}
+_WHOLE_FILE_TYPES = {
+    ".json": "config", ".yaml": "config", ".yml": "config",
+    ".css": "stylesheet",
+    ".html": "markup", ".htm": "markup",
+    ".sh": "shell",
+}
 
+
+def _dispatch_extract(source: bytes, file_path: str) -> list[CodeChunk]:
+    """Pick an extractor by file extension. Unknown extensions become whole-file chunks."""
+    ext = os.path.splitext(file_path)[1].lower()
     if ext == ".py":
         return extract_chunks_from_file(source, file_path)
-    if ext in (".js", ".jsx"):
-        return extract_js_chunks(source, file_path, js_parser)
-    if ext == ".ts":
-        return extract_js_chunks(source, file_path, ts_parser)
-    if ext == ".tsx":
-        return extract_js_chunks(source, file_path, tsx_parser)
+    if ext in _JS_EXT_PARSERS:
+        return extract_js_chunks(source, file_path, _JS_EXT_PARSERS[ext])
     if ext in (".md", ".markdown"):
         return extract_markdown_chunks(source, file_path)
-    if ext in (".json", ".yaml", ".yml"):
-        return extract_whole_file_chunk(source, file_path, "config")
-    if ext == ".css":
-        return extract_whole_file_chunk(source, file_path, "stylesheet")
-    if ext in (".html", ".htm"):
-        return extract_whole_file_chunk(source, file_path, "markup")
-    if ext == ".sh":
-        return extract_whole_file_chunk(source, file_path, "shell")
-
-    # Unknown extension: best-effort whole-file chunk
-    return extract_whole_file_chunk(source, file_path, "file")
+    return extract_whole_file_chunk(source, file_path, _WHOLE_FILE_TYPES.get(ext, "file"))
 
 
 def chunk_file_list(file_paths: list[str]) -> list[CodeChunk]:
