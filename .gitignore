@@ -27,3 +27,4 @@ env/
                                             
 # Docker                                
 *.log
+output.txt

@@ -30,7 +30,7 @@ explorer_agent = Agent[Any](
         "list_files with glob '**/<filename>' and respond with just the matching file path(s). "
         "Do NOT include line numbers for file lookups.\n"
         "2. If the user asks for a SYMBOL (function, class, variable, JSX component, etc.), call "
-        "search_code and respond with file:line matches.\n"
+        "search_code and respond with file:line matches. \n"
         "3. Use read_file only when the user wants the contents of a specific file or range.\n"
         "Keep responses concise — return paths or file:line entries, not prose summaries, unless asked."
     ),
@@ -49,7 +49,7 @@ explainer_agent = Agent[Any](
         "- Use `list_files(dir_path, glob)` to discover real files before reading them. "
         "Never invent paths.\n"
         "- Use `read_file(file_path, ...)` only on concrete files returned by list_files or "
-        "search_indexed — never on directories.\n"
+        "search_indexed — queries the indexed chunks in the database, use it for semantic search and finding specific code chunks. \n"
         "Cite file paths and line ranges in your answer."
     ),
     model="gpt-4o-mini",
