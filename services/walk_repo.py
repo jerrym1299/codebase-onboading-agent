@@ -1,6 +1,10 @@
 import os
 
-SKIP_DIRS = {"__pycache__", ".git"}
+SKIP_DIRS = {
+    "__pycache__", ".git",
+    "node_modules", "dist", "build", "out", "coverage",
+    ".next", ".turbo", ".nuxt", ".svelte-kit", ".vercel", ".cache",
+}
 CODE_EXTS = (
     ".py", ".js", ".ts", ".jsx", ".tsx",
     ".html", ".css", ".scss",

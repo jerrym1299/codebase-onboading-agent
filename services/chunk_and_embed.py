@@ -33,6 +33,13 @@ encoder = tiktoken.encoding_for_model("text-embedding-3-small")
 client = OpenAI()
 
 
+def embed_query(text: str) -> list[float]:
+    """Embed a single query string with the same model used for chunks."""
+    return client.embeddings.create(
+        input=[text], model="text-embedding-3-small"
+    ).data[0].embedding
+
+
 def dump_ast(node, src: bytes, depth: int = 0, max_depth: int | None = 3) -> list[str]:
     """Flatten a tree-sitter AST into indented `type [start:end]  'snippet'` lines."""
     if max_depth is not None and depth > max_depth:

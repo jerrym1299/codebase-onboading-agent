@@ -20,9 +20,9 @@ def _raw_query_param(request: Request, key: str) -> str:
 from services.clone_repo import ensure_repo_dir
 from services.walk_repo import walk_repo, collect_file_paths
 from services.chunk_and_embed import chunk_file_list, AST_PARSERS, dump_ast
-from services.db import init_schema, store_chunks, close_pool
+from services.db import init_schema, store_chunks, close_pool, get_pool
 from agent_defs import explorer_agent
-
+from services.chunk_and_embed import embed_query
 CLONE_FAILED = {"error": "Failed to clone repository"}
 
 
@@ -55,6 +55,7 @@ async def walkrepo_endpoint(repo_url: str):
 @app.get("/chunks/{repo_url:path}")
 async def chunks_endpoint(repo_url: str, preview: int = 300):
     """Clone → collect paths → chunk → store. Returns chunk metadata + preview."""
+    repo_url = repo_url.rstrip("/")
     repo_dir = await ensure_repo_dir(repo_url)
     if repo_dir is None:
         return CLONE_FAILED
@@ -128,4 +129,37 @@ async def explore_endpoint(repo_url: str, request: Request):
             }
             for item in result.raw_responses
         ],
+    }
+
+SEARCH_SQL = """
+    SELECT file_path, chunk_type, name, start_line, end_line, content,
+           1 - (embedding <=> %s::vector) AS similarity
+    FROM code_chunks
+    WHERE repo_url = %s
+    ORDER BY embedding <=> %s::vector
+    LIMIT %s
+"""
+
+
+@app.get("/search/{repo_url:path}/{query:path}")
+async def search_endpoint(repo_url: str, query: str, k: int = 10):
+    repo_url = repo_url.rstrip("/")
+    emb = "[" + ",".join(repr(x) for x in embed_query(query)) + "]"
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(SEARCH_SQL, (emb, repo_url, emb, k))
+        rows = await cur.fetchall()
+    return {
+        "results": [
+            {
+                "file_path": r[0],
+                "chunk_type": r[1],
+                "name": r[2],
+                "start_line": r[3],
+                "end_line": r[4],
+                "content": r[5],
+                "score": float(r[6]),
+            }
+            for r in rows
+        ]
     }
