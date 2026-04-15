@@ -128,4 +128,14 @@ async def explore_endpoint(repo_url: str, query: str):
         explorer_agent,
         f"The codebase is at {repo_dir}. {query}",
     )
-    return {"response": str(result.final_output)}
+    return {
+        "response": str(result.final_output),
+        "last_agent": result.last_agent.name,
+        "raw_responses": [
+            {
+                "role": item.type if hasattr(item, "type") else "unknown",
+                "content": str(item),
+            }
+            for item in result.raw_responses
+        ],
+    }
