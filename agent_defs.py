@@ -3,7 +3,7 @@ from typing import Any
 from agents import Agent, handoff
 from services.tools import (
     list_files, search_code, read_file,
-    find_references, get_dependencies, search_indexed, git_log,
+    find_references, get_dependencies, search_indexed, search_dir_summaries, git_log,
 )
 
 #Explorer agent finds exact matches in the codebase.
@@ -53,7 +53,7 @@ explainer_agent = Agent[Any](
         "Cite file paths and line ranges in your answer."
     ),
     model="gpt-4o-mini",
-    tools=[search_indexed, list_files, read_file, git_log],
+    tools=[search_indexed, search_dir_summaries, list_files, read_file, git_log],
     handoff_description="Hand off to the explainer agent to summarise/synthesise information and answer 'explain X' or 'how does X work' questions.",
 )
 

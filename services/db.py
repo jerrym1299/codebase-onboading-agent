@@ -12,6 +12,7 @@ from psycopg_pool import AsyncConnectionPool
 from pgvector.psycopg import register_vector_async
 
 from services.chunk_and_embed import CodeChunk
+from dataclasses import dataclass
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -59,6 +60,24 @@ CREATE INDEX IF NOT EXISTS code_chunks_embedding_idx
 
 CREATE INDEX IF NOT EXISTS code_chunks_repo_idx
     ON code_chunks (repo_url);
+
+CREATE TABLE IF NOT EXISTS dir_summaries (
+    id BIGSERIAL PRIMARY KEY,
+    repo_url TEXT NOT NULL,
+    dir_path TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    file_list TEXT[] NOT NULL DEFAULT '{}',
+    embedding vector(1536) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT dir_summaries_unique UNIQUE (repo_url, dir_path)
+);
+
+CREATE INDEX IF NOT EXISTS dir_summaries_embedding_idx
+    ON dir_summaries USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100);
+
+CREATE INDEX IF NOT EXISTS dir_summaries_repo_idx
+    ON dir_summaries (repo_url);
 """
 
 
@@ -106,6 +125,41 @@ async def store_chunks(repo_url: str, chunks: list[CodeChunk]) -> int:
             end_line     = EXCLUDED.end_line,
             content      = EXCLUDED.content,
             embedding    = EXCLUDED.embedding
+    """
+
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.executemany(sql, rows)
+    return len(rows)
+
+
+@dataclass
+class DirSummary:
+    dir_path: str
+    summary: str
+    file_list: list[str]
+    embedding: list[float] | None = None
+
+
+async def store_dir_summaries(repo_url: str, summaries: list[DirSummary]) -> int:
+    """Upsert directory summaries with embeddings. Returns rows written."""
+    rows = [
+        (repo_url, s.dir_path, s.summary, s.file_list, s.embedding)
+        for s in summaries if s.embedding is not None
+    ]
+    if not rows:
+        return 0
+
+    sql = """
+        INSERT INTO dir_summaries
+            (repo_url, dir_path, summary, file_list, embedding)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT ON CONSTRAINT dir_summaries_unique
+        DO UPDATE SET
+            summary   = EXCLUDED.summary,
+            file_list = EXCLUDED.file_list,
+            embedding = EXCLUDED.embedding
     """
 
     pool = await get_pool()

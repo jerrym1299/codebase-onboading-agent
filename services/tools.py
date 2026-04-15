@@ -112,9 +112,36 @@ async def search_indexed(query: str, repo_url: str, k: int = 10) -> str:
         )
     return "\n---\n".join(results) if results else "No matching chunks found."
 
+DIR_SUMMARY_SQL = """
+    SELECT dir_path, summary, file_list,
+           1 - (embedding <=> %s::vector) AS similarity
+    FROM dir_summaries
+    WHERE repo_url = %s
+    ORDER BY embedding <=> %s::vector
+    LIMIT %s
+"""
+
+
+@function_tool
+async def search_dir_summaries(query: str, repo_url: str, k: int = 5) -> str:
+    """Search directory summaries by semantic similarity. Useful for understanding
+    high-level project structure and what each directory is responsible for."""
+    emb = "[" + ",".join(repr(x) for x in embed_query(query)) + "]"
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(DIR_SUMMARY_SQL, (emb, repo_url, emb, k))
+        rows = await cur.fetchall()
+    results = []
+    for r in rows:
+        files = ", ".join(r[2]) if r[2] else ""
+        results.append(
+            f"[{r[3]:.3f}] {r[0]}/\nFiles: {files}\n{r[1]}"
+        )
+    return "\n---\n".join(results) if results else "No directory summaries found."
+
+
 @function_tool 
 def git_log(path:str, limit:int = 10) -> list[str]:
-    # get the git log recent commits + messages
     try:
         result = subprocess.run(["git", "log", "--pretty=format:%h %s", "-n", str(limit)], cwd=path, capture_output=True, text=True)
         return result.stdout.splitlines()

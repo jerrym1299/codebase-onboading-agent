@@ -8,7 +8,8 @@ from agent_defs import router_agent
 from services.clone_repo import ensure_repo_dir
 from services.walk_repo import collect_file_paths
 from services.chunk_and_embed import chunk_file_list
-from services.db import store_chunks, get_pool
+from services.db import store_chunks, store_dir_summaries, get_pool
+from services.dir_summaries import generate_dir_summaries
 
 
 @dataclass
@@ -55,6 +56,12 @@ async def index_repo_activity(params: IndexParams) -> int:
     paths = await collect_file_paths(params.repo_dir)
     chunks = chunk_file_list(paths)
     await store_chunks(params.repo_url, chunks)
+
+    activity.logger.info("Generating per-directory summaries for %s", params.repo_url)
+    dir_sums = generate_dir_summaries(paths, params.repo_dir)
+    await store_dir_summaries(params.repo_url, dir_sums)
+    activity.logger.info("Stored %d directory summaries", len(dir_sums))
+
     return len(chunks)
 
 
