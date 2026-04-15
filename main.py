@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from temporalio.client import Client
 from agents import Runner
 from agents.exceptions import MaxTurnsExceeded
-
+from agent_defs import router_agent
 
 def _raw_query_param(request: Request, key: str) -> str:
     """Pull `key=...` from the raw query string with `%` treated as a literal char.
@@ -141,8 +141,11 @@ SEARCH_SQL = """
 """
 
 
-@app.get("/search/{repo_url:path}/{query:path}")
-async def search_endpoint(repo_url: str, query: str, k: int = 10):
+@app.get("/search/{repo_url:path}")
+async def search_endpoint(repo_url: str, request: Request, k: int = 10):
+    query = _raw_query_param(request, "query")
+    if not query:
+        return {"error": "Missing 'query' parameter."}
     repo_url = repo_url.rstrip("/")
     emb = "[" + ",".join(repr(x) for x in embed_query(query)) + "]"
     pool = await get_pool()
@@ -162,4 +165,37 @@ async def search_endpoint(repo_url: str, query: str, k: int = 10):
             }
             for r in rows
         ]
+    }
+
+@app.get("/askQuestion/{repo_url:path}/{query:path}")
+async def askQuestion_endpoint(repo_url: str, query: str):
+    if not query:
+        return {"error": "Missing 'query' parameter."}
+    repo_url = repo_url.rstrip("/")
+    repo_dir = await ensure_repo_dir(repo_url)
+    if repo_dir is None:
+        return CLONE_FAILED
+    try:
+        result = await Runner.run(
+            router_agent,
+            (
+                f"Local codebase path (for list_files/read_file/git_log/search_code/find_references): {repo_dir}\n"
+                f"Indexed repo_url (for search_indexed): {repo_url}\n"
+                f"Question: {query}\n"
+                "Answer concisely, referencing specific files, lines, and functions."
+            ),
+            max_turns=20,
+        )
+    except MaxTurnsExceeded:
+        return {"error": "Agent exceeded max turns — try a more specific query."}
+    return {
+        "response": str(result.final_output),
+        "last_agent": result.last_agent.name,
+        "raw_responses": [
+            {
+                "role": getattr(item, "type", "unknown"),
+                "content": str(item),
+            }
+            for item in result.raw_responses
+        ],
     }
