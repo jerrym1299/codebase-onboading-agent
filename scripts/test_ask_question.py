@@ -76,7 +76,8 @@ def _encode_query(q: str) -> str:
 def index_repo(base: str, repo_url: str) -> None:
     print(f"{DIM}Indexing {repo_url} …{RESET}")
     t0 = time.time()
-    data = _http_get(f"{base}/chunks/{repo_url}?preview=0", timeout=600)
+    encoded_url = urllib.parse.quote(repo_url, safe="")
+    data = _http_get(f"{base}/chunks?repo_url={encoded_url}&preview=0", timeout=600)
     dt = time.time() - t0
     if "error" in data:
         sys.exit(f"Index failed: {data['error']}")
@@ -86,7 +87,8 @@ def index_repo(base: str, repo_url: str) -> None:
 
 def run_test(base: str, idx: int, category: str, expected_agent: str,
              question: str, grounding: list[str]) -> tuple[bool, bool, str, str]:
-    url = f"{base}/askQuestion/{REPO_URL}?query={_encode_query(question)}"
+    encoded_url = urllib.parse.quote(REPO_URL, safe="")
+    url = f"{base}/askQuestion?repo_url={encoded_url}&query={_encode_query(question)}"
     try:
         data = _http_get(url)
     except Exception as exc:

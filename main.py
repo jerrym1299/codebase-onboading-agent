@@ -62,7 +62,7 @@ def read_root():
     return {"Hello": "world"}
 
 
-@app.get("/walkrepo/{repo_url:path}")
+@app.get("/walkrepo")
 async def walkrepo_endpoint(repo_url: str):
     repo_dir = await ensure_repo_dir(repo_url)
     if repo_dir is None:
@@ -70,7 +70,7 @@ async def walkrepo_endpoint(repo_url: str):
     return {"response": await walk_repo(repo_dir)}
 
 
-@app.get("/chunks/{repo_url:path}")
+@app.get("/chunks")
 async def chunks_endpoint(repo_url: str, preview: int = 300):
     """Clone → collect paths → chunk → store. Returns chunk metadata + preview."""
     repo_url = repo_url.rstrip("/")
@@ -102,7 +102,7 @@ async def chunks_endpoint(repo_url: str, preview: int = 300):
     }
 
 
-@app.get("/ast/{repo_url:path}")
+@app.get("/ast")
 async def ast_endpoint(repo_url: str, max_depth: int = 3):
     """Clone → walk → dump tree-sitter AST for every .py/.js/.jsx/.ts/.tsx file."""
     repo_dir = await ensure_repo_dir(repo_url)
@@ -120,7 +120,7 @@ async def ast_endpoint(repo_url: str, max_depth: int = 3):
     return {"file_count": len(asts), "asts": asts}
 
 
-@app.get("/explore/{repo_url:path}")
+@app.get("/explore")
 async def explore_endpoint(repo_url: str, request: Request):
     """Explore the codebase with the given query. `query` is read raw — `%` is literal."""
     query = _raw_query_param(request, "query")
@@ -159,7 +159,7 @@ SEARCH_SQL = """
 """
 
 
-@app.get("/search/{repo_url:path}")
+@app.get("/search")
 async def search_endpoint(repo_url: str, request: Request, k: int = 10):
     query = _raw_query_param(request, "query")
     if not query:
@@ -185,7 +185,7 @@ async def search_endpoint(repo_url: str, request: Request, k: int = 10):
         ]
     }
 
-@app.get("/askQuestion/{repo_url:path}")
+@app.get("/askQuestion")
 async def askQuestion_endpoint(repo_url: str, request: Request):
     query = _raw_query_param(request, "query")
     if not query:
