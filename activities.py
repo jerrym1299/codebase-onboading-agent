@@ -37,6 +37,23 @@ class ChatParams:
     repo_url: str
 
 
+@dataclass
+class SessionStatusParams:
+    session_id: str
+    status: str
+
+
+@activity.defn
+async def update_session_status_activity(params: SessionStatusParams) -> None:
+    """Set sessions.status and bump last_seen_at."""
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE sessions SET status = %s, last_seen_at = NOW() WHERE id = %s",
+            (params.status, params.session_id),
+        )
+
+
 @activity.defn
 async def clone_repo_activity(repo_url: str) -> str:
     """Clone the repo (or reuse existing). Returns repo_dir path."""

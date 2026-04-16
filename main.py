@@ -15,6 +15,7 @@ from activities import (
     clone_repo_activity,
     index_repo_activity,
     ask_agent_activity,
+    update_session_status_activity,
 )
 from workflows import CodebaseOnboardingWorkflow, CodebaseChatWorkflow
 
@@ -48,7 +49,12 @@ async def lifespan(app):
         client,
         task_queue="onboarding-queue",
         workflows=[CodebaseOnboardingWorkflow, CodebaseChatWorkflow],
-        activities=[clone_repo_activity, index_repo_activity, ask_agent_activity],
+        activities=[
+            clone_repo_activity,
+            index_repo_activity,
+            ask_agent_activity,
+            update_session_status_activity,
+        ],
     )
     async with worker:
         yield
@@ -196,7 +202,7 @@ async def create_session_endpoint(payload: dict):
     pool = await get_pool()
     async with pool.connection() as conn, conn.cursor() as cur:
         await cur.execute(
-            "INSERT INTO sessions (repo_url, status) VALUES (%s, 'active') RETURNING id",
+            "INSERT INTO sessions (repo_url, status) VALUES (%s, 'indexing') RETURNING id",
             (repo_url,),
         )
         session_id = str((await cur.fetchone())[0])
@@ -208,6 +214,44 @@ async def create_session_endpoint(payload: dict):
         task_queue="onboarding-queue",
     )
     return {"session_id": session_id}
+
+
+@app.get("/sessions/{session_id}")
+async def get_session_endpoint(session_id: str):
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT status FROM sessions WHERE id = %s",
+            (session_id,),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return {"error": "Session not found."}
+    return {"session_id": session_id, "status": row[0]}
+
+
+@app.get("/sessions/{session_id}/messages")
+async def get_session_messages_endpoint(session_id: str):
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT id, role, parts, created_at FROM messages "
+            "WHERE session_id = %s ORDER BY created_at ASC, id ASC",
+            (session_id,),
+        )
+        rows = await cur.fetchall()
+    return {
+        "session_id": session_id,
+        "messages": [
+            {
+                "id": str(r[0]),
+                "role": r[1],
+                "parts": r[2],
+                "created_at": r[3].isoformat(),
+            }
+            for r in rows
+        ],
+    }
 
 
 @app.get("/askQuestion")
