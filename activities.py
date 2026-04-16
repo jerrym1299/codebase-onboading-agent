@@ -31,6 +31,12 @@ class WorkflowParams:
     query: str
 
 
+@dataclass
+class ChatParams:
+    session_id: str
+    repo_url: str
+
+
 @activity.defn
 async def clone_repo_activity(repo_url: str) -> str:
     """Clone the repo (or reuse existing). Returns repo_dir path."""

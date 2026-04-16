@@ -172,6 +172,7 @@ async def search_endpoint(repo_url: str, request: Request, k: int = 10):
         rows = await cur.fetchall()
     return {
         "results": [
+        
             {
                 "file_path": r[0],
                 "chunk_type": r[1],
