@@ -11,11 +11,12 @@ from agent_defs import router_agent
 
 from activities import (
     WorkflowParams,
+    ChatParams,
     clone_repo_activity,
     index_repo_activity,
     ask_agent_activity,
 )
-from workflows import CodebaseOnboardingWorkflow
+from workflows import CodebaseOnboardingWorkflow, CodebaseChatWorkflow
 
 def _raw_query_param(request: Request, key: str) -> str:
     """Pull `key=...` from the raw query string with `%` treated as a literal char.
@@ -46,7 +47,7 @@ async def lifespan(app):
     worker = Worker(
         client,
         task_queue="onboarding-queue",
-        workflows=[CodebaseOnboardingWorkflow],
+        workflows=[CodebaseOnboardingWorkflow, CodebaseChatWorkflow],
         activities=[clone_repo_activity, index_repo_activity, ask_agent_activity],
     )
     async with worker:
@@ -185,6 +186,29 @@ async def search_endpoint(repo_url: str, request: Request, k: int = 10):
             for r in rows
         ]
     }
+
+@app.post("/sessions")
+async def create_session_endpoint(payload: dict):
+    repo_url = (payload or {}).get("repo_url", "").rstrip("/")
+    if not repo_url:
+        return {"error": "Missing 'repo_url'."}
+
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO sessions (repo_url, status) VALUES (%s, 'active') RETURNING id",
+            (repo_url,),
+        )
+        session_id = str((await cur.fetchone())[0])
+
+    await app.state.temporal_client.start_workflow(
+        CodebaseChatWorkflow.run,
+        ChatParams(session_id=session_id, repo_url=repo_url),
+        id=f"chat-{session_id}",
+        task_queue="onboarding-queue",
+    )
+    return {"session_id": session_id}
+
 
 @app.get("/askQuestion")
 async def askQuestion_endpoint(repo_url: str, request: Request):
