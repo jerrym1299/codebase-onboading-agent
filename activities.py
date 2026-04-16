@@ -1,10 +1,7 @@
 from dataclasses import dataclass
 
 from temporalio import activity
-from agents import Runner
-from agents.exceptions import MaxTurnsExceeded
 
-from agent_defs import router_agent
 from services.clone_repo import ensure_repo_dir
 from services.walk_repo import collect_file_paths
 from services.chunk_and_embed import chunk_file_list
@@ -16,19 +13,6 @@ from services.dir_summaries import generate_dir_summaries
 class IndexParams:
     repo_url: str
     repo_dir: str
-
-
-@dataclass
-class AskParams:
-    repo_url: str
-    repo_dir: str
-    query: str
-
-
-@dataclass
-class WorkflowParams:
-    repo_url: str
-    query: str
 
 
 @dataclass
@@ -88,30 +72,3 @@ async def index_repo_activity(params: IndexParams) -> int:
     return len(chunks)
 
 
-@activity.defn
-async def ask_agent_activity(params: AskParams) -> dict:
-    """Run the router agent with the user's query. Returns the answer dict."""
-    try:
-        result = await Runner.run(
-            router_agent,
-            (
-                f"Local codebase path (for list_files/read_file/git_log/search_code/find_references): {params.repo_dir}\n"
-                f"Indexed repo_url (for search_indexed): {params.repo_url}\n"
-                f"Question: {params.query}\n"
-                "Answer concisely, referencing specific files, lines, and functions."
-            ),
-            max_turns=20,
-        )
-    except MaxTurnsExceeded:
-        return {"error": "Agent exceeded max turns — try a more specific query."}
-    return {
-        "response": str(result.final_output),
-        "last_agent": result.last_agent.name,
-        "raw_responses": [
-            {
-                "role": getattr(item, "type", "unknown"),
-                "content": str(item),
-            }
-            for item in result.raw_responses
-        ],
-    }

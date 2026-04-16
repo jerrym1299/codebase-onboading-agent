@@ -1,5 +1,4 @@
 import os
-import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -7,17 +6,14 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 from agents import Runner
 from agents.exceptions import MaxTurnsExceeded
-from agent_defs import router_agent
 
 from activities import (
-    WorkflowParams,
     ChatParams,
     clone_repo_activity,
     index_repo_activity,
-    ask_agent_activity,
     update_session_status_activity,
 )
-from workflows import CodebaseOnboardingWorkflow, CodebaseChatWorkflow
+from workflows import CodebaseChatWorkflow
 
 def _raw_query_param(request: Request, key: str) -> str:
     """Pull `key=...` from the raw query string with `%` treated as a literal char.
@@ -48,11 +44,10 @@ async def lifespan(app):
     worker = Worker(
         client,
         task_queue="onboarding-queue",
-        workflows=[CodebaseOnboardingWorkflow, CodebaseChatWorkflow],
+        workflows=[CodebaseChatWorkflow],
         activities=[
             clone_repo_activity,
             index_repo_activity,
-            ask_agent_activity,
             update_session_status_activity,
         ],
     )
@@ -254,15 +249,3 @@ async def get_session_messages_endpoint(session_id: str):
     }
 
 
-@app.get("/askQuestion")
-async def askQuestion_endpoint(repo_url: str, request: Request):
-    query = _raw_query_param(request, "query")
-    if not query:
-        return {"error": "Missing 'query' parameter."}
-    result = await app.state.temporal_client.execute_workflow(
-        CodebaseOnboardingWorkflow.run,
-        WorkflowParams(repo_url=repo_url.rstrip("/"), query=query),
-        id=f"onboard-{uuid.uuid4()}",
-        task_queue="onboarding-queue",
-    )
-    return result
