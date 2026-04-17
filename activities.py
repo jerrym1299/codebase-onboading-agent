@@ -165,7 +165,10 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
             if isinstance(event, RawResponsesStreamEvent):
                 delta = getattr(event.data, "delta", None)
                 if isinstance(delta, str) and delta:
-                    await publish(params.session_id, {"type": "text-delta", "text": delta})
+                    await publish(params.session_id, {
+                        "type": "text-delta",
+                        "textDelta": delta,
+                    })
 
             elif isinstance(event, RunItemStreamEvent):
                 item = event.item
@@ -175,13 +178,12 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
                     for block in getattr(item.raw_item, "content", []):
                         texts.append(getattr(block, "text", ""))
                     part = {"type": "text", "text": "".join(texts)}
-                    await publish(params.session_id, part)
                     await _append_part(pool, msg_id, part)
 
                 elif isinstance(item, ToolCallItem) and event.name == "tool_called":
                     raw = item.raw_item
                     part = {
-                        "type": "tool-call",
+                        "type": "tool-input-available",
                         "toolCallId": getattr(raw, "call_id", ""),
                         "toolName": getattr(raw, "name", ""),
                         "args": getattr(raw, "arguments", ""),
@@ -193,7 +195,7 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
                     raw = item.raw_item
                     call_id = raw.get("call_id", "") if isinstance(raw, dict) else getattr(raw, "call_id", "")
                     part = {
-                        "type": "tool-result",
+                        "type": "tool-output-available",
                         "toolCallId": call_id,
                         "output": str(item.output),
                     }
@@ -202,14 +204,16 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
 
                 elif isinstance(item, (HandoffCallItem, HandoffOutputItem)):
                     target = getattr(item, "target_agent", None)
-                    await publish(params.session_id, {
-                        "type": "agent-handoff",
+                    part = {
+                        "type": "data-handoff",
                         "agent": getattr(target, "name", str(target)) if target else "",
-                    })
+                    }
+                    await publish(params.session_id, part)
+                    await _append_part(pool, msg_id, part)
 
             elif isinstance(event, AgentUpdatedStreamEvent):
                 await publish(params.session_id, {
-                    "type": "agent-updated",
+                    "type": "data-handoff",
                     "agent": event.new_agent.name,
                 })
 
@@ -224,5 +228,5 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
         await _append_part(pool, msg_id, fallback)
         await publish(params.session_id, fallback)
 
-    await publish(params.session_id, {"type": "done"})
+    await publish(params.session_id, {"type": "finish"})
     return {"kind": "done", "message_id": msg_id, "parts": [{"type": "text", "text": text}]}
