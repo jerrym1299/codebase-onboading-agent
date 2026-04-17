@@ -16,6 +16,7 @@ from agents.exceptions import MaxTurnsExceeded
 from agent_defs import router_agent
 from services.clone_repo import ensure_repo_dir
 from services.event_bus import publish
+from services.tools import current_session_id
 from services.walk_repo import collect_file_paths
 from services.chunk_and_embed import chunk_file_list
 from services.db import store_chunks, store_dir_summaries, get_pool
@@ -93,6 +94,32 @@ async def index_repo_activity(params: IndexParams) -> int:
     return len(chunks)
 
 
+@activity.defn
+async def cancel_pending_actions_activity(session_id: str) -> int:
+    """Cancel all open pending_actions for a session. Returns count cancelled."""
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE pending_actions SET status = 'cancelled', resolved_at = NOW() "
+            "WHERE session_id = %s AND status = 'open'",
+            (session_id,),
+        )
+        return cur.rowcount
+
+
+@activity.defn
+async def resolve_pending_actions_activity(session_id: str) -> int:
+    """Resolve all open pending_actions for a session (user replied via normal message)."""
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE pending_actions SET status = 'resolved', resolved_at = NOW() "
+            "WHERE session_id = %s AND status = 'open'",
+            (session_id,),
+        )
+        return cur.rowcount
+
+
 async def _append_part(pool, msg_id: str, part: dict):
     async with pool.connection() as conn, conn.cursor() as cur:
         await cur.execute(
@@ -137,6 +164,7 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
         )
         msg_id = str((await cur.fetchone())[0])
 
+    current_session_id.set(params.session_id)
     session = SQLiteSession(params.session_id, SESSION_DB_PATH)
 
     def prepend_repo_context(history, new_input):
@@ -229,4 +257,21 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
         await publish(params.session_id, fallback)
 
     await publish(params.session_id, {"type": "finish"})
+
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT id, payload FROM pending_actions "
+            "WHERE session_id = %s AND status = 'open' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (params.session_id,),
+        )
+        pending = await cur.fetchone()
+
+    if pending:
+        return {
+            "kind": "paused",
+            "message_id": msg_id,
+            "pending_id": str(pending[0]),
+            "payload": pending[1],
+        }
     return {"kind": "done", "message_id": msg_id, "parts": [{"type": "text", "text": text}]}

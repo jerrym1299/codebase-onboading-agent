@@ -13,6 +13,8 @@ from activities import (
     index_repo_activity,
     update_session_status_activity,
     agent_turn_activity,
+    cancel_pending_actions_activity,
+    resolve_pending_actions_activity,
 )
 from workflows import CodebaseChatWorkflow
 
@@ -51,6 +53,8 @@ async def lifespan(app):
             index_repo_activity,
             update_session_status_activity,
             agent_turn_activity,
+            cancel_pending_actions_activity,
+            resolve_pending_actions_activity,
         ],
     )
     async with worker:

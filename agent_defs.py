@@ -4,6 +4,7 @@ from agents import Agent, ModelSettings, handoff
 from services.tools import (
     list_files, search_code, read_file,
     find_references, get_dependencies, search_indexed, search_dir_summaries, git_log,
+    ask_user,
 )
 
 #Explorer agent finds exact matches in the codebase.
@@ -18,7 +19,7 @@ tracer_agent = Agent[Any](
     ),
     model="gpt-4.1-mini",
     model_settings=ModelSettings(max_tokens=16384),
-    tools=[read_file, find_references, get_dependencies],
+    tools=[read_file, find_references, get_dependencies, ask_user],
     handoff_description="Hand off to the tracer agent to trace the execution path of the codebase, follow execution paths, what calls X, what does X call, execution call follow execution paths",
 )
 
@@ -37,7 +38,7 @@ explorer_agent = Agent[Any](
     ),
     model="gpt-4.1-mini",
     model_settings=ModelSettings(max_tokens=16384),
-    tools=[list_files, search_code, read_file],
+    tools=[list_files, search_code, read_file, ask_user],
     handoff_description="Hand off to the explorer agent to find things in the codebase, give paths/file:lines, to search for specific functionality, symbols, classes or functions",
 )
 
@@ -56,15 +57,19 @@ explainer_agent = Agent[Any](
     ),
     model="gpt-4.1-mini",
     model_settings=ModelSettings(max_tokens=16384),
-    tools=[search_indexed, search_dir_summaries, list_files, read_file, git_log],
+    tools=[search_indexed, search_dir_summaries, list_files, read_file, git_log, ask_user],
     handoff_description="Hand off to the explainer agent to summarise/synthesise information and answer 'explain X' or 'how does X work' questions.",
 )
 
 router_agent = Agent[Any](
     name="Router",
     instructions=(
-        "You are a router to route the users question to the appropriate agent, you can hand off to the explorer agent to find things in the codebase, the explainer agent to summarise and synthesise information, or the tracer agent to trace the execution path of the codebase. After handing off to one agent you can hand off to another agent. You should ensure you completely and directly answer the users question and pick up all information from the previous agents/related to the question."
+        "You are a router to route the users question to the appropriate agent, you can hand off to the explorer agent to find things in the codebase, the explainer agent to summarise and synthesise information, or the tracer agent to trace the execution path of the codebase. After handing off to one agent you can hand off to another agent. You should ensure you completely and directly answer the users question and pick up all information from the previous agents/related to the question.\n"
+        "If you believe the question is ambiguous or unfinished, you can use ask_user to clarify before proceeding. "
+        "For example if they say 'trace the flow' without specifying which flow, ask which one. "
+        "Or if they ask 'how does the uploading work' and there are multiple upload workflows (e.g. files from computer to server vs server to AWS), ask which upload process they mean."
     ),
     model="gpt-4.1-mini",
+    tools=[ask_user],
     handoffs=[explorer_agent, explainer_agent, tracer_agent],
 )

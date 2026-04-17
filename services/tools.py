@@ -1,9 +1,15 @@
+import contextvars
+import json
+import uuid
 from pathlib import Path
 import re
 import subprocess
 from agents import function_tool
 from services.chunk_and_embed import embed_query
 from services.db import get_pool
+from services.event_bus import publish
+
+current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar("current_session_id")
 SEARCH_SQL = """
     SELECT file_path, chunk_type, name, start_line, end_line, content,
            1 - (embedding <=> %s::vector) AS similarity
@@ -140,10 +146,38 @@ async def search_dir_summaries(query: str, repo_url: str, k: int = 5) -> str:
     return "\n---\n".join(results) if results else "No directory summaries found."
 
 
-@function_tool 
+@function_tool
 def git_log(path:str, limit:int = 10) -> list[str]:
     try:
         result = subprocess.run(["git", "log", "--pretty=format:%h %s", "-n", str(limit)], cwd=path, capture_output=True, text=True)
         return result.stdout.splitlines()
     except (subprocess.CalledProcessError, OSError):
         return []
+
+
+@function_tool
+async def ask_user(question: str, options: list[str] | None = None) -> str:
+    """Ask the user a clarifying question. Use when the query is ambiguous
+    or you need the user to choose between alternatives before proceeding."""
+    session_id = current_session_id.get()
+    pending_id = str(uuid.uuid4())
+    payload: dict = {"question": question}
+    if options is not None:
+        payload["options"] = options
+
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO pending_actions (id, session_id, kind, payload) "
+            "VALUES (%s, %s, 'ask_user', %s::jsonb)",
+            (pending_id, session_id, json.dumps(payload)),
+        )
+
+    await publish(session_id, {
+        "type": "data-needs-input",
+        "pendingId": pending_id,
+        "question": question,
+        "options": options,
+    })
+
+    return f"[Waiting for user response. Pending ID: {pending_id}]"

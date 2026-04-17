@@ -13,6 +13,8 @@ with workflow.unsafe.imports_passed_through():
         index_repo_activity,
         update_session_status_activity,
         agent_turn_activity,
+        cancel_pending_actions_activity,
+        resolve_pending_actions_activity,
     )
 
 
@@ -67,6 +69,16 @@ class CodebaseChatWorkflow:
 
             if self._user_messages:
                 content = self._user_messages.pop(0)
+
+                if self._pending:
+                    self._pending.clear()
+                    await workflow.execute_activity(
+                        resolve_pending_actions_activity,
+                        params.session_id,
+                        start_to_close_timeout=timedelta(seconds=15),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+
                 result = await workflow.execute_activity(
                     agent_turn_activity,
                     AgentTurnParams(session_id=params.session_id, content=content),
@@ -75,9 +87,13 @@ class CodebaseChatWorkflow:
                 )
                 if result.get("kind") == "paused":
                     self._pending[result["pending_id"]] = result.get("payload", {})
-            elif self._clarifications:
-                self._clarifications.pop(0)
 
+        await workflow.execute_activity(
+            cancel_pending_actions_activity,
+            params.session_id,
+            start_to_close_timeout=timedelta(seconds=15),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
         self._status = "ended"
         await workflow.execute_activity(
             update_session_status_activity,
