@@ -290,7 +290,7 @@ if (event.type === 'data-needs-input') {
 }
 
 // When user picks an option, just send it as a normal message
-handleSubmit("User login flow");
+sendMessage({ text: "User login flow" });
 ```
 
 ---
