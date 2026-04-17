@@ -8,9 +8,11 @@ with workflow.unsafe.imports_passed_through():
         IndexParams,
         ChatParams,
         SessionStatusParams,
+        AgentTurnParams,
         clone_repo_activity,
         index_repo_activity,
         update_session_status_activity,
+        agent_turn_activity,
     )
 
 
@@ -18,10 +20,15 @@ with workflow.unsafe.imports_passed_through():
 class CodebaseChatWorkflow:
     def __init__(self) -> None:
         self._ended = False
+        self._status: str = "starting"
         self._repo_dir: str | None = None
+        self._user_messages: list[str] = []
+        self._clarifications: list[tuple[str, dict]] = []
+        self._pending: dict[str, dict] = {}
 
     @workflow.run
     async def run(self, params: ChatParams) -> dict:
+        self._status = "indexing"
         await workflow.execute_activity(
             update_session_status_activity,
             SessionStatusParams(session_id=params.session_id, status="indexing"),
@@ -43,6 +50,7 @@ class CodebaseChatWorkflow:
             retry_policy=RetryPolicy(maximum_attempts=2),
         )
 
+        self._status = "ready"
         await workflow.execute_activity(
             update_session_status_activity,
             SessionStatusParams(session_id=params.session_id, status="ready"),
@@ -50,8 +58,27 @@ class CodebaseChatWorkflow:
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
 
-        await workflow.wait_condition(lambda: self._ended)
+        while not self._ended:
+            await workflow.wait_condition(
+                lambda: bool(self._user_messages) or bool(self._clarifications) or self._ended
+            )
+            if self._ended:
+                break
 
+            if self._user_messages:
+                content = self._user_messages.pop(0)
+                result = await workflow.execute_activity(
+                    agent_turn_activity,
+                    AgentTurnParams(session_id=params.session_id, content=content),
+                    start_to_close_timeout=timedelta(seconds=300),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+                if result.get("kind") == "paused":
+                    self._pending[result["pending_id"]] = result.get("payload", {})
+            elif self._clarifications:
+                self._clarifications.pop(0)
+
+        self._status = "ended"
         await workflow.execute_activity(
             update_session_status_activity,
             SessionStatusParams(session_id=params.session_id, status="ended"),
@@ -61,5 +88,22 @@ class CodebaseChatWorkflow:
         return {"session_id": params.session_id, "status": "ended"}
 
     @workflow.signal
-    def end(self) -> None:
+    def user_message(self, content: str) -> None:
+        self._user_messages.append(content)
+
+    @workflow.signal
+    def clarification_response(self, pending_id: str, value: dict) -> None:
+        self._clarifications.append((pending_id, value))
+        self._pending.pop(pending_id, None)
+
+    @workflow.signal
+    def end_session(self) -> None:
         self._ended = True
+
+    @workflow.query
+    def get_status(self) -> str:
+        return self._status
+
+    @workflow.query
+    def get_pending(self) -> list[dict]:
+        return [{"id": pid, **payload} for pid, payload in self._pending.items()]

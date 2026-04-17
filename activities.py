@@ -1,12 +1,18 @@
+import os
 from dataclasses import dataclass
 
 from temporalio import activity
+from agents import Runner, RunConfig, SQLiteSession
+from agents.exceptions import MaxTurnsExceeded
 
+from agent_defs import router_agent
 from services.clone_repo import ensure_repo_dir
 from services.walk_repo import collect_file_paths
 from services.chunk_and_embed import chunk_file_list
 from services.db import store_chunks, store_dir_summaries, get_pool
 from services.dir_summaries import generate_dir_summaries
+
+SESSION_DB_PATH = os.environ.get("AGENT_SESSION_DB", "agent_sessions.db")
 
 
 @dataclass
@@ -19,6 +25,12 @@ class IndexParams:
 class ChatParams:
     session_id: str
     repo_url: str
+
+
+@dataclass
+class AgentTurnParams:
+    session_id: str
+    content: str
 
 
 @dataclass
@@ -72,3 +84,49 @@ async def index_repo_activity(params: IndexParams) -> int:
     return len(chunks)
 
 
+@activity.defn
+async def agent_turn_activity(params: AgentTurnParams) -> dict:
+    """Run one router_agent turn. SDK session manages history automatically."""
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT repo_url FROM sessions WHERE id = %s",
+            (params.session_id,),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        raise RuntimeError(f"Session {params.session_id} not found")
+    repo_url = row[0]
+
+    repo_dir = await ensure_repo_dir(repo_url)
+    if repo_dir is None:
+        raise RuntimeError(f"Failed to resolve repo dir for {repo_url}")
+
+    session = SQLiteSession(params.session_id, SESSION_DB_PATH)
+
+    def prepend_repo_context(history, new_input):
+        context = {
+            "role": "developer",
+            "content": (
+                f"Local codebase path: {repo_dir}\n"
+                f"Indexed repo_url: {repo_url}\n"
+                "You are a senior developer and codebase expert. "
+                "Be concise but make sure to fully answer the user's question. "
+                "Cite file:line where relevant."
+            ),
+        }
+        return [context] + history + new_input
+
+    try:
+        result = await Runner.run(
+            router_agent,
+            params.content,
+            session=session,
+            run_config=RunConfig(session_input_callback=prepend_repo_context),
+            max_turns=20,
+        )
+        text = str(result.final_output)
+    except MaxTurnsExceeded:
+        text = "Agent exceeded max turns — try a more specific query."
+
+    return {"kind": "done", "parts": [{"type": "text", "text": text}]}
