@@ -147,14 +147,6 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
     if repo_dir is None:
         raise RuntimeError(f"Failed to resolve repo dir for {repo_url}")
 
-    # Persist user message
-    user_parts = [{"type": "text", "text": params.content}]
-    async with pool.connection() as conn, conn.cursor() as cur:
-        await cur.execute(
-            "INSERT INTO messages (session_id, role, parts) VALUES (%s, 'user', %s::jsonb)",
-            (params.session_id, json.dumps(user_parts)),
-        )
-
     # Insert placeholder assistant row
     async with pool.connection() as conn, conn.cursor() as cur:
         await cur.execute(

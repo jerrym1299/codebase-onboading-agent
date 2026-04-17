@@ -1,11 +1,16 @@
+import asyncio
+import json
 import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 from temporalio.client import Client
 from temporalio.worker import Worker
 from agents import Runner
 from agents.exceptions import MaxTurnsExceeded
+
+from services.event_bus import subscribe, unsubscribe
 
 from activities import (
     ChatParams,
@@ -253,5 +258,56 @@ async def get_session_messages_endpoint(session_id: str):
             for r in rows
         ],
     }
+
+
+@app.post("/sessions/{session_id}/messages")
+async def post_session_message_endpoint(session_id: str, payload: dict):
+    content = (payload or {}).get("content", "").strip()
+    if not content:
+        return {"error": "Missing 'content'."}
+
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT status FROM sessions WHERE id = %s", (session_id,),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return {"error": "Session not found."}
+
+    user_parts = [{"type": "text", "text": content}]
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO messages (session_id, role, parts) VALUES (%s, 'user', %s::jsonb)",
+            (session_id, json.dumps(user_parts)),
+        )
+
+    queue = subscribe(session_id)
+
+    handle = app.state.temporal_client.get_workflow_handle(f"chat-{session_id}")
+    await handle.signal(CodebaseChatWorkflow.user_message, content)
+
+    async def event_generator():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=300)
+                except asyncio.TimeoutError:
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("type") == "finish":
+                    break
+        finally:
+            unsubscribe(session_id, queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
