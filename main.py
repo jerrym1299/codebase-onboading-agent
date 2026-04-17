@@ -187,7 +187,7 @@ async def search_endpoint(repo_url: str, request: Request, k: int = 10):
                 "score": float(r[6]),
             }
             for r in rows
-        ]
+        ],
     }
 
 @app.post("/sessions")
