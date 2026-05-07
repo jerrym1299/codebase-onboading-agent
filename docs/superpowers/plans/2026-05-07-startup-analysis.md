@@ -10,7 +10,7 @@
 
 **Spec:** [docs/superpowers/specs/2026-05-07-startup-analysis-design.md](../specs/2026-05-07-startup-analysis-design.md)
 
-**Testing convention:** This project does NOT use pytest. Per CLAUDE.md, verification is curl/HTTP-based against a running FastAPI server (`docker compose up -d`, base URL `http://localhost:8000`). Each task ends with an inline Python or curl smoke check. A new manual script `scripts/test_startup_plan.py` (Task 11) is the equivalent of an integration test.
+**Testing convention:** This project does NOT use pytest. Per CLAUDE.md, verification is curl/HTTP-based against a running FastAPI server (`docker compose up -d`, base URL `http://localhost:8001`). Each task ends with an inline Python or curl smoke check. A new manual script `scripts/test_startup_plan.py` (Task 11) is the equivalent of an integration test.
 
 **Test repo:** `https://github.com/ThomasBenjaminCook/WattAppWebApp` per CLAUDE.md.
 
@@ -33,7 +33,7 @@ Expected: `fastapi`, `temporal`, `temporal-ui`, `postgres` services all show `ru
 - [ ] **Step 2: Smoke-check FastAPI**
 
 ```bash
-curl -s http://localhost:8000/ | python3 -m json.tool
+curl -s http://localhost:8001/ | python3 -m json.tool
 ```
 
 Expected: `{ "Hello": "world" }`.
@@ -1130,14 +1130,14 @@ docker compose restart fastapi
 Create a fresh session against a *different* repo (so the existing row from Task 4 step 3 doesn't trigger the idempotency skip):
 
 ```bash
-SESSION=$(curl -s -X POST http://localhost:8000/sessions \
+SESSION=$(curl -s -X POST http://localhost:8001/sessions \
   -H "Content-Type: application/json" \
   -d '{"repo_url":"https://github.com/jerrym1299/codebase-onboading-agent"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['session_id'])")
 echo "session=$SESSION"
 
 # Poll until ready
 for i in $(seq 1 60); do
-  STATUS=$(curl -s "http://localhost:8000/sessions/$SESSION" | python3 -c "import sys,json;print(json.load(sys.stdin).get('status'))")
+  STATUS=$(curl -s "http://localhost:8001/sessions/$SESSION" | python3 -c "import sys,json;print(json.load(sys.stdin).get('status'))")
   echo "[$i] $STATUS"
   [ "$STATUS" = "ready" ] && break
   sleep 2
@@ -1524,7 +1524,7 @@ sleep 4
 SESSION=$(docker compose exec postgres psql -U postgres -d codebase_agent -t -A -c \
   "SELECT id FROM sessions WHERE repo_url = 'https://github.com/jerrym1299/codebase-onboading-agent' ORDER BY created_at DESC LIMIT 1")
 echo "session=$SESSION"
-curl -s "http://localhost:8000/sessions/$SESSION/startup-plan" | python3 -m json.tool | head -40
+curl -s "http://localhost:8001/sessions/$SESSION/startup-plan" | python3 -m json.tool | head -40
 ```
 
 Expected: prints `analysis_status: "ok"` (or `"partial"`), a non-null `plan` object, and an `updated_at` timestamp.
@@ -1534,12 +1534,12 @@ Expected: prints `analysis_status: "ok"` (or `"partial"`), a non-null `plan` obj
 Create a brand new session against a never-analyzed repo, and immediately query the plan endpoint **before** the workflow finishes:
 
 ```bash
-NEW_SESSION=$(curl -s -X POST http://localhost:8000/sessions \
+NEW_SESSION=$(curl -s -X POST http://localhost:8001/sessions \
   -H "Content-Type: application/json" \
   -d '{"repo_url":"https://github.com/sindresorhus/awesome"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['session_id'])")
 echo "new=$NEW_SESSION"
 # Hit immediately — should be 404
-curl -s -o /dev/null -w "%{http_code}\n" "http://localhost:8000/sessions/$NEW_SESSION/startup-plan"
+curl -s -o /dev/null -w "%{http_code}\n" "http://localhost:8001/sessions/$NEW_SESSION/startup-plan"
 ```
 
 Expected: prints `404`. (If indexing is unusually fast you may already see 200 — try a larger repo if so.)
@@ -1599,16 +1599,16 @@ SESSION=$(docker compose exec postgres psql -U postgres -d codebase_agent -t -A 
   "SELECT id FROM sessions WHERE repo_url = 'https://github.com/jerrym1299/codebase-onboading-agent' ORDER BY created_at DESC LIMIT 1")
 
 # Capture the current updated_at
-BEFORE=$(curl -s "http://localhost:8000/sessions/$SESSION/startup-plan" | python3 -c "import sys,json;print(json.load(sys.stdin)['updated_at'])")
+BEFORE=$(curl -s "http://localhost:8001/sessions/$SESSION/startup-plan" | python3 -c "import sys,json;print(json.load(sys.stdin)['updated_at'])")
 echo "before=$BEFORE"
 
 # Trigger recompute
-curl -s -o /dev/null -w "%{http_code}\n" -X POST "http://localhost:8000/sessions/$SESSION/startup-plan/recompute" \
+curl -s -o /dev/null -w "%{http_code}\n" -X POST "http://localhost:8001/sessions/$SESSION/startup-plan/recompute" \
   -H "Content-Type: application/json" -d '{"reason":"manual smoke"}'
 
 # Poll until updated_at advances or 30s elapses
 for i in $(seq 1 30); do
-  AFTER=$(curl -s "http://localhost:8000/sessions/$SESSION/startup-plan" | python3 -c "import sys,json;print(json.load(sys.stdin)['updated_at'])")
+  AFTER=$(curl -s "http://localhost:8001/sessions/$SESSION/startup-plan" | python3 -c "import sys,json;print(json.load(sys.stdin)['updated_at'])")
   if [ "$AFTER" != "$BEFORE" ]; then
     echo "after=$AFTER (advanced after ${i}s)"
     break
@@ -1624,8 +1624,8 @@ Expected: HTTP 202, then `updated_at` advances within ~15 s.
 ```bash
 # Fire two recomputes in parallel — both should accept (the workflow
 # coalesces internally; there's no per-request rejection).
-(curl -s -o /dev/null -w "1:%{http_code}\n" -X POST "http://localhost:8000/sessions/$SESSION/startup-plan/recompute" -H "Content-Type: application/json" -d '{}' &
- curl -s -o /dev/null -w "2:%{http_code}\n" -X POST "http://localhost:8000/sessions/$SESSION/startup-plan/recompute" -H "Content-Type: application/json" -d '{}' &
+(curl -s -o /dev/null -w "1:%{http_code}\n" -X POST "http://localhost:8001/sessions/$SESSION/startup-plan/recompute" -H "Content-Type: application/json" -d '{}' &
+ curl -s -o /dev/null -w "2:%{http_code}\n" -X POST "http://localhost:8001/sessions/$SESSION/startup-plan/recompute" -H "Content-Type: application/json" -d '{}' &
  wait)
 ```
 
@@ -1663,7 +1663,7 @@ In one terminal, open a chat stream:
 SESSION=$(docker compose exec postgres psql -U postgres -d codebase_agent -t -A -c \
   "SELECT id FROM sessions WHERE repo_url = 'https://github.com/jerrym1299/codebase-onboading-agent' ORDER BY created_at DESC LIMIT 1")
 
-curl -N -X POST "http://localhost:8000/sessions/$SESSION/messages" \
+curl -N -X POST "http://localhost:8001/sessions/$SESSION/messages" \
   -H "Content-Type: application/json" \
   -d '{"content":"hi"}' | tee /tmp/sse.log &
 SSE_PID=$!
@@ -1675,7 +1675,7 @@ In a second shell (still in the repo dir):
 ```bash
 SESSION=$(docker compose exec postgres psql -U postgres -d codebase_agent -t -A -c \
   "SELECT id FROM sessions WHERE repo_url = 'https://github.com/jerrym1299/codebase-onboading-agent' ORDER BY created_at DESC LIMIT 1")
-curl -s -X POST "http://localhost:8000/sessions/$SESSION/startup-plan/recompute" -H "Content-Type: application/json" -d '{}'
+curl -s -X POST "http://localhost:8001/sessions/$SESSION/startup-plan/recompute" -H "Content-Type: application/json" -d '{}'
 ```
 
 Wait until the chat stream has emitted its `finish` (or kill the sse pid after ~30s):
@@ -1787,7 +1787,7 @@ def _stream_messages(base: str, session_id: str, content: str,
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", default="http://localhost:8000")
+    ap.add_argument("--base", default="http://localhost:8001")
     ap.add_argument("--repo", default=DEFAULT_REPO)
     args = ap.parse_args()
 
@@ -1903,11 +1903,11 @@ Inject `analysis_status='failed'` for a fresh repo to exercise rule 6 of the boo
 
 ```bash
 # 1. Create a session and wait for ready.
-SESSION=$(curl -s -X POST http://localhost:8000/sessions \
+SESSION=$(curl -s -X POST http://localhost:8001/sessions \
   -H "Content-Type: application/json" \
   -d '{"repo_url":"https://github.com/sindresorhus/awesome"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['session_id'])")
 for i in $(seq 1 90); do
-  S=$(curl -s "http://localhost:8000/sessions/$SESSION" | python3 -c "import sys,json;print(json.load(sys.stdin).get('status'))")
+  S=$(curl -s "http://localhost:8001/sessions/$SESSION" | python3 -c "import sys,json;print(json.load(sys.stdin).get('status'))")
   [ "$S" = "ready" ] && break
   sleep 2
 done
@@ -1917,7 +1917,7 @@ docker compose exec postgres psql -U postgres -d codebase_agent -c \
   "UPDATE startup_plans SET analysis_status='failed', error='synthetic failure', plan='{}'::jsonb WHERE repo_url='https://github.com/sindresorhus/awesome';"
 
 # 3. Ask the bootstrap agent and confirm it falls back to manifest discovery.
-curl -N -X POST "http://localhost:8000/sessions/$SESSION/messages" \
+curl -N -X POST "http://localhost:8001/sessions/$SESSION/messages" \
   -H "Content-Type: application/json" \
   -d '{"content":"how do I run this repo locally?"}' | head -c 4000
 ```
