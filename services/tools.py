@@ -92,10 +92,18 @@ _PY_IMPORT_PATTERNS = [
 @function_tool
 def get_dependencies(file_path: str) -> list[str]:
     """Extract import dependencies from a JS/TS/Python file."""
-    with open(file_path, "r", errors="replace") as f:
-        content = f.read()
+    p = Path(file_path)
+    if not p.exists():
+        return [f"ERROR: {file_path} does not exist."]
+    if p.is_dir():
+        return [f"ERROR: {file_path} is a directory."]
+    try:
+        with open(file_path, "r", errors="replace") as f:
+            content = f.read()
+    except OSError as e:
+        return [f"ERROR: {e}"]
 
-    ext = Path(file_path).suffix.lower()
+    ext = p.suffix.lower()
     patterns = _PY_IMPORT_PATTERNS if ext == ".py" else _JS_IMPORT_PATTERNS
 
     deps = []
@@ -147,19 +155,29 @@ async def search_dir_summaries(query: str, repo_url: str, k: int = 5) -> str:
 
 
 @function_tool
-def git_log(path:str, limit:int = 10) -> list[str]:
+def git_log(repo_dir: str, file_path: str = "", limit: int = 10) -> list[str]:
+    """Run `git log` inside repo_dir. If file_path is given, scope the log
+    to that file or directory (relative to repo_dir or absolute)."""
+    cmd = ["git", "-C", repo_dir, "log", "--pretty=format:%h %s", "-n", str(limit)]
+    if file_path:
+        cmd += ["--", file_path]
     try:
-        result = subprocess.run(["git", "log", "--pretty=format:%h %s", "-n", str(limit)], cwd=path, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return [f"ERROR: {result.stderr.strip() or 'git log failed'}"]
         return result.stdout.splitlines()
-    except (subprocess.CalledProcessError, OSError):
-        return []
+    except (subprocess.CalledProcessError, OSError) as e:
+        return [f"ERROR: {e}"]
 
 
 @function_tool
 async def ask_user(question: str, options: list[str] | None = None) -> str:
     """Ask the user a clarifying question. Use when the query is ambiguous
     or you need the user to choose between alternatives before proceeding."""
-    session_id = current_session_id.get()
+    try:
+        session_id = current_session_id.get()
+    except LookupError:
+        return "[ask_user unavailable: no active session context]"
     pending_id = str(uuid.uuid4())
     payload: dict = {"question": question}
     if options is not None:
