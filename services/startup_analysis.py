@@ -6,9 +6,13 @@ against the cloned repo, and persist the resulting plan.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from openai import OpenAI
 
 # Per-bucket character budgets. The total bundle is capped at ~32k chars;
 # if total exceeds the budget, drop buckets in reverse priority order.
@@ -211,3 +215,256 @@ def render_bundle(bundle: ContextBundle) -> str:
             f"{', '.join(bundle.truncations)}"
         )
     return "\n\n".join(blocks)
+
+
+# JSON schema enforced via OpenAI response_format. Strict mode requires every
+# property to be listed in `required`; nullability is expressed via `["type", "null"]`.
+PLAN_JSON_SCHEMA: dict = {
+    "name": "startup_plan",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["schema_version", "summary", "is_monorepo", "packages", "warnings"],
+        "properties": {
+            "schema_version": {"type": "string"},
+            "summary": {"type": "string"},
+            "is_monorepo": {"type": "boolean"},
+            "packages": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "path", "name", "framework", "runtime", "package_manager",
+                        "external_tools", "services", "env_vars", "steps",
+                    ],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "name": {"type": ["string", "null"]},
+                        "framework": {"type": ["string", "null"]},
+                        "runtime": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["language", "version", "version_source", "confidence"],
+                            "properties": {
+                                "language": {"type": "string"},
+                                "version": {"type": ["string", "null"]},
+                                "version_source": {"type": ["string", "null"]},
+                                "confidence": {"type": "number"},
+                            },
+                        },
+                        "package_manager": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["name", "version", "source", "confidence"],
+                            "properties": {
+                                "name": {"type": "string"},
+                                "version": {"type": ["string", "null"]},
+                                "source": {"type": ["string", "null"]},
+                                "confidence": {"type": "number"},
+                            },
+                        },
+                        "external_tools": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["name", "required", "reason", "confidence"],
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "required": {"type": "boolean"},
+                                    "reason": {"type": "string"},
+                                    "confidence": {"type": "number"},
+                                },
+                            },
+                        },
+                        "services": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["name", "image", "source", "confidence"],
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "image": {"type": ["string", "null"]},
+                                    "source": {"type": ["string", "null"]},
+                                    "confidence": {"type": "number"},
+                                },
+                            },
+                        },
+                        "env_vars": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": [
+                                    "name", "required", "example", "sources",
+                                    "confidence", "needs_verification",
+                                ],
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "required": {"type": "boolean"},
+                                    "example": {"type": ["string", "null"]},
+                                    "sources": {"type": "array", "items": {"type": "string"}},
+                                    "confidence": {"type": "number"},
+                                    "needs_verification": {"type": "boolean"},
+                                },
+                            },
+                        },
+                        "steps": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": [
+                                    "order", "title", "command", "cwd", "explain",
+                                    "confidence", "needs_verification",
+                                ],
+                                "properties": {
+                                    "order": {"type": "integer"},
+                                    "title": {"type": "string"},
+                                    "command": {"type": "string"},
+                                    "cwd": {"type": "string"},
+                                    "explain": {"type": "string"},
+                                    "confidence": {"type": "number"},
+                                    "needs_verification": {"type": "boolean"},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            "warnings": {"type": "array", "items": {"type": "string"}},
+        },
+    },
+    "strict": True,
+}
+
+
+SYSTEM_PROMPT = (
+    "You are a senior software engineer specializing in repository onboarding. "
+    "Given a curated bundle of files from a freshly cloned codebase, produce a "
+    "structured 'how to run this locally' plan. Be precise, cite real file paths "
+    "in `sources`/`source`/`version_source`, and assign honest `confidence` (0..1). "
+    "If you have to guess a value, set `needs_verification: true`. Do not invent "
+    "files, scripts, or commands that aren't supported by the bundle. If a piece "
+    "of information is genuinely unknown, omit it (use null where the schema "
+    "allows) and add a brief note to `warnings`."
+)
+
+ANALYSIS_MODEL = os.environ.get("STARTUP_ANALYSIS_MODEL", "gpt-5.4")
+
+
+_openai_client: OpenAI | None = None
+
+
+def _client() -> OpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAI()
+    return _openai_client
+
+
+@dataclass
+class AnalysisResult:
+    plan: dict
+    raw_response: str
+    prompt_tokens: int
+    completion_tokens: int
+
+
+def call_llm(bundle: ContextBundle) -> AnalysisResult:
+    """Call OpenAI with the response_format JSON schema. Raises on parse failure."""
+    rendered = render_bundle(bundle)
+    response = _client().chat.completions.create(
+        model=ANALYSIS_MODEL,
+        temperature=0.1,
+        response_format={"type": "json_schema", "json_schema": PLAN_JSON_SCHEMA},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": rendered},
+        ],
+    )
+    raw = response.choices[0].message.content or ""
+    plan = json.loads(raw)
+    usage = response.usage
+    return AnalysisResult(
+        plan=plan,
+        raw_response=raw,
+        prompt_tokens=getattr(usage, "prompt_tokens", 0),
+        completion_tokens=getattr(usage, "completion_tokens", 0),
+    )
+
+
+_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_PKG_RUN_RE = re.compile(r"^(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?([\w:.-]+)")
+
+
+def _package_json_scripts(repo_dir: Path, package_path: str) -> set[str]:
+    """Return the set of script names defined in package.json under package_path."""
+    candidate = repo_dir / package_path / "package.json"
+    if not candidate.is_file():
+        return set()
+    try:
+        data = json.loads(candidate.read_text())
+    except (OSError, json.JSONDecodeError):
+        return set()
+    scripts = data.get("scripts", {})
+    return set(scripts.keys()) if isinstance(scripts, dict) else set()
+
+
+def validate_plan(plan: dict, repo_dir: str) -> tuple[dict, str, float | None]:
+    """Mutate plan in place: downgrade confidence + flag needs_verification on
+    steps/env_vars/services that fail sanity checks. Returns (plan, status,
+    overall_confidence). status is 'ok' | 'partial' | 'failed'."""
+    root = Path(repo_dir)
+    packages = plan.get("packages", [])
+    if not packages:
+        return plan, "partial", None
+
+    surviving_steps = 0
+    total_steps = 0
+    confidences: list[float] = []
+
+    for pkg in packages:
+        pkg_path = pkg.get("path", ".")
+        scripts = _package_json_scripts(root, pkg_path)
+
+        for step in pkg.get("steps", []):
+            total_steps += 1
+            command = step.get("command", "")
+            cwd = step.get("cwd", ".")
+
+            cwd_ok = (root / cwd).is_dir() if cwd else True
+            cmd_ok = True
+            match = _PKG_RUN_RE.match(command.strip())
+            if match:
+                script_name = match.group(1)
+                if script_name not in {"install", "i", "ci"}:
+                    cmd_ok = script_name in scripts
+
+            if not cwd_ok or not cmd_ok:
+                step["confidence"] = min(step.get("confidence", 0.5), 0.3)
+                step["needs_verification"] = True
+            else:
+                surviving_steps += 1
+            confidences.append(step.get("confidence", 0.5))
+
+        for env in pkg.get("env_vars", []):
+            name = env.get("name", "")
+            if not _ENV_NAME_RE.match(name):
+                env["confidence"] = min(env.get("confidence", 0.5), 0.3)
+                env["needs_verification"] = True
+            confidences.append(env.get("confidence", 0.5))
+
+        for tool in pkg.get("external_tools", []):
+            confidences.append(tool.get("confidence", 0.5))
+        for svc in pkg.get("services", []):
+            confidences.append(svc.get("confidence", 0.5))
+        confidences.append(pkg.get("runtime", {}).get("confidence", 0.5))
+        confidences.append(pkg.get("package_manager", {}).get("confidence", 0.5))
+
+    overall = sum(confidences) / len(confidences) if confidences else None
+    if total_steps > 0 and surviving_steps == 0:
+        return plan, "partial", overall
+    return plan, "ok", overall
