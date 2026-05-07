@@ -17,7 +17,7 @@ tracer_agent = Agent[Any](
     instructions=(
         "You are an assistant to trace the execution path of the codebase. You are given a file:line and you need to trace the execution path of the codebase."
     ),
-    model="gpt-4.1-mini",
+    model="gpt-5.4",
     model_settings=ModelSettings(max_tokens=16384),
     tools=[read_file, find_references, get_dependencies, ask_user],
     handoff_description="Hand off to the tracer agent to trace the execution path of the codebase, follow execution paths, what calls X, what does X call, execution call follow execution paths",
@@ -36,7 +36,7 @@ explorer_agent = Agent[Any](
         "3. Use read_file only when the user wants the contents of a specific file or range.\n"
         "Keep responses concise — return paths or file:line entries, not prose summaries, unless asked."
     ),
-    model="gpt-4.1-mini",
+    model="gpt-5.4",
     model_settings=ModelSettings(max_tokens=16384),
     tools=[list_files, search_code, read_file, ask_user],
     handoff_description="Hand off to the explorer agent to find things in the codebase, give paths/file:lines, to search for specific functionality, symbols, classes or functions",
@@ -55,7 +55,7 @@ explainer_agent = Agent[Any](
         "search_indexed — queries the indexed chunks in the database, use it for semantic search and finding specific code chunks. \n"
         "Cite file paths and line ranges in your answer."
     ),
-    model="gpt-4.1-mini",
+    model="gpt-5.4",
     model_settings=ModelSettings(max_tokens=16384),
     tools=[search_indexed, search_dir_summaries, list_files, read_file, git_log, ask_user],
     handoff_description="Hand off to the explainer agent to summarise/synthesise information and answer 'explain X' or 'how does X work' questions.",
@@ -69,7 +69,7 @@ router_agent = Agent[Any](
         "For example if they say 'trace the flow' without specifying which flow, ask which one. "
         "Or if they ask 'how does the uploading work' and there are multiple upload workflows (e.g. files from computer to server vs server to AWS), ask which upload process they mean."
     ),
-    model="gpt-4.1-mini",
+    model="gpt-5.4",
     tools=[ask_user],
     handoffs=[explorer_agent, explainer_agent, tracer_agent],
 )

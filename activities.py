@@ -87,7 +87,7 @@ async def index_repo_activity(params: IndexParams) -> int:
     await store_chunks(params.repo_url, chunks)
 
     activity.logger.info("Generating per-directory summaries for %s", params.repo_url)
-    dir_sums = generate_dir_summaries(paths, params.repo_dir)
+    dir_sums = generate_dir_summaries(chunks, params.repo_dir)
     await store_dir_summaries(params.repo_url, dir_sums)
     activity.logger.info("Stored %d directory summaries", len(dir_sums))
 

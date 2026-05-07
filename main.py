@@ -164,10 +164,10 @@ async def explore_endpoint(repo_url: str, request: Request):
 
 SEARCH_SQL = """
     SELECT file_path, chunk_type, name, start_line, end_line, content,
-           1 - (embedding <=> %s::vector) AS similarity
+           1 - (embedding <=> %s::halfvec) AS similarity
     FROM code_chunks
     WHERE repo_url = %s
-    ORDER BY embedding <=> %s::vector
+    ORDER BY embedding <=> %s::halfvec
     LIMIT %s
 """
 

@@ -48,15 +48,14 @@ CREATE TABLE IF NOT EXISTS code_chunks (
     start_line INT NOT NULL,
     end_line INT NOT NULL,
     content TEXT NOT NULL,
-    embedding vector(1536) NOT NULL,
+    embedding halfvec(3072) NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT code_chunks_unique UNIQUE NULLS NOT DISTINCT
         (repo_url, file_path, start_line, chunk_type, name)
 );
 
 CREATE INDEX IF NOT EXISTS code_chunks_embedding_idx
-    ON code_chunks USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
+    ON code_chunks USING hnsw (embedding halfvec_cosine_ops);
 
 CREATE INDEX IF NOT EXISTS code_chunks_repo_idx
     ON code_chunks (repo_url);
@@ -67,14 +66,13 @@ CREATE TABLE IF NOT EXISTS dir_summaries (
     dir_path TEXT NOT NULL,
     summary TEXT NOT NULL,
     file_list TEXT[] NOT NULL DEFAULT '{}',
-    embedding vector(1536) NOT NULL,
+    embedding halfvec(3072) NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT dir_summaries_unique UNIQUE (repo_url, dir_path)
 );
 
 CREATE INDEX IF NOT EXISTS dir_summaries_embedding_idx
-    ON dir_summaries USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
+    ON dir_summaries USING hnsw (embedding halfvec_cosine_ops);
 
 CREATE INDEX IF NOT EXISTS dir_summaries_repo_idx
     ON dir_summaries (repo_url);

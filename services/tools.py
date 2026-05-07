@@ -12,10 +12,10 @@ from services.event_bus import publish
 current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar("current_session_id")
 SEARCH_SQL = """
     SELECT file_path, chunk_type, name, start_line, end_line, content,
-           1 - (embedding <=> %s::vector) AS similarity
+           1 - (embedding <=> %s::halfvec) AS similarity
     FROM code_chunks
     WHERE repo_url = %s
-    ORDER BY embedding <=> %s::vector
+    ORDER BY embedding <=> %s::halfvec
     LIMIT %s
 """
 
@@ -120,10 +120,10 @@ async def search_indexed(query: str, repo_url: str, k: int = 10) -> str:
 
 DIR_SUMMARY_SQL = """
     SELECT dir_path, summary, file_list,
-           1 - (embedding <=> %s::vector) AS similarity
+           1 - (embedding <=> %s::halfvec) AS similarity
     FROM dir_summaries
     WHERE repo_url = %s
-    ORDER BY embedding <=> %s::vector
+    ORDER BY embedding <=> %s::halfvec
     LIMIT %s
 """
 
