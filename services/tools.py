@@ -1,23 +1,18 @@
 import contextvars
 import json
-import uuid
-from pathlib import Path
 import re
 import subprocess
+import uuid
+from pathlib import Path
+
 from agents import function_tool
+
 from services.chunk_and_embed import embed_query
-from services.db import get_pool
+from services.db import CODE_SEARCH_SQL, DIR_SUMMARY_SEARCH_SQL, get_pool
 from services.event_bus import publish
 
 current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar("current_session_id")
-SEARCH_SQL = """
-    SELECT file_path, chunk_type, name, start_line, end_line, content,
-           1 - (embedding <=> %s::halfvec) AS similarity
-    FROM code_chunks
-    WHERE repo_url = %s
-    ORDER BY embedding <=> %s::halfvec
-    LIMIT %s
-"""
+
 
 def _list_files(dir_path: str, glob: str = "**/*") -> list[str]:
     return [str(p) for p in Path(dir_path).glob(glob) if p.is_file()]
@@ -117,7 +112,7 @@ async def search_indexed(query: str, repo_url: str, k: int = 10) -> str:
     emb = "[" + ",".join(repr(x) for x in embed_query(query)) + "]"
     pool = await get_pool()
     async with pool.connection() as conn, conn.cursor() as cur:
-        await cur.execute(SEARCH_SQL, (emb, repo_url, emb, k))
+        await cur.execute(CODE_SEARCH_SQL, (emb, repo_url, emb, k))
         rows = await cur.fetchall()
     results = []
     for r in rows:
@@ -125,15 +120,6 @@ async def search_indexed(query: str, repo_url: str, k: int = 10) -> str:
             f"[{r[6]:.3f}] {r[0]} ({r[1]}: {r[2]}) L{r[3]}-{r[4]}\n{r[5][:500]}"
         )
     return "\n---\n".join(results) if results else "No matching chunks found."
-
-DIR_SUMMARY_SQL = """
-    SELECT dir_path, summary, file_list,
-           1 - (embedding <=> %s::halfvec) AS similarity
-    FROM dir_summaries
-    WHERE repo_url = %s
-    ORDER BY embedding <=> %s::halfvec
-    LIMIT %s
-"""
 
 
 @function_tool
@@ -143,7 +129,7 @@ async def search_dir_summaries(query: str, repo_url: str, k: int = 5) -> str:
     emb = "[" + ",".join(repr(x) for x in embed_query(query)) + "]"
     pool = await get_pool()
     async with pool.connection() as conn, conn.cursor() as cur:
-        await cur.execute(DIR_SUMMARY_SQL, (emb, repo_url, emb, k))
+        await cur.execute(DIR_SUMMARY_SEARCH_SQL, (emb, repo_url, emb, k))
         rows = await cur.fetchall()
     results = []
     for r in rows:

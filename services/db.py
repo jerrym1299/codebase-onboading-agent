@@ -7,17 +7,36 @@ overwrites existing rows instead of duplicating them.
 """
 
 import os
+from dataclasses import dataclass
+
 import psycopg
-from psycopg_pool import AsyncConnectionPool
 from pgvector.psycopg import register_vector_async
+from psycopg_pool import AsyncConnectionPool
 
 from services.chunk_and_embed import CodeChunk
-from dataclasses import dataclass
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql://postgres:postgres@postgres:5432/codebase_agent",
 )
+
+CODE_SEARCH_SQL = """
+    SELECT file_path, chunk_type, name, start_line, end_line, content,
+           1 - (embedding <=> %s::halfvec) AS similarity
+    FROM code_chunks
+    WHERE repo_url = %s
+    ORDER BY embedding <=> %s::halfvec
+    LIMIT %s
+"""
+
+DIR_SUMMARY_SEARCH_SQL = """
+    SELECT dir_path, summary, file_list,
+           1 - (embedding <=> %s::halfvec) AS similarity
+    FROM dir_summaries
+    WHERE repo_url = %s
+    ORDER BY embedding <=> %s::halfvec
+    LIMIT %s
+"""
 
 _pool: AsyncConnectionPool | None = None
 

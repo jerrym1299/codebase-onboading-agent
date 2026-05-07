@@ -32,8 +32,8 @@ TESTS = [
      "where is the dockerfile",
      ["dockerfile", "Dockerfile"]),
     ("explorer", "Explorer",
-     "find the SEARCH_SQL constant",
-     ["SEARCH_SQL", "main.py"]),
+     "find the CODE_SEARCH_SQL constant",
+     ["CODE_SEARCH_SQL", "services/db.py"]),
 
     ("explainer", "Explainer",
      "explain how semantic search works in this codebase",
