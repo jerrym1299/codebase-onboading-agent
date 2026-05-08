@@ -32,6 +32,8 @@ ALWAYS_FILES = (
 )
 ALWAYS_GLOBS = ("requirements*.txt",)
 
+LOCKFILE_NAMES = frozenset({"poetry.lock", "uv.lock", "Cargo.toml", "Gemfile"})
+
 ENV_FILES = (".env.example", ".env.sample", ".env.template", ".env.dist")
 
 INFRA_FILES = (
@@ -119,7 +121,8 @@ def build_context(repo_dir: str) -> ContextBundle:
     # Priority 1 (highest): always
     always_entries: list[BundleEntry] = []
     for path in _collect_matches(root, ALWAYS_FILES, ALWAYS_GLOBS):
-        text = _read_text(path)
+        max_lines = 200 if path.name in LOCKFILE_NAMES else None
+        text = _read_text(path, max_lines=max_lines)
         if text is not None:
             always_entries.append(BundleEntry(
                 bucket="always",

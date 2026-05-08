@@ -313,7 +313,7 @@ async def get_session_startup_plan_endpoint(session_id: str):
         )
         row = await cur.fetchone()
     if row is None:
-        return {"error": "Session not found."}
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
     repo_url = row[0]
     plan_row = await get_startup_plan_row(repo_url)
     if plan_row is None:
@@ -340,7 +340,7 @@ async def post_session_startup_recompute_endpoint(session_id: str, payload: dict
         )
         row = await cur.fetchone()
     if row is None:
-        return {"error": "Session not found."}
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
     handle = app.state.temporal_client.get_workflow_handle(f"chat-{session_id}")
     await handle.signal("recompute_startup_plan", reason)
     return JSONResponse(status_code=202, content={"status": "recomputing", "session_id": session_id})
