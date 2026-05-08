@@ -28,8 +28,7 @@ env/
 # Docker                                
 *.log
 output.txt
-agent_sessions.db
-agent_sessions.db
-agent_sessions.db-wal
-agent_sessions.db-shm
-agent_sessions.db
+agent_sessions.db*
+
+# Claude
+.claude/

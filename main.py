@@ -1,27 +1,38 @@
 import asyncio
+import base64
 import json
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
-from temporalio.client import Client
-from temporalio.worker import Worker
 from agents import Runner
 from agents.exceptions import MaxTurnsExceeded
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from temporalio.client import Client
+from temporalio.worker import Worker
 
-from services.event_bus import subscribe, unsubscribe
-
+from agent_defs import bootstrap_agent, explorer_agent
 from activities import (
     ChatParams,
+    agent_turn_activity,
+    analyze_startup_activity,
+    cancel_pending_actions_activity,
     clone_repo_activity,
     index_repo_activity,
-    update_session_status_activity,
-    agent_turn_activity,
-    cancel_pending_actions_activity,
     resolve_pending_actions_activity,
+    update_session_status_activity,
 )
+from services.chunk_and_embed import AST_PARSERS, chunk_file_list, dump_ast, embed_query
+from services.clone_repo import ensure_repo_dir
+from services.db import (
+    CODE_SEARCH_SQL, close_pool, get_pool, get_startup_plan_row, init_schema, store_chunks,
+)
+from services.event_bus import subscribe, unsubscribe
+from services.pdf_output import write_markdown_pdf
+from services.tools import current_session_id
+from services.walk_repo import collect_file_paths, walk_repo
 from workflows import CodebaseChatWorkflow
+
 
 def _raw_query_param(request: Request, key: str) -> str:
     """Pull `key=...` from the raw query string with `%` treated as a literal char.
@@ -33,12 +44,7 @@ def _raw_query_param(request: Request, key: str) -> str:
             return part[len(prefix):].replace("+", " ")
     return ""
 
-from services.clone_repo import ensure_repo_dir
-from services.walk_repo import walk_repo, collect_file_paths
-from services.chunk_and_embed import chunk_file_list, AST_PARSERS, dump_ast
-from services.db import init_schema, store_chunks, close_pool, get_pool
-from agent_defs import explorer_agent
-from services.chunk_and_embed import embed_query
+
 CLONE_FAILED = {"error": "Failed to clone repository"}
 
 
@@ -56,6 +62,7 @@ async def lifespan(app):
         activities=[
             clone_repo_activity,
             index_repo_activity,
+            analyze_startup_activity,
             update_session_status_activity,
             agent_turn_activity,
             cancel_pending_actions_activity,
@@ -162,16 +169,6 @@ async def explore_endpoint(repo_url: str, request: Request):
         ],
     }
 
-SEARCH_SQL = """
-    SELECT file_path, chunk_type, name, start_line, end_line, content,
-           1 - (embedding <=> %s::vector) AS similarity
-    FROM code_chunks
-    WHERE repo_url = %s
-    ORDER BY embedding <=> %s::vector
-    LIMIT %s
-"""
-
-
 @app.get("/search")
 async def search_endpoint(repo_url: str, request: Request, k: int = 10):
     query = _raw_query_param(request, "query")
@@ -181,11 +178,10 @@ async def search_endpoint(repo_url: str, request: Request, k: int = 10):
     emb = "[" + ",".join(repr(x) for x in embed_query(query)) + "]"
     pool = await get_pool()
     async with pool.connection() as conn, conn.cursor() as cur:
-        await cur.execute(SEARCH_SQL, (emb, repo_url, emb, k))
+        await cur.execute(CODE_SEARCH_SQL, (emb, repo_url, emb, k))
         rows = await cur.fetchall()
     return {
         "results": [
-        
             {
                 "file_path": r[0],
                 "chunk_type": r[1],
@@ -309,5 +305,177 @@ async def post_session_message_endpoint(session_id: str, payload: dict):
             "Connection": "keep-alive",
         },
     )
+
+
+@app.get("/sessions/{session_id}/startup-plan")
+async def get_session_startup_plan_endpoint(session_id: str):
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT repo_url FROM sessions WHERE id = %s", (session_id,),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
+    repo_url = row[0]
+    plan_row = await get_startup_plan_row(repo_url)
+    if plan_row is None:
+        return JSONResponse(status_code=404, content={"status": "pending"})
+    return {
+        "repo_url": repo_url,
+        "plan": plan_row["plan"],
+        "analysis_status": plan_row["analysis_status"],
+        "overall_confidence": plan_row["overall_confidence"],
+        "model": plan_row["model"],
+        "truncations": plan_row["truncations"],
+        "error": plan_row["error"],
+        "updated_at": plan_row["updated_at"],
+    }
+
+
+@app.post("/sessions/{session_id}/startup-plan/recompute")
+async def post_session_startup_recompute_endpoint(session_id: str, payload: dict | None = None):
+    reason = ((payload or {}).get("reason") or "").strip()
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT repo_url FROM sessions WHERE id = %s", (session_id,),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
+    handle = app.state.temporal_client.get_workflow_handle(f"chat-{session_id}")
+    await handle.signal("recompute_startup_plan", reason)
+    return JSONResponse(status_code=202, content={"status": "recomputing", "session_id": session_id})
+
+
+_EXPORT_PROMPT = """You are producing a concise, user-facing "how to run this repo" document.
+
+Verify the plan below against the actual files at {repo_dir} (indexed as
+{repo_url}) using list_files, read_file, and get_dependencies. Use the
+verification only to correct inaccuracies — do NOT include the verification
+narrative in the output. Do NOT call recompute_startup_plan. The output response should not include
+comparisons to the startup plan, the user doesn't know about this, it should just be a polished, final guide
+on how to get the application running. 
+
+Output a single markdown document with EXACTLY these sections, in this order:
+
+# Startup plan: <repo name or short title>
+
+## Env vars (MAKE SURE TO INCLUDE ALL REQUIRED AND OPTIONAL ENV VARS, INCLUDING THOSE REFERENCED IN THE CODE BUT NOT IN .env.example or similar., check for these explicitly)
+
+### Required
+- `NAME` — one-line description of what this is for.
+- (one bullet per required env var; omit this subsection only if there are none)
+
+### Optional
+- `NAME` — one-line description.
+- (one bullet per optional env var; omit this subsection only if there are none)
+
+## Steps
+
+1. <imperative title>
+   ```
+   <command>
+   ```
+2. <imperative title>
+   ```
+   <command>
+   ```
+3. ...
+4. ...
+These steps should only be how to get the application running, it does not need to include further instructions
+on how to use the application (e.g. navigating ui, calling the api, etc). Make sure to include steps for installing requirements (and how to do so).
+
+
+## Runtime
+
+- Language + version, package manager + version. One bullet each. No commentary.
+
+## Services
+
+- One bullet per required service (e.g. `postgres (image: postgres:16)`). Omit
+  the section entirely if no services are needed.
+
+## External tools
+
+- One bullet per required tool (e.g. `Docker`, `Node 20+`). Omit the section
+  entirely if none.
+
+## Notes
+
+- Anything you were unsure about, low-confidence items, items missing from the
+  repo that the user should provide, or corrections worth flagging.
+- Be specific. One bullet per concern. Omit the section if there are no
+  concerns worth surfacing.
+- add a warning section if you are concerned or uncertain about anything.
+
+STRICT FORMATTING RULES:
+- Do NOT include phrases like "Verified command:", "Verified requirement:",
+  "Verified service:", or "Correction:" in the output.
+- Do NOT include examples of what you verified or how you verified it.
+- Do NOT cite `file:line` references in the user-facing sections (Env vars,
+  Steps, Runtime, Services, External tools). Citations belong only in Notes
+  if they help explain a concern.
+- Keep each bullet under ~120 characters where possible.
+
+PLAN (JSON, source of truth — verify and correct, don't paraphrase):
+{plan_json}
+"""
+
+
+@app.post("/sessions/{session_id}/startup-plan/export")
+async def post_session_startup_export_endpoint(session_id: str):
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT repo_url FROM sessions WHERE id = %s", (session_id,),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
+    repo_url = row[0]
+
+    plan_row = await get_startup_plan_row(repo_url)
+    if plan_row is None:
+        return JSONResponse(status_code=404, content={"status": "pending"})
+
+    repo_dir = await ensure_repo_dir(repo_url)
+    if repo_dir is None:
+        return JSONResponse(status_code=500, content={"error": "Failed to resolve repo dir."})
+
+    prompt = _EXPORT_PROMPT.format(
+        repo_dir=repo_dir,
+        repo_url=repo_url,
+        plan_json=json.dumps(plan_row["plan"], indent=2),
+    )
+
+    current_session_id.set(session_id)
+    try:
+        result = await Runner.run(bootstrap_agent, prompt, max_turns=20)
+    except MaxTurnsExceeded:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Agent exceeded max turns while verifying the plan."},
+        )
+
+    markdown = str(result.final_output)
+    pdf_safe = (
+        markdown
+        .replace("“", '"').replace("”", '"')
+        .replace("‘", "'").replace("’", "'")
+        .replace("–", "-").replace("—", "-")
+        .replace("…", "...")
+        .encode("latin-1", errors="replace").decode("latin-1")
+    )
+    pdf_path = write_markdown_pdf(pdf_safe, f"/tmp/startup_plans/{session_id}.pdf")
+    pdf_b64 = base64.b64encode(pdf_path.read_bytes()).decode("ascii")
+
+    return {
+        "session_id": session_id,
+        "repo_url": repo_url,
+        "markdown": markdown,
+        "pdf_base64": pdf_b64,
+    }
 
 

@@ -63,11 +63,12 @@ services:
       temporal:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      - "8001:8000"
     environment:
       - TEMPORAL_HOST=temporal:7233
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/codebase_agent
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
     volumes:
       - .:/app
     networks:

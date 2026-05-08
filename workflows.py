@@ -9,10 +9,12 @@ with workflow.unsafe.imports_passed_through():
         ChatParams,
         SessionStatusParams,
         AgentTurnParams,
+        AnalyzeStartupParams,
         clone_repo_activity,
         index_repo_activity,
         update_session_status_activity,
         agent_turn_activity,
+        analyze_startup_activity,
         cancel_pending_actions_activity,
         resolve_pending_actions_activity,
     )
@@ -24,12 +26,18 @@ class CodebaseChatWorkflow:
         self._ended = False
         self._status: str = "starting"
         self._repo_dir: str | None = None
+        self._repo_url: str | None = None
+        self._session_id: str | None = None
         self._user_messages: list[str] = []
         self._clarifications: list[tuple[str, dict]] = []
         self._pending: dict[str, dict] = {}
+        self._recompute_requested = False
+        self._recompute_reason = ""
 
     @workflow.run
     async def run(self, params: ChatParams) -> dict:
+        self._repo_url = params.repo_url
+        self._session_id = params.session_id
         self._status = "indexing"
         await workflow.execute_activity(
             update_session_status_activity,
@@ -52,6 +60,18 @@ class CodebaseChatWorkflow:
             retry_policy=RetryPolicy(maximum_attempts=2),
         )
 
+        await workflow.execute_activity(
+            analyze_startup_activity,
+            AnalyzeStartupParams(
+                session_id=params.session_id,
+                repo_url=params.repo_url,
+                repo_dir=self._repo_dir,
+                force=False,
+            ),
+            start_to_close_timeout=timedelta(seconds=120),
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+
         self._status = "ready"
         await workflow.execute_activity(
             update_session_status_activity,
@@ -62,10 +82,32 @@ class CodebaseChatWorkflow:
 
         while not self._ended:
             await workflow.wait_condition(
-                lambda: bool(self._user_messages) or bool(self._clarifications) or self._ended
+                lambda: bool(self._user_messages)
+                        or bool(self._clarifications)
+                        or self._recompute_requested
+                        or self._ended
             )
             if self._ended:
                 break
+
+            if self._recompute_requested:
+                self._recompute_requested = False
+                workflow.logger.info(
+                    "recompute_startup_plan signal: reason=%r", self._recompute_reason,
+                )
+                self._recompute_reason = ""
+                await workflow.execute_activity(
+                    analyze_startup_activity,
+                    AnalyzeStartupParams(
+                        session_id=params.session_id,
+                        repo_url=params.repo_url,
+                        repo_dir=self._repo_dir,
+                        force=True,
+                    ),
+                    start_to_close_timeout=timedelta(seconds=120),
+                    retry_policy=RetryPolicy(maximum_attempts=2),
+                )
+                continue
 
             if self._user_messages:
                 content = self._user_messages.pop(0)
@@ -115,6 +157,11 @@ class CodebaseChatWorkflow:
     @workflow.signal
     def end_session(self) -> None:
         self._ended = True
+
+    @workflow.signal
+    def recompute_startup_plan(self, reason: str = "") -> None:
+        self._recompute_requested = True
+        self._recompute_reason = reason
 
     @workflow.query
     def get_status(self) -> str:
