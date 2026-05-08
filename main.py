@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 from contextlib import asynccontextmanager
@@ -10,7 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from agent_defs import explorer_agent
+from agent_defs import bootstrap_agent, explorer_agent
 from activities import (
     ChatParams,
     agent_turn_activity,
@@ -27,6 +28,8 @@ from services.db import (
     CODE_SEARCH_SQL, close_pool, get_pool, get_startup_plan_row, init_schema, store_chunks,
 )
 from services.event_bus import subscribe, unsubscribe
+from services.pdf_output import write_markdown_pdf
+from services.tools import current_session_id
 from services.walk_repo import collect_file_paths, walk_repo
 from workflows import CodebaseChatWorkflow
 
@@ -344,5 +347,86 @@ async def post_session_startup_recompute_endpoint(session_id: str, payload: dict
     handle = app.state.temporal_client.get_workflow_handle(f"chat-{session_id}")
     await handle.signal("recompute_startup_plan", reason)
     return JSONResponse(status_code=202, content={"status": "recomputing", "session_id": session_id})
+
+
+_EXPORT_PROMPT = """You are verifying a precomputed startup plan for the repo at {repo_dir}.
+Indexed repo_url: {repo_url}.
+
+For each runtime / package_manager / external_tool / service / env_var / step in
+the plan below, use list_files, read_file, and get_dependencies to confirm the
+claim is grounded in the actual files. Correct any inaccuracies you find.
+
+Then output a single markdown document with sections in this order:
+# Startup plan: <name or repo>
+## Summary
+## Runtime
+## Package manager
+## External tools
+## Services
+## Env vars
+## Steps
+## Warnings
+
+Use bullet lists, fenced code blocks for commands, and cite `file:line` for
+each non-trivial fact you verified. Do NOT call recompute_startup_plan.
+
+PLAN (JSON):
+{plan_json}
+"""
+
+
+@app.post("/sessions/{session_id}/startup-plan/export")
+async def post_session_startup_export_endpoint(session_id: str):
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT repo_url FROM sessions WHERE id = %s", (session_id,),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
+    repo_url = row[0]
+
+    plan_row = await get_startup_plan_row(repo_url)
+    if plan_row is None:
+        return JSONResponse(status_code=404, content={"status": "pending"})
+
+    repo_dir = await ensure_repo_dir(repo_url)
+    if repo_dir is None:
+        return JSONResponse(status_code=500, content={"error": "Failed to resolve repo dir."})
+
+    prompt = _EXPORT_PROMPT.format(
+        repo_dir=repo_dir,
+        repo_url=repo_url,
+        plan_json=json.dumps(plan_row["plan"], indent=2),
+    )
+
+    current_session_id.set(session_id)
+    try:
+        result = await Runner.run(bootstrap_agent, prompt, max_turns=20)
+    except MaxTurnsExceeded:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Agent exceeded max turns while verifying the plan."},
+        )
+
+    markdown = str(result.final_output)
+    pdf_safe = (
+        markdown
+        .replace("“", '"').replace("”", '"')
+        .replace("‘", "'").replace("’", "'")
+        .replace("–", "-").replace("—", "-")
+        .replace("…", "...")
+        .encode("latin-1", errors="replace").decode("latin-1")
+    )
+    pdf_path = write_markdown_pdf(pdf_safe, f"/tmp/startup_plans/{session_id}.pdf")
+    pdf_b64 = base64.b64encode(pdf_path.read_bytes()).decode("ascii")
+
+    return {
+        "session_id": session_id,
+        "repo_url": repo_url,
+        "markdown": markdown,
+        "pdf_base64": pdf_b64,
+    }
 
 
