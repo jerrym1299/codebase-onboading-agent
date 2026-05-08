@@ -14,6 +14,7 @@ from agent_defs import explorer_agent
 from activities import (
     ChatParams,
     agent_turn_activity,
+    analyze_startup_activity,
     cancel_pending_actions_activity,
     clone_repo_activity,
     index_repo_activity,
@@ -56,6 +57,7 @@ async def lifespan(app):
         activities=[
             clone_repo_activity,
             index_repo_activity,
+            analyze_startup_activity,
             update_session_status_activity,
             agent_turn_activity,
             cancel_pending_actions_activity,
