@@ -1,14 +1,13 @@
 """
 LLM-first startup analysis: build a context bundle of key repo files,
-call OpenAI with a JSON-schema constrained response, validate commands
-against the cloned repo, and persist the resulting plan.
+call OpenAI with a JSON-schema constrained response, and persist the
+resulting plan.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -396,75 +395,3 @@ def call_llm(bundle: ContextBundle) -> AnalysisResult:
     )
 
 
-_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
-_PKG_RUN_RE = re.compile(r"^(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?([\w:.-]+)")
-
-
-def _package_json_scripts(repo_dir: Path, package_path: str) -> set[str]:
-    """Return the set of script names defined in package.json under package_path."""
-    candidate = repo_dir / package_path / "package.json"
-    if not candidate.is_file():
-        return set()
-    try:
-        data = json.loads(candidate.read_text())
-    except (OSError, json.JSONDecodeError):
-        return set()
-    scripts = data.get("scripts", {})
-    return set(scripts.keys()) if isinstance(scripts, dict) else set()
-
-
-def validate_plan(plan: dict, repo_dir: str) -> tuple[dict, str, float | None]:
-    """Mutate plan in place: downgrade confidence + flag needs_verification on
-    steps/env_vars/services that fail sanity checks. Returns (plan, status,
-    overall_confidence). status is 'ok' | 'partial' | 'failed'."""
-    root = Path(repo_dir)
-    packages = plan.get("packages", [])
-    if not packages:
-        return plan, "partial", None
-
-    surviving_steps = 0
-    total_steps = 0
-    confidences: list[float] = []
-
-    for pkg in packages:
-        pkg_path = pkg.get("path", ".")
-        scripts = _package_json_scripts(root, pkg_path)
-
-        for step in pkg.get("steps", []):
-            total_steps += 1
-            command = step.get("command", "")
-            cwd = step.get("cwd", ".")
-
-            cwd_ok = (root / cwd).is_dir() if cwd else True
-            cmd_ok = True
-            match = _PKG_RUN_RE.match(command.strip())
-            if match:
-                script_name = match.group(1)
-                if script_name not in {"install", "i", "ci"}:
-                    cmd_ok = script_name in scripts
-
-            if not cwd_ok or not cmd_ok:
-                step["confidence"] = min(step.get("confidence", 0.5), 0.3)
-                step["needs_verification"] = True
-            else:
-                surviving_steps += 1
-            confidences.append(step.get("confidence", 0.5))
-
-        for env in pkg.get("env_vars", []):
-            name = env.get("name", "")
-            if not _ENV_NAME_RE.match(name):
-                env["confidence"] = min(env.get("confidence", 0.5), 0.3)
-                env["needs_verification"] = True
-            confidences.append(env.get("confidence", 0.5))
-
-        for tool in pkg.get("external_tools", []):
-            confidences.append(tool.get("confidence", 0.5))
-        for svc in pkg.get("services", []):
-            confidences.append(svc.get("confidence", 0.5))
-        confidences.append(pkg.get("runtime", {}).get("confidence", 0.5))
-        confidences.append(pkg.get("package_manager", {}).get("confidence", 0.5))
-
-    overall = sum(confidences) / len(confidences) if confidences else None
-    if total_steps > 0 and surviving_steps == 0:
-        return plan, "partial", overall
-    return plan, "ok", overall

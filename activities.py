@@ -24,7 +24,7 @@ from services.db import (
     upsert_startup_plan,
 )
 from services.startup_analysis import (
-    ANALYSIS_MODEL, build_context, call_llm, validate_plan,
+    ANALYSIS_MODEL, build_context, call_llm,
 )
 from services.dir_summaries import generate_dir_summaries
 
@@ -133,35 +133,36 @@ async def analyze_startup_activity(params: AnalyzeStartupParams) -> dict:
     )
 
     status: str
-    overall: float | None
     plan: dict
     error: str | None = None
     try:
         result = call_llm(bundle)
-        plan, status, overall = validate_plan(result.plan, params.repo_dir)
+        plan = result.plan
+        status = "ok"
         activity.logger.info(
-            "LLM ok: prompt_tokens=%d completion_tokens=%d status=%s overall=%s",
-            result.prompt_tokens, result.completion_tokens, status, overall,
+            "LLM ok: prompt_tokens=%d completion_tokens=%d",
+            result.prompt_tokens, result.completion_tokens,
         )
     except json.JSONDecodeError as exc:
         activity.logger.warning("LLM JSON parse failed; retrying once: %s", exc)
         try:
             result = call_llm(bundle)
-            plan, status, overall = validate_plan(result.plan, params.repo_dir)
+            plan = result.plan
+            status = "ok"
         except Exception as exc2:
             activity.logger.error("LLM retry failed: %s", exc2)
-            plan, status, overall = {}, "failed", None
+            plan, status = {}, "failed"
             error = f"json_parse: {exc2}"
     except Exception as exc:
         activity.logger.exception("LLM call failed: %s", exc)
-        plan, status, overall = {}, "failed", None
+        plan, status = {}, "failed"
         error = str(exc)[:1000]
 
     await upsert_startup_plan(
         repo_url=params.repo_url,
         plan=plan,
         analysis_status=status,
-        overall_confidence=overall,
+        overall_confidence=None,
         model=ANALYSIS_MODEL,
         truncations=bundle.truncations,
         error=error,
