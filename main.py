@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from agents import Runner
 from agents.exceptions import MaxTurnsExceeded
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from temporalio.client import Client
 from temporalio.worker import Worker
 
@@ -23,7 +23,9 @@ from activities import (
 )
 from services.chunk_and_embed import AST_PARSERS, chunk_file_list, dump_ast, embed_query
 from services.clone_repo import ensure_repo_dir
-from services.db import CODE_SEARCH_SQL, close_pool, get_pool, init_schema, store_chunks
+from services.db import (
+    CODE_SEARCH_SQL, close_pool, get_pool, get_startup_plan_row, init_schema, store_chunks,
+)
 from services.event_bus import subscribe, unsubscribe
 from services.walk_repo import collect_file_paths, walk_repo
 from workflows import CodebaseChatWorkflow
@@ -300,5 +302,47 @@ async def post_session_message_endpoint(session_id: str, payload: dict):
             "Connection": "keep-alive",
         },
     )
+
+
+@app.get("/sessions/{session_id}/startup-plan")
+async def get_session_startup_plan_endpoint(session_id: str):
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT repo_url FROM sessions WHERE id = %s", (session_id,),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return {"error": "Session not found."}
+    repo_url = row[0]
+    plan_row = await get_startup_plan_row(repo_url)
+    if plan_row is None:
+        return JSONResponse(status_code=404, content={"status": "pending"})
+    return {
+        "repo_url": repo_url,
+        "plan": plan_row["plan"],
+        "analysis_status": plan_row["analysis_status"],
+        "overall_confidence": plan_row["overall_confidence"],
+        "model": plan_row["model"],
+        "truncations": plan_row["truncations"],
+        "error": plan_row["error"],
+        "updated_at": plan_row["updated_at"],
+    }
+
+
+@app.post("/sessions/{session_id}/startup-plan/recompute")
+async def post_session_startup_recompute_endpoint(session_id: str, payload: dict | None = None):
+    reason = ((payload or {}).get("reason") or "").strip()
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT repo_url FROM sessions WHERE id = %s", (session_id,),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return {"error": "Session not found."}
+    handle = app.state.temporal_client.get_workflow_handle(f"chat-{session_id}")
+    await handle.signal("recompute_startup_plan", reason)
+    return JSONResponse(status_code=202, content={"status": "recomputing", "session_id": session_id})
 
 
