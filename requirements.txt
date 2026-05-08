@@ -1,4 +1,6 @@
 fastapi==0.135.3
+fpdf2
+markdown
 openai
 openai-agents
 pgvector
