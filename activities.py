@@ -19,7 +19,13 @@ from services.event_bus import publish
 from services.tools import current_session_id
 from services.walk_repo import collect_file_paths
 from services.chunk_and_embed import chunk_file_list
-from services.db import store_chunks, store_dir_summaries, get_pool
+from services.db import (
+    get_pool, get_startup_plan_row, store_chunks, store_dir_summaries,
+    upsert_startup_plan,
+)
+from services.startup_analysis import (
+    ANALYSIS_MODEL, build_context, call_llm,
+)
 from services.dir_summaries import generate_dir_summaries
 
 SESSION_DB_PATH = os.environ.get("AGENT_SESSION_DB", "agent_sessions.db")
@@ -47,6 +53,14 @@ class AgentTurnParams:
 class SessionStatusParams:
     session_id: str
     status: str
+
+
+@dataclass
+class AnalyzeStartupParams:
+    session_id: str
+    repo_url: str
+    repo_dir: str
+    force: bool = False
 
 
 @activity.defn
@@ -87,11 +101,80 @@ async def index_repo_activity(params: IndexParams) -> int:
     await store_chunks(params.repo_url, chunks)
 
     activity.logger.info("Generating per-directory summaries for %s", params.repo_url)
-    dir_sums = generate_dir_summaries(paths, params.repo_dir)
+    dir_sums = generate_dir_summaries(chunks, params.repo_dir)
     await store_dir_summaries(params.repo_url, dir_sums)
     activity.logger.info("Stored %d directory summaries", len(dir_sums))
 
     return len(chunks)
+
+
+@activity.defn
+async def analyze_startup_activity(params: AnalyzeStartupParams) -> dict:
+    """Build a context bundle, call the LLM, validate the plan, persist it,
+    and notify the session bus that the plan is updated. Idempotent on
+    repo_url unless force=True."""
+    if not params.force:
+        existing = await get_startup_plan_row(params.repo_url)
+        if existing is not None:
+            await publish(params.session_id, {
+                "type": "data-startup-plan-updated",
+                "updatedAt": existing["updated_at"],
+            })
+            return {"status": existing["analysis_status"], "skipped": True}
+
+    activity.logger.info(
+        "Analyzing startup for %s (force=%s)", params.repo_url, params.force,
+    )
+
+    bundle = build_context(params.repo_dir)
+    activity.logger.info(
+        "Context bundle: entries=%d chars=%d truncations=%s",
+        len(bundle.entries), bundle.total_chars, bundle.truncations,
+    )
+
+    status: str
+    plan: dict
+    error: str | None = None
+    try:
+        result = call_llm(bundle)
+        plan = result.plan
+        status = "ok"
+        activity.logger.info(
+            "LLM ok: prompt_tokens=%d completion_tokens=%d",
+            result.prompt_tokens, result.completion_tokens,
+        )
+    except json.JSONDecodeError as exc:
+        activity.logger.warning("LLM JSON parse failed; retrying once: %s", exc)
+        try:
+            result = call_llm(bundle)
+            plan = result.plan
+            status = "ok"
+        except Exception as exc2:
+            activity.logger.error("LLM retry failed: %s", exc2)
+            plan, status = {}, "failed"
+            error = f"json_parse: {exc2}"
+    except Exception as exc:
+        activity.logger.exception("LLM call failed: %s", exc)
+        plan, status = {}, "failed"
+        error = str(exc)[:1000]
+
+    await upsert_startup_plan(
+        repo_url=params.repo_url,
+        plan=plan,
+        analysis_status=status,
+        overall_confidence=None,
+        model=ANALYSIS_MODEL,
+        truncations=bundle.truncations,
+        error=error,
+    )
+
+    fresh = await get_startup_plan_row(params.repo_url)
+    await publish(params.session_id, {
+        "type": "data-startup-plan-updated",
+        "updatedAt": fresh["updated_at"] if fresh else None,
+    })
+
+    return {"status": status, "skipped": False}
 
 
 @activity.defn
