@@ -1,14 +1,18 @@
 import contextvars
 import json
+import os
 import re
 import subprocess
 import uuid
 from pathlib import Path
 
 from agents import function_tool
+from temporalio.client import Client
 
 from services.chunk_and_embed import embed_query
-from services.db import CODE_SEARCH_SQL, DIR_SUMMARY_SEARCH_SQL, get_pool
+from services.db import (
+    CODE_SEARCH_SQL, DIR_SUMMARY_SEARCH_SQL, get_pool, get_startup_plan_row,
+)
 from services.event_bus import publish
 
 current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar("current_session_id")
@@ -185,3 +189,106 @@ async def ask_user(question: str, options: list[str] | None = None) -> str:
     })
 
     return f"[Waiting for user response. Pending ID: {pending_id}]"
+
+
+def _format_plan_for_llm(row: dict) -> str:
+    plan = row.get("plan") or {}
+    status = row.get("analysis_status")
+    if status == "failed":
+        return (
+            f"Startup plan analysis FAILED for this repo "
+            f"(error: {row.get('error', 'unknown')}). "
+            "Investigate manually using list_files and read_file."
+        )
+    lines: list[str] = []
+    lines.append(f"# Startup plan ({status}, confidence={row.get('overall_confidence')})")
+    if plan.get("summary"):
+        lines.append(plan["summary"])
+    if row.get("truncations"):
+        lines.append(f"_Note: dropped from context: {', '.join(row['truncations'])}_")
+    for pkg in plan.get("packages", []):
+        lines.append(f"\n## Package: {pkg.get('path', '.')} ({pkg.get('framework') or 'unknown'})")
+        rt = pkg.get("runtime", {})
+        lines.append(
+            f"- Runtime: {rt.get('language')} {rt.get('version') or ''} "
+            f"(source: {rt.get('version_source')}, conf {rt.get('confidence')})"
+        )
+        pm = pkg.get("package_manager", {})
+        lines.append(
+            f"- Package manager: {pm.get('name')} {pm.get('version') or ''} "
+            f"(source: {pm.get('source')}, conf {pm.get('confidence')})"
+        )
+        if pkg.get("external_tools"):
+            lines.append("- External tools:")
+            for t in pkg["external_tools"]:
+                req = "REQUIRED" if t.get("required") else "optional"
+                lines.append(f"  - {t.get('name')} ({req}): {t.get('reason')}")
+        if pkg.get("services"):
+            lines.append("- Services:")
+            for s in pkg["services"]:
+                lines.append(
+                    f"  - {s.get('name')} ({s.get('image') or '?'}, source {s.get('source')})"
+                )
+        if pkg.get("env_vars"):
+            lines.append("- Env vars:")
+            for e in pkg["env_vars"]:
+                req = "REQUIRED" if e.get("required") else "optional"
+                flag = " [needs verification]" if e.get("needs_verification") else ""
+                lines.append(
+                    f"  - {e.get('name')} ({req}, conf {e.get('confidence')}){flag}: "
+                    f"example={e.get('example')!r} sources={e.get('sources') or []}"
+                )
+        if pkg.get("steps"):
+            lines.append("- Steps:")
+            for step in sorted(pkg["steps"], key=lambda s: s.get("order", 0)):
+                flag = " [needs verification]" if step.get("needs_verification") else ""
+                lines.append(
+                    f"  {step.get('order')}. {step.get('title')}: "
+                    f"`{step.get('command')}` (cwd={step.get('cwd')}, "
+                    f"conf {step.get('confidence')}){flag}"
+                )
+                if step.get("explain"):
+                    lines.append(f"     {step['explain']}")
+    if plan.get("warnings"):
+        lines.append("\n## Warnings")
+        for w in plan["warnings"]:
+            lines.append(f"- {w}")
+    return "\n".join(lines)
+
+
+@function_tool
+async def get_startup_plan(repo_url: str) -> str:
+    """Return the persisted startup plan for a repo, formatted for the LLM.
+    Returns 'no plan available' when nothing has been computed yet."""
+    row = await get_startup_plan_row(repo_url)
+    if row is None:
+        return "No startup plan available for this repo yet."
+    return _format_plan_for_llm(row)
+
+
+_temporal_client: Client | None = None
+
+
+async def _temporal() -> Client:
+    global _temporal_client
+    if _temporal_client is None:
+        _temporal_client = await Client.connect(
+            os.environ.get("TEMPORAL_HOST", "temporal:7233")
+        )
+    return _temporal_client
+
+
+@function_tool
+async def recompute_startup_plan(repo_url: str, reason: str = "") -> str:
+    """Signal the current session's workflow to recompute the startup plan."""
+    try:
+        session_id = current_session_id.get()
+    except LookupError:
+        return "[recompute_startup_plan unavailable: no active session context]"
+    client = await _temporal()
+    handle = client.get_workflow_handle(f"chat-{session_id}")
+    await handle.signal("recompute_startup_plan", reason)
+    return (
+        f"Recompute requested for {repo_url}. "
+        "The new plan will appear in a few seconds; re-call get_startup_plan to read it."
+    )
