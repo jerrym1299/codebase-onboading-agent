@@ -5,6 +5,7 @@ from services.tools import (
     list_files, search_code, read_file,
     find_references, get_dependencies, search_indexed, search_dir_summaries, git_log,
     ask_user,
+    get_startup_plan, recompute_startup_plan,
 )
 
 #Explorer agent finds exact matches in the codebase.
@@ -70,15 +71,68 @@ explainer_agent = Agent[Any](
     ),
     model="gpt-5.4",
     model_settings=ModelSettings(max_tokens=16384),
-    tools=[search_indexed, search_dir_summaries, list_files, read_file, git_log, ask_user],
+    tools=[search_indexed, search_dir_summaries, list_files, read_file, git_log, ask_user, get_startup_plan],
     handoffs=[tracer_agent],
     handoff_description="Hand off to the explainer agent to summarise/synthesise information and answer 'explain X' or 'how does X work' questions.",
+)
+
+bootstrap_agent = Agent[Any](
+    name="Bootstrap",
+    instructions=(
+        "You help users get a codebase running locally. You have a precomputed "
+        "startup plan for this repo, accessible via `get_startup_plan(repo_url)`. "
+        "The plan is the source of truth — start every answer by reading it.\n"
+        "\n"
+        "Routing rules:\n"
+        "1. 'How do I run this' / 'how do I start this' / 'what do I need to install' → "
+        "read the plan, summarise: runtime, install command, required services, env vars, "
+        "step-by-step. Cite step numbers from the plan.\n"
+        "2. 'What env vars do I need' → list `env_vars` from the plan, marking required vs "
+        "optional and flagging items where `needs_verification: true` or `example` is null.\n"
+        "3. 'Why do I need X' → cite the `sources` array on the relevant plan entry. Use "
+        "`read_file` on those sources only if the user asks for more detail.\n"
+        "4. 'Re-analyse this repo' / 'I added a new env var, update the plan' → call "
+        "`recompute_startup_plan(repo_url, reason)`, tell the user it's running, then re-read "
+        "the plan when finished.\n"
+        "5. If the plan is missing a value the user is asking about (`needs_verification`, "
+        "no example, low confidence), use `ask_user` to clarify — but don't pre-emptively "
+        "ask; only when answering depends on it.\n"
+        "6. If `analysis_status == 'failed'` (or `get_startup_plan` returns 'no plan "
+        "available'), investigate independently. Use `list_files` to find manifests "
+        "(package.json, pyproject.toml, go.mod, Cargo.toml, Gemfile, pom.xml, etc.), "
+        "`read_file` on them and any `.env.example` / `Dockerfile` / `docker-compose.yml` / "
+        "`Makefile` you find, `get_dependencies` for import graphs, and `search_indexed` "
+        "for natural-language hints. Synthesise a startup walkthrough from what you find. "
+        "Cite `file:line` for every command, env var, and service. Do NOT call "
+        "`recompute_startup_plan` automatically — only if the user asks.\n"
+        "\n"
+        "Always cite step numbers and `file:line` sources. Don't invent commands or env vars. "
+        "If the plan doesn't cover something, say so."
+    ),
+    model="gpt-5.4",
+    model_settings=ModelSettings(max_tokens=16384),
+    tools=[
+        get_startup_plan,
+        recompute_startup_plan,
+        list_files,
+        read_file,
+        get_dependencies,
+        search_indexed,
+        ask_user,
+    ],
+    handoffs=[explainer_agent, tracer_agent],
+    handoff_description=(
+        "Hand off to the bootstrap agent for any question about getting the project "
+        "running locally: install commands, env vars, required services, dependencies, "
+        "Docker setup, dev-server startup, or 'how do I run this'."
+    ),
 )
 
 router_agent = Agent[Any](
     name="Router",
     instructions=(
-        "You are a router to route the users question to the appropriate agent, you can hand off to the explorer agent to find things in the codebase, the explainer agent to summarise and synthesise information, or the tracer agent to trace the execution path of the codebase. After handing off to one agent you can hand off to another agent. You should ensure you completely and directly answer the users question and pick up all information from the previous agents/related to the question.\n"
+        "You are a router to route the users question to the appropriate agent, you can hand off to the explorer agent to find things in the codebase, the explainer agent to summarise and synthesise information, the tracer agent to trace the execution path of the codebase, or the bootstrap agent for questions about getting the repo running locally. After handing off to one agent you can hand off to another agent. You should ensure you completely and directly answer the users question and pick up all information from the previous agents/related to the question.\n"
+        "Any question about getting the repo running locally (install, env vars, services, dev-server, Docker setup, 'how do I run this') goes to the bootstrap agent.\n"
         "Any git-related question (commit history, when/why something changed, recent changes, who/what touched a file, 'what changed recently') goes to the explainer agent — it is the only agent with `git_log`.\n"
         "If you believe the question is ambiguous or unfinished, you can use ask_user to clarify before proceeding. "
         "For example if they say 'trace the flow' without specifying which flow, ask which one. "
@@ -86,5 +140,5 @@ router_agent = Agent[Any](
     ),
     model="gpt-5.4",
     tools=[ask_user],
-    handoffs=[explorer_agent, explainer_agent, tracer_agent],
+    handoffs=[explorer_agent, explainer_agent, tracer_agent, bootstrap_agent],
 )
