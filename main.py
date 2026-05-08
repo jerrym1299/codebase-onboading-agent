@@ -349,28 +349,77 @@ async def post_session_startup_recompute_endpoint(session_id: str, payload: dict
     return JSONResponse(status_code=202, content={"status": "recomputing", "session_id": session_id})
 
 
-_EXPORT_PROMPT = """You are verifying a precomputed startup plan for the repo at {repo_dir}.
-Indexed repo_url: {repo_url}.
+_EXPORT_PROMPT = """You are producing a concise, user-facing "how to run this repo" document.
 
-For each runtime / package_manager / external_tool / service / env_var / step in
-the plan below, use list_files, read_file, and get_dependencies to confirm the
-claim is grounded in the actual files. Correct any inaccuracies you find.
+Verify the plan below against the actual files at {repo_dir} (indexed as
+{repo_url}) using list_files, read_file, and get_dependencies. Use the
+verification only to correct inaccuracies — do NOT include the verification
+narrative in the output. Do NOT call recompute_startup_plan. The output response should not include
+comparisons to the startup plan, the user doesn't know about this, it should just be a polished, final guide
+on how to get the application running. 
 
-Then output a single markdown document with sections in this order:
-# Startup plan: <name or repo>
-## Summary
-## Runtime
-## Package manager
-## External tools
-## Services
-## Env vars
+Output a single markdown document with EXACTLY these sections, in this order:
+
+# Startup plan: <repo name or short title>
+
+## Env vars (MAKE SURE TO INCLUDE ALL REQUIRED AND OPTIONAL ENV VARS, INCLUDING THOSE REFERENCED IN THE CODE BUT NOT IN .env.example or similar., check for these explicitly)
+
+### Required
+- `NAME` — one-line description of what this is for.
+- (one bullet per required env var; omit this subsection only if there are none)
+
+### Optional
+- `NAME` — one-line description.
+- (one bullet per optional env var; omit this subsection only if there are none)
+
 ## Steps
-## Warnings
 
-Use bullet lists, fenced code blocks for commands, and cite `file:line` for
-each non-trivial fact you verified. Do NOT call recompute_startup_plan.
+1. <imperative title>
+   ```
+   <command>
+   ```
+2. <imperative title>
+   ```
+   <command>
+   ```
+3. ...
+4. ...
+These steps should only be how to get the application running, it does not need to include further instructions
+on how to use the application (e.g. navigating ui, calling the api, etc). Make sure to include steps for installing requirements (and how to do so).
 
-PLAN (JSON):
+
+## Runtime
+
+- Language + version, package manager + version. One bullet each. No commentary.
+
+## Services
+
+- One bullet per required service (e.g. `postgres (image: postgres:16)`). Omit
+  the section entirely if no services are needed.
+
+## External tools
+
+- One bullet per required tool (e.g. `Docker`, `Node 20+`). Omit the section
+  entirely if none.
+
+## Notes
+
+- Anything you were unsure about, low-confidence items, items missing from the
+  repo that the user should provide, or corrections worth flagging.
+- Be specific. One bullet per concern. Omit the section if there are no
+  concerns worth surfacing.
+- add a warning section if you are concerned or uncertain about anything.
+
+STRICT FORMATTING RULES:
+- Do NOT include phrases like "Verified command:", "Verified requirement:",
+  "Verified service:", or "Correction:" in the output.
+- Do NOT include examples of what you verified or how you verified it.
+- Do NOT cite `file:line` references in the user-facing sections (Env vars,
+  Steps, Runtime, Services, External tools). Citations belong only in Notes
+  if they help explain a concern.
+- Keep each bullet under ~120 characters where possible.
+
+PLAN (JSON, source of truth — verify and correct, don't paraphrase):
 {plan_json}
 """
 
