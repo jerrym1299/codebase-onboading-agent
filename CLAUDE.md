@@ -10,35 +10,41 @@ HTTP (FastAPI)        Temporal workflow            Activities                 Ag
 main.py               CodebaseChatWorkflow         clone_repo_activity        router_agent
   POST /sessions  ──▶   indexing → ready ──▶         ensure_repo_dir            ├── explorer_agent
   POST /…/messages ─signal▶ user_message              index_repo_activity        ├── explainer_agent
-  GET  /…/messages       wait_condition loop          chunk_file_list +          └── tracer_agent
-  SSE stream  ◀──── event_bus.publish                 generate_dir_summaries
-                                                    agent_turn_activity ──────▶ Runner.run_streamed
-                                                                                + SQLiteSession
+  GET  /…/messages       wait_condition loop          chunk_file_list +          ├── tracer_agent
+  POST /…/startup-plan/recompute                       generate_dir_summaries    └── bootstrap_agent
+  POST /…/startup-plan/export                        analyze_startup_activity
+  GET  /…/startup-plan                                 build_context + call_llm
+  SSE stream  ◀──── event_bus.publish                                          Runner.run_streamed
+                                                    agent_turn_activity ──────▶ + SQLiteSession
                                                     cancel/resolve_pending_actions
 ```
 
-One **Temporal workflow per session**, one **chat thread per workflow**, one **repo per session**. The workflow owns the session lifecycle (`indexing` → `ready` → `ended`) and routes every user message to a single `agent_turn_activity` that streams events to a per-session pubsub which the FastAPI SSE endpoint forwards to the client.
+One **Temporal workflow per session**, one **chat thread per workflow**, one **repo per session**. The workflow owns the session lifecycle (`indexing` → `ready` → `ended`), produces a persisted `startup_plans` row during indexing via `analyze_startup_activity`, and routes every user message to a single `agent_turn_activity` that streams events to a per-session pubsub which the FastAPI SSE endpoint forwards to the client.
+
+A planned multi-repo extension (one session over N repos with a consolidated app-level plan) is fully designed but **not yet implemented** — see [docs/multi_repo_startup_plan.md](docs/multi_repo_startup_plan.md). Anything below describes the current single-repo behaviour.
 
 ## Repo layout
 
 | Path | Role |
 |---|---|
 | `main.py` | FastAPI app. Owns lifespan (init Postgres schema, start Temporal worker on task queue `onboarding-queue`), HTTP endpoints, SSE streaming. |
-| `workflows.py` | `CodebaseChatWorkflow` — durable per-session orchestrator. Signals: `user_message`, `clarification_response`, `end_session`. Queries: `get_status`, `get_pending`. |
-| `activities.py` | All six Temporal activities (`clone_repo_activity`, `index_repo_activity`, `update_session_status_activity`, `agent_turn_activity`, `cancel_pending_actions_activity`, `resolve_pending_actions_activity`) + dataclass params (`IndexParams`, `ChatParams`, `AgentTurnParams`, `SessionStatusParams`). Streaming agent turn lives here. |
-| `agent_defs.py` | The four agents (`router`, `explorer`, `explainer`, `tracer`) with their tool sets, prompts, handoffs. |
+| `workflows.py` | `CodebaseChatWorkflow` — durable per-session orchestrator. Signals: `user_message`, `clarification_response`, `end_session`, `recompute_startup_plan`. Queries: `get_status`, `get_pending`. |
+| `activities.py` | All seven Temporal activities (`clone_repo_activity`, `index_repo_activity`, `analyze_startup_activity`, `update_session_status_activity`, `agent_turn_activity`, `cancel_pending_actions_activity`, `resolve_pending_actions_activity`) + dataclass params (`IndexParams`, `ChatParams`, `AgentTurnParams`, `SessionStatusParams`, `AnalyzeStartupParams`). Streaming agent turn lives here. |
+| `agent_defs.py` | The five agents (`router`, `explorer`, `explainer`, `tracer`, `bootstrap`) with their tool sets, prompts, handoffs. All on `gpt-5.4` with `max_tokens=16384`. |
 | `services/clone_repo.py` | `git clone` with optional `GITHUB_TOKEN` injection; idempotent `ensure_repo_dir`. |
 | `services/walk_repo.py` | Filtered file iteration (skips `node_modules`, `.git`, build dirs; keeps source/markup/docs extensions). |
 | `services/chunk_and_embed.py` | Tree-sitter AST chunking for Python/JS/TS/TSX, markdown heading split, whole-file fallback for config/HTML/CSS/shell. Token-budget splitter + OpenAI batch embedding. |
-| `services/dir_summaries.py` | LLM-generated per-directory natural-language summaries, then embedded for high-level semantic browsing. |
-| `services/db.py` | Postgres + pgvector pool, schema bootstrap, upserts for `code_chunks` and `dir_summaries`. |
-| `services/tools.py` | Function tools exposed to the agents (file/code search, semantic search, references, deps, git log, `ask_user`). Owns the `current_session_id` ContextVar. |
+| `services/dir_summaries.py` | LLM-generated (`gpt-5.4`) per-directory natural-language summaries, then embedded for high-level semantic browsing. |
+| `services/db.py` | Postgres + pgvector pool, schema bootstrap, upserts for `code_chunks`, `dir_summaries`, and `startup_plans`. |
+| `services/startup_analysis.py` | Builds a curated context bundle (`README`, manifests, env templates, infra/CI files, top-level skeleton; budget-capped at ~32k chars), calls OpenAI (`STARTUP_ANALYSIS_MODEL`, default `gpt-5.4`) with a JSON-schema-constrained response → produces the `startup_plans.plan` JSON. |
+| `services/pdf_output.py` | `write_markdown_pdf` — converts the verified startup plan markdown to PDF (used by `POST /sessions/:id/startup-plan/export`). |
+| `services/tools.py` | Function tools exposed to the agents (file/code search, semantic search, references, deps, git log, `ask_user`, `get_startup_plan`, `recompute_startup_plan`). Owns the `current_session_id` ContextVar. |
 | `services/event_bus.py` | In-process per-session asyncio `Queue` fan-out used to bridge the activity → SSE response. |
-| `scripts/` | Manual debugging helpers (`show_chunks.py`, `show_ast.py`, `test_ask_question.py`). |
+| `scripts/` | Manual debugging helpers (`show_chunks.py`, `show_ast.py`, `test_ask_question.py`, `test_startup_plan.py`). |
 
 ## Vector indexing pipeline
 
-All embeddings — for chunks, directory summaries, and live queries — use OpenAI `text-embedding-3-small` (1536-dim). Tokenisation budget is enforced with `tiktoken.encoding_for_model("text-embedding-3-small")`.
+All embeddings — for chunks, directory summaries, and live queries — use OpenAI `text-embedding-3-large` (3072-dim, stored as pgvector `halfvec(3072)`). Tokenisation budget is enforced with `tiktoken.encoding_for_model("text-embedding-3-large")`. The 7500-token cap on `embedding_text` leaves headroom under the model's 8191-token limit.
 
 Indexing happens once per repo, on first session creation, inside `index_repo_activity`. It is **idempotent**: if `code_chunks` already has rows for the `repo_url`, the activity returns early.
 
@@ -50,40 +56,49 @@ Indexing happens once per repo, on first session creation, inside `index_repo_ac
    - **Markdown** (`extract_markdown_chunks`): split on `#`/`##`/`###` headings into named sections.
    - **JSON / YAML / CSS / HTML / shell** (`extract_whole_file_chunk`): treated as one chunk per file with a typed label (`config`, `stylesheet`, `markup`, `shell`).
 4. **Token-budget split** (`split_oversized`) — any chunk whose `embedding_text` exceeds `MAX_TOKENS = 7500` is recut at line boundaries with `OVERLAP_LINES = 5` overlap, preserving `chunk_type`, `name`, `parent_class` and recording `part N` in the name.
-5. **Prefix + embed** — each chunk's `embedding_text` is `"# File: <path>\n# Class: <parent>\n# <chunk_type>: <name>\n<content>"`. Chunks are batched (size 100) into `client.embeddings.create(model="text-embedding-3-small")` → 1536-dim vectors.
+5. **Prefix + embed** — each chunk's `embedding_text` is `"# File: <path>\n# Class: <parent>\n# <chunk_type>: <name>\n<content>"`. Chunks are batched into `client.embeddings.create(model="text-embedding-3-large")` → 3072-dim vectors.
 6. **Upsert** (`services/db.py::store_chunks`) — `INSERT … ON CONFLICT ON CONSTRAINT code_chunks_unique` on `(repo_url, file_path, start_line, chunk_type, name)` (NULLS NOT DISTINCT) so re-indexing rewrites in place.
-7. **Directory summaries** (`services/dir_summaries.py::generate_dir_summaries`) — group files by parent dir, build a compact context (file list + first 40 lines of each, capped at 12k chars), call `gpt-4o-mini` with a senior-engineer summarisation prompt, embed the result, upsert into `dir_summaries`.
+7. **Directory summaries** (`services/dir_summaries.py::generate_dir_summaries`) — group files by parent dir, build a compact context (file list + first 40 lines of each, capped at 12k chars), call `gpt-5.4` with a senior-engineer summarisation prompt, embed the result, upsert into `dir_summaries`.
+8. **Startup analysis** (`services/startup_analysis.py` → `analyze_startup_activity`) — separately, after indexing, build a curated context bundle (`README`, manifests, env templates, infra/CI files, top-level skeleton), call `gpt-5.4` with a JSON-schema-constrained completion, persist into `startup_plans`. Idempotent on `repo_url` unless `force=True`.
 
-**Querying.** Both vector tables use `ivfflat (embedding vector_cosine_ops)` with `lists = 100`. Lookups are `1 - (embedding <=> query_vec)` cosine similarity, scoped by `repo_url`. The query is embedded with the same `text-embedding-3-small` model via `embed_query` so vectors live in the same space.
+**Querying.** Both vector tables use `hnsw (embedding halfvec_cosine_ops)`. Lookups are `1 - (embedding <=> query_vec::halfvec)` cosine similarity, scoped by `repo_url`. The query is embedded with the same `text-embedding-3-large` model via `embed_query` so vectors live in the same space.
 
 ## Agents
 
-All four agents are `openai-agents` SDK `Agent` objects on `gpt-4.1-mini`. Each agent's tool set is intentionally narrow so the router can compose them.
+All five agents are `openai-agents` SDK `Agent` objects on `gpt-5.4` with `model_settings=ModelSettings(max_tokens=16384)`. Each agent's tool set is intentionally narrow so the router can compose them.
 
-### `router_agent` — `agent_defs.py:64`
+### `router_agent` — [agent_defs.py:131](agent_defs.py#L131)
 - **Role:** entry point for every user message. Decides which sub-agent to hand off to, or asks the user to disambiguate.
 - **Tools:** `ask_user`.
-- **Handoffs:** `explorer_agent`, `explainer_agent`, `tracer_agent`. Can chain handoffs across one turn.
-- **Behaviour:** if a question is ambiguous (e.g. "trace the flow", "how does upload work" with multiple candidates), it `ask_user`s before delegating.
+- **Handoffs:** `explorer_agent`, `explainer_agent`, `tracer_agent`, `bootstrap_agent`. Can chain handoffs across one turn.
+- **Routing baked into the prompt:** "how do I run this / install / env vars / Docker / dev-server" → `bootstrap_agent`; git-history questions ("what changed recently", commit/blame) → `explainer_agent` (it owns `git_log`); ambiguous queries → `ask_user` first.
 
-### `explorer_agent` — `agent_defs.py:26`
+### `explorer_agent` — [agent_defs.py:32](agent_defs.py#L32)
 - **Role:** find exact things in the codebase — files by name, symbols by definition site.
-- **Tools:** `list_files`, `search_code`, `read_file`, `ask_user`.
+- **Tools:** `list_files`, `search_code`, `search_indexed`, `read_file`, `ask_user`.
 - **Routing rules baked into the prompt:**
   - File lookup → `list_files` with glob `**/<name>`, return paths only (no line numbers).
   - Symbol lookup (function/class/variable/JSX component) → `search_code`, return `file:line` matches.
+  - Natural-language functionality lookup that exact-string search would miss → `search_indexed`.
   - Content read → `read_file` with optional line range.
 - **Output style:** terse — paths or `file:line` lists, not prose.
 
-### `explainer_agent` — `agent_defs.py:45`
-- **Role:** synthesise and explain. Answers "how does X work", "what is the architecture of Y".
-- **Tools:** `search_indexed`, `search_dir_summaries`, `list_files`, `read_file`, `git_log`, `ask_user`.
+### `explainer_agent` — [agent_defs.py:55](agent_defs.py#L55)
+- **Role:** synthesise and explain. Answers "how does X work", "what is the architecture of Y", and any git-history question.
+- **Tools:** `search_indexed`, `search_dir_summaries`, `list_files`, `read_file`, `git_log`, `ask_user`, `get_startup_plan`.
+- **Handoffs:** `tracer_agent` (for exact-string / regex lookups it lacks).
 - **Inputs:** receives both the local clone path and the indexed `repo_url` (the GitHub URL) injected into the developer prompt by `agent_turn_activity::prepend_repo_context`. Must use the GitHub URL for `search_indexed` / `search_dir_summaries`, and the local path for `list_files` / `read_file`.
 - **Discipline:** never invent paths — must `list_files` or `search_indexed` first; cites file paths and line ranges in the answer.
 
-### `tracer_agent` — `agent_defs.py:15`
+### `tracer_agent` — [agent_defs.py:16](agent_defs.py#L16)
 - **Role:** follow execution paths. Given a `file:line` or symbol, traces what calls it / what it calls.
-- **Tools:** `read_file`, `find_references`, `get_dependencies`, `ask_user`.
+- **Tools:** `read_file`, `search_code`, `find_references`, `get_dependencies`, `ask_user`.
+
+### `bootstrap_agent` — [agent_defs.py:79](agent_defs.py#L79)
+- **Role:** answer "how do I run this", "what env vars do I need", "why is X required" against the persisted startup plan. The plan is the source of truth.
+- **Tools:** `get_startup_plan`, `recompute_startup_plan`, `list_files`, `read_file`, `get_dependencies`, `search_indexed`, `ask_user`.
+- **Handoffs:** `explainer_agent`, `tracer_agent`.
+- **Behaviour:** start every answer by reading the plan; cite plan step numbers and `file:line` sources from the plan's `sources` arrays. If `analysis_status == 'failed'` (or no plan exists), investigate manifests/Dockerfiles/etc. directly and synthesise a walkthrough — but do **not** auto-call `recompute_startup_plan`; only do so when the user explicitly asks. Also reused by `POST /sessions/:id/startup-plan/export` to verify and reformat the plan into a polished markdown PDF.
 
 ### Tool catalogue (`services/tools.py`)
 
@@ -96,18 +111,21 @@ All four agents are `openai-agents` SDK `Agent` objects on `gpt-4.1-mini`. Each 
 | `get_dependencies` | `(file_path) -> list[str]` | Extract imports — `import X from "y"` / `require()` / `import()` for JS, `from X import` / `import X` for Python. |
 | `search_indexed` | `(query, repo_url, k=10) -> str` (async) | Embed query + cosine similarity over `code_chunks`, returns top-k formatted blocks `[score] path (type: name) Lstart-end\n<content>`. |
 | `search_dir_summaries` | `(query, repo_url, k=5) -> str` (async) | Same pattern over `dir_summaries` for high-level "what's in this folder" answers. |
-| `git_log` | `(path, limit=10) -> list[str]` | `git log --pretty=format:%h %s -n <limit>`. |
+| `git_log` | `(repo_dir, file_path="", limit=10) -> list[str]` | `git log --pretty=format:%h %s -n <limit>`, optionally scoped to a path. |
 | `ask_user` | `(question, options=None) -> str` (async) | **Human-in-the-loop.** Inserts a `pending_actions` row, publishes `data-needs-input` to the SSE stream, returns a placeholder string. The current `session_id` is read from a `contextvars.ContextVar` set by `agent_turn_activity`. |
+| `get_startup_plan` | `(repo_url) -> str` (async) | Read the persisted `startup_plans` row for a repo and render it as a structured markdown summary for the LLM (runtime, package manager, env vars w/ required+confidence, services, ordered steps, warnings). Returns `"No startup plan available …"` if missing. |
+| `recompute_startup_plan` | `(repo_url, reason="") -> str` (async) | Look up the current session via the `current_session_id` ContextVar, resolve the workflow handle `chat-<session_id>`, and signal `recompute_startup_plan(reason)` to force a re-analysis. |
 
 ## Data model (`services/db.py::SCHEMA_SQL`)
 
 | Table | Purpose | Key fields |
 |---|---|---|
-| `code_chunks` | AST-level chunks + 1536-dim embeddings. ivfflat cosine index. | `repo_url`, `file_path`, `chunk_type`, `name`, `parent_class`, `start_line`, `end_line`, `content`, `embedding`. Unique on `(repo_url, file_path, start_line, chunk_type, name)` NULLS NOT DISTINCT. |
-| `dir_summaries` | LLM-summarised directories + embeddings. | `dir_path`, `summary`, `file_list TEXT[]`, `embedding`. Unique on `(repo_url, dir_path)`. |
+| `code_chunks` | AST-level chunks + 3072-dim `halfvec` embeddings, hnsw cosine index. | `repo_url`, `file_path`, `chunk_type`, `name`, `parent_class`, `start_line`, `end_line`, `content`, `embedding halfvec(3072)`. Unique on `(repo_url, file_path, start_line, chunk_type, name)` NULLS NOT DISTINCT. |
+| `dir_summaries` | LLM-summarised directories + 3072-dim `halfvec` embeddings, hnsw cosine index. | `dir_path`, `summary`, `file_list TEXT[]`, `embedding halfvec(3072)`. Unique on `(repo_url, dir_path)`. |
 | `sessions` | One row per chat session. | `id uuid`, `repo_url`, `status (indexing\|ready\|ended)`, `created_at`, `last_seen_at`. |
 | `messages` | Persisted chat transcript (the source of truth for the **frontend**). | `role (user\|assistant\|system\|tool)`, `parts jsonb` (AI-SDK-v6 UI Message parts so the FE renders directly). |
 | `pending_actions` | Backs human-in-the-loop pauses. | `kind`, `payload jsonb`, `status (open\|resolved\|cancelled)`, `resolved_value jsonb`, `resolved_at`. |
+| `startup_plans` | Per-repo "how to run this" plan produced by `analyze_startup_activity`. | PK `repo_url`, `plan jsonb`, `analysis_status (ok\|partial\|failed)`, `overall_confidence`, `model`, `truncations TEXT[]`, `error`, `created_at`, `updated_at`. |
 
 `init_schema()` runs on FastAPI startup, creates the `vector` extension on a raw connection (the pool's `register_vector_async` configure hook needs the type to exist), then runs the `IF NOT EXISTS` schema.
 
@@ -124,6 +142,9 @@ Do not try to unify them; they have different consumers.
 - `GET /sessions/:id` — current status.
 - `GET /sessions/:id/messages` — full transcript for hydration.
 - `POST /sessions/:id/messages { content }` — writes user message, signals the workflow with `user_message`, subscribes to the per-session event bus, returns an SSE `text/event-stream` of agent events until a `finish` event arrives or 300s idle timeout.
+- `GET /sessions/:id/startup-plan` — returns the persisted `startup_plans` row for this session's repo, or `404 {"status": "pending"}` if `analyze_startup_activity` hasn't completed yet. Shape: `{ repo_url, plan, analysis_status, overall_confidence, model, truncations, error, updated_at }`.
+- `POST /sessions/:id/startup-plan/recompute { reason? }` — signals the workflow with `recompute_startup_plan(reason)`; returns `202 {"status": "recomputing"}`. The workflow re-runs `analyze_startup_activity` with `force=True` and publishes `data-startup-plan-updated` when done.
+- `POST /sessions/:id/startup-plan/export` — runs `bootstrap_agent` to verify the persisted plan against the actual repo, render a polished single-document markdown ("# Startup plan", env vars, steps, runtime, services, external tools, notes), convert to PDF via `services/pdf_output.py::write_markdown_pdf`, and return `{ session_id, repo_url, markdown, pdf_base64 }`. The agent is told **not** to call `recompute_startup_plan` and to omit verification narrative from the output.
 
 **Exploratory / debug endpoints (no session, direct one-shot):**
 - `GET /walkrepo` — flat tree dump.
@@ -149,13 +170,14 @@ Event mapping:
 | `ToolCallOutputItem` (`tool_output`) | `{ "type": "tool-output-available", "toolCallId", "output" }`. |
 | `HandoffCallItem` / `HandoffOutputItem` / `AgentUpdatedStreamEvent` | `{ "type": "data-handoff", "agent": <name> }`. |
 | `ask_user` tool execution | `{ "type": "data-needs-input", "pendingId", "question", "options" }` (published from inside the tool itself). |
+| `analyze_startup_activity` (post-indexing or recompute) | `{ "type": "data-startup-plan-updated", "updatedAt": <iso> }` (published to the per-session bus regardless of whether the activity skipped or recomputed). |
 | End of turn | `{ "type": "finish" }`. |
 
 If the turn ends with an open `pending_actions` row, `agent_turn_activity` returns `{"kind": "paused", "pending_id", "payload"}` and the workflow stashes it in `self._pending` until a follow-up `user_message` (auto-resolves the pending row) or a `clarification_response` signal arrives.
 
 ## Temporal
 
-**Worker.** Spun up inside the FastAPI lifespan in `main.py`: `Client.connect(TEMPORAL_HOST)` → `Worker(client, task_queue="onboarding-queue", workflows=[CodebaseChatWorkflow], activities=[…six activities…])`. The worker runs in-process with the API server, so a uvicorn reload restarts it.
+**Worker.** Spun up inside the FastAPI lifespan in `main.py`: `Client.connect(TEMPORAL_HOST)` → `Worker(client, task_queue="onboarding-queue", workflows=[CodebaseChatWorkflow], activities=[…seven activities…])`. The worker runs in-process with the API server, so a uvicorn reload restarts it.
 
 **Workflow id convention.** `chat-<session_id>`. `POST /sessions` starts the workflow; `POST /sessions/:id/messages` resolves the handle by id and signals it.
 
@@ -165,6 +187,7 @@ If the turn ends with an open `pending_actions` row, `agent_turn_activity` retur
 |---|---|---|---|---|
 | `clone_repo_activity` | `repo_url: str` | 120s | 3 | `ensure_repo_dir`; raises if clone fails. |
 | `index_repo_activity` | `IndexParams(repo_url, repo_dir)` | 600s | 2 | Walk → AST chunk → embed → `store_chunks` → `generate_dir_summaries` → `store_dir_summaries`. Idempotent: returns early if `code_chunks` already has rows for `repo_url`. |
+| `analyze_startup_activity` | `AnalyzeStartupParams(session_id, repo_url, repo_dir, force=False)` | 120s | 2 | `build_context` → `call_llm` (`gpt-5.4`, JSON-schema-constrained) → `upsert_startup_plan`. Idempotent unless `force=True`; publishes `data-startup-plan-updated` either way. JSON parse fails are retried once before storing `analysis_status='failed'`. |
 | `update_session_status_activity` | `SessionStatusParams(session_id, status)` | 30s | 3 | `UPDATE sessions SET status, last_seen_at`. |
 | `agent_turn_activity` | `AgentTurnParams(session_id, content)` | 300s | 1 | Stream one `Runner.run_streamed(router_agent, …)` turn; emits to `event_bus` + appends parts to the placeholder `messages` row. |
 | `resolve_pending_actions_activity` | `session_id: str` | 15s | 3 | Mark all `open` pending_actions for the session `resolved`. Called when a user reply is interpreted as the answer to an open clarification. |
@@ -177,6 +200,7 @@ If the turn ends with an open `pending_actions` row, `agent_turn_activity` retur
 | signal | `user_message(content: str)` | Append to internal queue; wakes the wait loop. |
 | signal | `clarification_response(pending_id: str, value: dict)` | Stash a clarification result; pops `pending_id` from `self._pending`. |
 | signal | `end_session()` | Sets `self._ended` so the loop exits. |
+| signal | `recompute_startup_plan(reason: str = "")` | Sets `self._recompute_requested`; the wait loop reruns `analyze_startup_activity` with `force=True` before processing further messages. |
 | query  | `get_status() -> str` | One of `starting` / `indexing` / `ready` / `ended`. |
 | query  | `get_pending() -> list[dict]` | Currently-open pending payloads. |
 
@@ -187,10 +211,12 @@ If the turn ends with an open `pending_actions` row, `agent_turn_activity` retur
 1. `update_session_status_activity("indexing")`.
 2. `clone_repo_activity(repo_url)` → repo dir.
 3. `index_repo_activity(repo_url, repo_dir)` (skipped fast-path if already indexed).
-4. `update_session_status_activity("ready")`.
-5. **Wait loop:** `workflow.wait_condition(self._user_messages or self._clarifications or self._ended)`.
+4. `analyze_startup_activity(session_id, repo_url, repo_dir, force=False)` (skipped fast-path if a `startup_plans` row already exists; emits `data-startup-plan-updated` either way).
+5. `update_session_status_activity("ready")`.
+6. **Wait loop:** `workflow.wait_condition(self._user_messages or self._clarifications or self._recompute_requested or self._ended)`.
+   - On `recompute_startup_plan`: clear the flag and rerun `analyze_startup_activity` with `force=True`.
    - On `user_message`: if a pending action is open, clear `self._pending` and call `resolve_pending_actions_activity`, then run `agent_turn_activity`. If the result is `{"kind": "paused"}`, stash `self._pending[pending_id] = payload`.
-6. On `end_session`: `cancel_pending_actions_activity` → `update_session_status_activity("ended")`.
+7. On `end_session`: `cancel_pending_actions_activity` → `update_session_status_activity("ended")`.
 
 ## Conventions
 
@@ -210,7 +236,7 @@ docker compose up -d
 # postgres    → localhost:5432  (postgres / postgres / codebase_agent)
 ```
 
-Required env: `OPENAI_API_KEY`. Optional: `TEMPORAL_HOST`, `DATABASE_URL`, `AGENT_SESSION_DB`, `GITHUB_TOKEN` (for private clones).
+Required env: `OPENAI_API_KEY`. Optional: `TEMPORAL_HOST`, `DATABASE_URL`, `AGENT_SESSION_DB`, `STARTUP_ANALYSIS_MODEL` (default `gpt-5.4`), `GITHUB_TOKEN` (for private clones).
 
 FastAPI reloads on file change (`--reload`); Temporal workflows pick up code changes when the worker restarts (i.e. the uvicorn restart restarts the worker too).
 
@@ -241,7 +267,18 @@ curl -N -X POST http://localhost:8000/sessions/<session_id>/messages \
 # 4. Hydrate the transcript
 curl -s http://localhost:8000/sessions/<session_id>/messages
 
-# 5. Error cases
+# 5. Read the persisted startup plan
+curl -s http://localhost:8000/sessions/<session_id>/startup-plan
+
+# 6. Force a re-analysis
+curl -s -X POST http://localhost:8000/sessions/<session_id>/startup-plan/recompute \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"added a new env var"}'
+
+# 7. Export verified plan + PDF (markdown returned in JSON, PDF as base64)
+curl -s -X POST http://localhost:8000/sessions/<session_id>/startup-plan/export
+
+# 8. Error cases
 curl -s -X POST http://localhost:8000/sessions -H "Content-Type: application/json" -d '{}'
 curl -s http://localhost:8000/sessions/00000000-0000-0000-0000-000000000000
 ```
@@ -254,7 +291,9 @@ Always test the happy path, expected error responses, and state transitions (`in
 - **Phase 4 — streaming agent turn** ✅ (`Runner.run_streamed` → AI SDK v6 parts → per-event persistence)
 - **Phase 5 — human-in-the-loop** ✅ (`ask_user`, `pending_actions`, `clarification_response`)
 - **Phase 6 — SSE endpoint** ✅
-- **Phase 7 — cleanup:** TTL session sweeper, structured logging, rate limiting, swap `SQLiteSession` for `SQLAlchemySession` for multi-replica deployment.
+- **Phase 7 — startup analysis** ✅ (`analyze_startup_activity`, `startup_plans`, `bootstrap_agent`, `recompute_startup_plan` signal, `GET/POST .../startup-plan(/recompute|/export)`).
+- **Phase 8 — multi-repo sessions:** designed in [docs/multi_repo_startup_plan.md](docs/multi_repo_startup_plan.md). Adds `session_repos`, `repo_boundaries`, `app_startup_plans`, a `boundary_extractor_agent` and `consolidator_agent`, and a deterministic `services/dependency_graph.py` matcher. Not yet implemented.
+- **Phase 9 — cleanup:** TTL session sweeper, structured logging, rate limiting, swap `SQLiteSession` for `SQLAlchemySession` for multi-replica deployment.
 
 ## Deprecated
 

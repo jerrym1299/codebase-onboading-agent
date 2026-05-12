@@ -1,6 +1,7 @@
 from typing import Any
 
 from agents import Agent, ModelSettings, handoff
+from services.boundary_extractor import BoundaryReport
 from services.tools import (
     list_files, search_code, read_file,
     find_references, get_dependencies, search_indexed, search_dir_summaries, git_log,
@@ -126,6 +127,29 @@ bootstrap_agent = Agent[Any](
         "running locally: install commands, env vars, required services, dependencies, "
         "Docker setup, dev-server startup, or 'how do I run this'."
     ),
+)
+
+boundary_extractor_agent = Agent[BoundaryReport](
+    name="BoundaryExtractor",
+    instructions=(
+        "You produce a strict BoundaryReport for one repository. The repo's local path "
+        "and indexed repo_url are in the developer prompt, alongside the per-repo startup "
+        "plan that has already been generated.\n"
+        "Use the startup plan as context — runtime, package manager, env vars are already "
+        "known there. Your job: surface WIRE BOUNDARIES — what HTTP routes the repo "
+        "exposes, what HTTP/DB endpoints it consumes, what dev-server proxies are "
+        "configured, what infra services are required.\n"
+        "For each consumed entry, surface BOTH the symbolic env var name AND any resolved "
+        "value you can find (.env, .env.example, code defaults, docker-compose, deployment "
+        "configs). Symbolic-only targets go into `ambiguities`.\n"
+        "DO NOT invent paths or routes — only what you can ground in real files. Use "
+        "list_files, read_file, get_dependencies, search_code, search_indexed to "
+        "investigate. Once you have a complete report, return it."
+    ),
+    output_type=BoundaryReport,
+    model="gpt-5.4",
+    model_settings=ModelSettings(max_tokens=16384),
+    tools=[list_files, read_file, get_dependencies, search_code, search_indexed],
 )
 
 router_agent = Agent[Any](

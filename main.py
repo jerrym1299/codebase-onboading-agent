@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
 from contextlib import asynccontextmanager
@@ -16,8 +17,10 @@ from activities import (
     ChatParams,
     agent_turn_activity,
     analyze_startup_activity,
+    build_graph_activity,
     cancel_pending_actions_activity,
     clone_repo_activity,
+    extract_boundaries_activity,
     index_repo_activity,
     resolve_pending_actions_activity,
     update_session_status_activity,
@@ -25,7 +28,8 @@ from activities import (
 from services.chunk_and_embed import AST_PARSERS, chunk_file_list, dump_ast, embed_query
 from services.clone_repo import ensure_repo_dir
 from services.db import (
-    CODE_SEARCH_SQL, close_pool, get_pool, get_startup_plan_row, init_schema, store_chunks,
+    CODE_SEARCH_SQL, close_pool, get_pool, get_session_repo_urls, get_startup_plan_row,
+    init_schema, insert_session_repos, store_chunks,
 )
 from services.event_bus import subscribe, unsubscribe
 from services.pdf_output import write_markdown_pdf
@@ -63,6 +67,8 @@ async def lifespan(app):
             clone_repo_activity,
             index_repo_activity,
             analyze_startup_activity,
+            extract_boundaries_activity,
+            build_graph_activity,
             update_session_status_activity,
             agent_turn_activity,
             cancel_pending_actions_activity,
@@ -195,27 +201,47 @@ async def search_endpoint(repo_url: str, request: Request, k: int = 10):
         ],
     }
 
+def _compute_repo_set_hash(repo_urls: list[str]) -> str:
+    return hashlib.sha256("\n".join(sorted(repo_urls)).encode("utf-8")).hexdigest()
+
+
 @app.post("/sessions")
 async def create_session_endpoint(payload: dict):
-    repo_url = (payload or {}).get("repo_url", "").rstrip("/")
-    if not repo_url:
-        return {"error": "Missing 'repo_url'."}
+    payload = payload or {}
+    raw_urls = payload.get("repo_urls")
+    if raw_urls is None:
+        legacy = payload.get("repo_url", "")
+        raw_urls = [legacy] if legacy else []
+    if not isinstance(raw_urls, list) or not raw_urls:
+        return {"error": "Missing 'repo_urls' (or legacy 'repo_url')."}
+
+    repo_urls = sorted({u.rstrip("/") for u in raw_urls if isinstance(u, str) and u.strip()})
+    if not repo_urls:
+        return {"error": "Missing 'repo_urls' (or legacy 'repo_url')."}
+
+    repo_set_hash = _compute_repo_set_hash(repo_urls)
 
     pool = await get_pool()
     async with pool.connection() as conn, conn.cursor() as cur:
         await cur.execute(
-            "INSERT INTO sessions (repo_url, status) VALUES (%s, 'indexing') RETURNING id",
-            (repo_url,),
+            "INSERT INTO sessions (status, app_plan_hash) VALUES ('indexing', %s) RETURNING id",
+            (repo_set_hash,),
         )
         session_id = str((await cur.fetchone())[0])
 
+    await insert_session_repos(session_id, repo_urls)
+
     await app.state.temporal_client.start_workflow(
         CodebaseChatWorkflow.run,
-        ChatParams(session_id=session_id, repo_url=repo_url),
+        ChatParams(
+            session_id=session_id,
+            repo_urls=repo_urls,
+            repo_set_hash=repo_set_hash,
+        ),
         id=f"chat-{session_id}",
         task_queue="onboarding-queue",
     )
-    return {"session_id": session_id}
+    return {"session_id": session_id, "repo_urls": repo_urls}
 
 
 @app.get("/sessions/{session_id}")
@@ -309,15 +335,10 @@ async def post_session_message_endpoint(session_id: str, payload: dict):
 
 @app.get("/sessions/{session_id}/startup-plan")
 async def get_session_startup_plan_endpoint(session_id: str):
-    pool = await get_pool()
-    async with pool.connection() as conn, conn.cursor() as cur:
-        await cur.execute(
-            "SELECT repo_url FROM sessions WHERE id = %s", (session_id,),
-        )
-        row = await cur.fetchone()
-    if row is None:
+    repo_urls = await get_session_repo_urls(session_id)
+    if not repo_urls:
         return JSONResponse(status_code=404, content={"error": "Session not found."})
-    repo_url = row[0]
+    repo_url = repo_urls[0]
     plan_row = await get_startup_plan_row(repo_url)
     if plan_row is None:
         return JSONResponse(status_code=404, content={"status": "pending"})
@@ -336,13 +357,8 @@ async def get_session_startup_plan_endpoint(session_id: str):
 @app.post("/sessions/{session_id}/startup-plan/recompute")
 async def post_session_startup_recompute_endpoint(session_id: str, payload: dict | None = None):
     reason = ((payload or {}).get("reason") or "").strip()
-    pool = await get_pool()
-    async with pool.connection() as conn, conn.cursor() as cur:
-        await cur.execute(
-            "SELECT repo_url FROM sessions WHERE id = %s", (session_id,),
-        )
-        row = await cur.fetchone()
-    if row is None:
+    repo_urls = await get_session_repo_urls(session_id)
+    if not repo_urls:
         return JSONResponse(status_code=404, content={"error": "Session not found."})
     handle = app.state.temporal_client.get_workflow_handle(f"chat-{session_id}")
     await handle.signal("recompute_startup_plan", reason)
@@ -426,15 +442,10 @@ PLAN (JSON, source of truth — verify and correct, don't paraphrase):
 
 @app.post("/sessions/{session_id}/startup-plan/export")
 async def post_session_startup_export_endpoint(session_id: str):
-    pool = await get_pool()
-    async with pool.connection() as conn, conn.cursor() as cur:
-        await cur.execute(
-            "SELECT repo_url FROM sessions WHERE id = %s", (session_id,),
-        )
-        row = await cur.fetchone()
-    if row is None:
+    repo_urls = await get_session_repo_urls(session_id)
+    if not repo_urls:
         return JSONResponse(status_code=404, content={"error": "Session not found."})
-    repo_url = row[0]
+    repo_url = repo_urls[0]
 
     plan_row = await get_startup_plan_row(repo_url)
     if plan_row is None:
