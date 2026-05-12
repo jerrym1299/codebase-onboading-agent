@@ -14,6 +14,7 @@ with workflow.unsafe.imports_passed_through():
         AnalyzeStartupParams,
         ExtractBoundariesParams,
         BuildGraphParams,
+        ConsolidateParams,
         clone_repo_activity,
         index_repo_activity,
         update_session_status_activity,
@@ -21,6 +22,7 @@ with workflow.unsafe.imports_passed_through():
         analyze_startup_activity,
         extract_boundaries_activity,
         build_graph_activity,
+        consolidate_plan_activity,
         cancel_pending_actions_activity,
         resolve_pending_actions_activity,
     )
@@ -41,43 +43,29 @@ class CodebaseChatWorkflow:
         self._recompute_requested = False
         self._recompute_reason = ""
 
-    @workflow.run
-    async def run(self, params: ChatParams) -> dict:
-        self._repo_urls = list(params.repo_urls)
-        self._repo_set_hash = params.repo_set_hash
-        self._session_id = params.session_id
-        self._status = "indexing"
-        await workflow.execute_activity(
-            update_session_status_activity,
-            SessionStatusParams(session_id=params.session_id, status="indexing"),
-            start_to_close_timeout=timedelta(seconds=30),
-            retry_policy=RetryPolicy(maximum_attempts=3),
-        )
-
+    async def _run_pipeline(self, session_id: str, force: bool) -> None:
+        """Per-repo (clone/index/analyze/extract) in parallel, then matcher,
+        then consolidator. Used both on initial start and on recompute."""
         async def per_repo(repo_url: str) -> tuple[str, str]:
             repo_dir = await workflow.execute_activity(
                 clone_repo_activity,
-                CloneParams(repo_url=repo_url, session_id=params.session_id),
+                CloneParams(repo_url=repo_url, session_id=session_id),
                 start_to_close_timeout=timedelta(seconds=120),
                 retry_policy=RetryPolicy(maximum_attempts=3),
             )
             await workflow.execute_activity(
                 index_repo_activity,
-                IndexParams(
-                    repo_url=repo_url,
-                    repo_dir=repo_dir,
-                    session_id=params.session_id,
-                ),
+                IndexParams(repo_url=repo_url, repo_dir=repo_dir, session_id=session_id),
                 start_to_close_timeout=timedelta(seconds=600),
                 retry_policy=RetryPolicy(maximum_attempts=2),
             )
             await workflow.execute_activity(
                 analyze_startup_activity,
                 AnalyzeStartupParams(
-                    session_id=params.session_id,
+                    session_id=session_id,
                     repo_url=repo_url,
                     repo_dir=repo_dir,
-                    force=False,
+                    force=force,
                 ),
                 start_to_close_timeout=timedelta(seconds=120),
                 retry_policy=RetryPolicy(maximum_attempts=2),
@@ -85,7 +73,7 @@ class CodebaseChatWorkflow:
             await workflow.execute_activity(
                 extract_boundaries_activity,
                 ExtractBoundariesParams(
-                    session_id=params.session_id,
+                    session_id=session_id,
                     repo_url=repo_url,
                     repo_dir=repo_dir,
                 ),
@@ -100,7 +88,7 @@ class CodebaseChatWorkflow:
         await workflow.execute_activity(
             build_graph_activity,
             BuildGraphParams(
-                session_id=params.session_id,
+                session_id=session_id,
                 repo_set_hash=self._repo_set_hash,
                 repo_urls=self._repo_urls,
                 repo_dirs=self._repo_dirs,
@@ -108,6 +96,33 @@ class CodebaseChatWorkflow:
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RetryPolicy(maximum_attempts=2),
         )
+
+        await workflow.execute_activity(
+            consolidate_plan_activity,
+            ConsolidateParams(
+                session_id=session_id,
+                repo_set_hash=self._repo_set_hash,
+                repo_urls=self._repo_urls,
+                repo_dirs=self._repo_dirs,
+            ),
+            start_to_close_timeout=timedelta(seconds=600),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+
+    @workflow.run
+    async def run(self, params: ChatParams) -> dict:
+        self._repo_urls = list(params.repo_urls)
+        self._repo_set_hash = params.repo_set_hash
+        self._session_id = params.session_id
+        self._status = "indexing"
+        await workflow.execute_activity(
+            update_session_status_activity,
+            SessionStatusParams(session_id=params.session_id, status="indexing"),
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+
+        await self._run_pipeline(params.session_id, force=False)
 
         self._status = "ready"
         await workflow.execute_activity(
@@ -133,16 +148,20 @@ class CodebaseChatWorkflow:
                     "recompute_startup_plan signal: reason=%r", self._recompute_reason,
                 )
                 self._recompute_reason = ""
+                self._status = "indexing"
                 await workflow.execute_activity(
-                    analyze_startup_activity,
-                    AnalyzeStartupParams(
-                        session_id=params.session_id,
-                        repo_url=self._repo_urls[0],
-                        repo_dir=self._repo_dirs[self._repo_urls[0]],
-                        force=True,
-                    ),
-                    start_to_close_timeout=timedelta(seconds=120),
-                    retry_policy=RetryPolicy(maximum_attempts=2),
+                    update_session_status_activity,
+                    SessionStatusParams(session_id=params.session_id, status="indexing"),
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+                await self._run_pipeline(params.session_id, force=True)
+                self._status = "ready"
+                await workflow.execute_activity(
+                    update_session_status_activity,
+                    SessionStatusParams(session_id=params.session_id, status="ready"),
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
                 )
                 continue
 

@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from agent_defs import bootstrap_agent, explorer_agent
+from agent_defs import explorer_agent
 from activities import (
     ChatParams,
     agent_turn_activity,
@@ -20,20 +20,22 @@ from activities import (
     build_graph_activity,
     cancel_pending_actions_activity,
     clone_repo_activity,
+    consolidate_plan_activity,
     extract_boundaries_activity,
     index_repo_activity,
     resolve_pending_actions_activity,
     update_session_status_activity,
 )
+
 from services.chunk_and_embed import AST_PARSERS, chunk_file_list, dump_ast, embed_query
 from services.clone_repo import ensure_repo_dir
 from services.db import (
-    CODE_SEARCH_SQL, close_pool, get_pool, get_session_repo_urls, get_startup_plan_row,
+    CODE_SEARCH_SQL, close_pool, get_app_startup_plan_row, get_pool,
+    get_repo_boundaries_row, get_session_repo_urls, get_startup_plan_row,
     init_schema, insert_session_repos, store_chunks,
 )
 from services.event_bus import subscribe, unsubscribe
 from services.pdf_output import write_markdown_pdf
-from services.tools import current_session_id
 from services.walk_repo import collect_file_paths, walk_repo
 from workflows import CodebaseChatWorkflow
 
@@ -63,17 +65,19 @@ async def lifespan(app):
         client,
         task_queue="onboarding-queue",
         workflows=[CodebaseChatWorkflow],
-        activities=[
+                activities=[
             clone_repo_activity,
             index_repo_activity,
             analyze_startup_activity,
             extract_boundaries_activity,
             build_graph_activity,
+            consolidate_plan_activity,
             update_session_status_activity,
             agent_turn_activity,
             cancel_pending_actions_activity,
             resolve_pending_actions_activity,
         ],
+
     )
     async with worker:
         yield
@@ -333,17 +337,59 @@ async def post_session_message_endpoint(session_id: str, payload: dict):
     )
 
 
+async def _session_app_plan_hash(session_id: str) -> str | None:
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT app_plan_hash FROM sessions WHERE id = %s", (session_id,),
+        )
+        row = await cur.fetchone()
+    return row[0] if row else None
+
+
 @app.get("/sessions/{session_id}/startup-plan")
 async def get_session_startup_plan_endpoint(session_id: str):
+    """App-level consolidated startup plan for the session's repo set."""
     repo_urls = await get_session_repo_urls(session_id)
     if not repo_urls:
         return JSONResponse(status_code=404, content={"error": "Session not found."})
-    repo_url = repo_urls[0]
-    plan_row = await get_startup_plan_row(repo_url)
+    plan_hash = await _session_app_plan_hash(session_id)
+    if not plan_hash:
+        return JSONResponse(status_code=404, content={"status": "pending"})
+    plan_row = await get_app_startup_plan_row(plan_hash)
     if plan_row is None:
         return JSONResponse(status_code=404, content={"status": "pending"})
     return {
-        "repo_url": repo_url,
+        "repo_set_hash": plan_row["repo_set_hash"],
+        "repo_urls": plan_row["repo_urls"],
+        "plan_markdown": plan_row["plan_markdown"],
+        "graph": plan_row["graph"],
+        "ambiguities": plan_row["ambiguities"],
+        "orchestration_findings": plan_row["orchestration_findings"],
+        "analysis_status": plan_row["analysis_status"],
+        "model": plan_row["model"],
+        "error": plan_row["error"],
+        "updated_at": plan_row["updated_at"],
+    }
+
+
+@app.get("/sessions/{session_id}/repos/{repo_url:path}/startup-plan")
+async def get_per_repo_startup_plan_endpoint(session_id: str, repo_url: str):
+    """Diagnostic: per-repo startup_plans row. URL-encode the repo_url."""
+    repo_urls = await get_session_repo_urls(session_id)
+    if not repo_urls:
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
+    target = repo_url.rstrip("/")
+    if target not in repo_urls:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Repo not part of session.", "repo_urls": repo_urls},
+        )
+    plan_row = await get_startup_plan_row(target)
+    if plan_row is None:
+        return JSONResponse(status_code=404, content={"status": "pending"})
+    return {
+        "repo_url": target,
         "plan": plan_row["plan"],
         "analysis_status": plan_row["analysis_status"],
         "overall_confidence": plan_row["overall_confidence"],
@@ -351,6 +397,31 @@ async def get_session_startup_plan_endpoint(session_id: str):
         "truncations": plan_row["truncations"],
         "error": plan_row["error"],
         "updated_at": plan_row["updated_at"],
+    }
+
+
+@app.get("/sessions/{session_id}/repos/{repo_url:path}/boundaries")
+async def get_per_repo_boundaries_endpoint(session_id: str, repo_url: str):
+    """Diagnostic: per-repo repo_boundaries row. URL-encode the repo_url."""
+    repo_urls = await get_session_repo_urls(session_id)
+    if not repo_urls:
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
+    target = repo_url.rstrip("/")
+    if target not in repo_urls:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Repo not part of session.", "repo_urls": repo_urls},
+        )
+    row = await get_repo_boundaries_row(target)
+    if row is None:
+        return JSONResponse(status_code=404, content={"status": "pending"})
+    return {
+        "repo_url": target,
+        "report": row["report"],
+        "analysis_status": row["analysis_status"],
+        "model": row["model"],
+        "error": row["error"],
+        "updated_at": row["updated_at"],
     }
 
 
@@ -365,112 +436,21 @@ async def post_session_startup_recompute_endpoint(session_id: str, payload: dict
     return JSONResponse(status_code=202, content={"status": "recomputing", "session_id": session_id})
 
 
-_EXPORT_PROMPT = """You are producing a concise, user-facing "how to run this repo" document.
-
-Verify the plan below against the actual files at {repo_dir} (indexed as
-{repo_url}) using list_files, read_file, and get_dependencies. Use the
-verification only to correct inaccuracies — do NOT include the verification
-narrative in the output. Do NOT call recompute_startup_plan. The output response should not include
-comparisons to the startup plan, the user doesn't know about this, it should just be a polished, final guide
-on how to get the application running. 
-
-Output a single markdown document with EXACTLY these sections, in this order:
-
-# Startup plan: <repo name or short title>
-
-## Env vars (MAKE SURE TO INCLUDE ALL REQUIRED AND OPTIONAL ENV VARS, INCLUDING THOSE REFERENCED IN THE CODE BUT NOT IN .env.example or similar., check for these explicitly)
-
-### Required
-- `NAME` — one-line description of what this is for.
-- (one bullet per required env var; omit this subsection only if there are none)
-
-### Optional
-- `NAME` — one-line description.
-- (one bullet per optional env var; omit this subsection only if there are none)
-
-## Steps
-
-1. <imperative title>
-   ```
-   <command>
-   ```
-2. <imperative title>
-   ```
-   <command>
-   ```
-3. ...
-4. ...
-These steps should only be how to get the application running, it does not need to include further instructions
-on how to use the application (e.g. navigating ui, calling the api, etc). Make sure to include steps for installing requirements (and how to do so).
-
-
-## Runtime
-
-- Language + version, package manager + version. One bullet each. No commentary.
-
-## Services
-
-- One bullet per required service (e.g. `postgres (image: postgres:16)`). Omit
-  the section entirely if no services are needed.
-
-## External tools
-
-- One bullet per required tool (e.g. `Docker`, `Node 20+`). Omit the section
-  entirely if none.
-
-## Notes
-
-- Anything you were unsure about, low-confidence items, items missing from the
-  repo that the user should provide, or corrections worth flagging.
-- Be specific. One bullet per concern. Omit the section if there are no
-  concerns worth surfacing.
-- add a warning section if you are concerned or uncertain about anything.
-
-STRICT FORMATTING RULES:
-- Do NOT include phrases like "Verified command:", "Verified requirement:",
-  "Verified service:", or "Correction:" in the output.
-- Do NOT include examples of what you verified or how you verified it.
-- Do NOT cite `file:line` references in the user-facing sections (Env vars,
-  Steps, Runtime, Services, External tools). Citations belong only in Notes
-  if they help explain a concern.
-- Keep each bullet under ~120 characters where possible.
-
-PLAN (JSON, source of truth — verify and correct, don't paraphrase):
-{plan_json}
-"""
-
-
 @app.post("/sessions/{session_id}/startup-plan/export")
 async def post_session_startup_export_endpoint(session_id: str):
+    """Thin wrapper: read app_startup_plans.plan_markdown, render to PDF.
+    The consolidator already produced the polished, verified markdown."""
     repo_urls = await get_session_repo_urls(session_id)
     if not repo_urls:
         return JSONResponse(status_code=404, content={"error": "Session not found."})
-    repo_url = repo_urls[0]
-
-    plan_row = await get_startup_plan_row(repo_url)
-    if plan_row is None:
+    plan_hash = await _session_app_plan_hash(session_id)
+    if not plan_hash:
+        return JSONResponse(status_code=404, content={"status": "pending"})
+    plan_row = await get_app_startup_plan_row(plan_hash)
+    if plan_row is None or not plan_row.get("plan_markdown"):
         return JSONResponse(status_code=404, content={"status": "pending"})
 
-    repo_dir = await ensure_repo_dir(repo_url)
-    if repo_dir is None:
-        return JSONResponse(status_code=500, content={"error": "Failed to resolve repo dir."})
-
-    prompt = _EXPORT_PROMPT.format(
-        repo_dir=repo_dir,
-        repo_url=repo_url,
-        plan_json=json.dumps(plan_row["plan"], indent=2),
-    )
-
-    current_session_id.set(session_id)
-    try:
-        result = await Runner.run(bootstrap_agent, prompt, max_turns=20)
-    except MaxTurnsExceeded:
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Agent exceeded max turns while verifying the plan."},
-        )
-
-    markdown = str(result.final_output)
+    markdown = plan_row["plan_markdown"]
     pdf_safe = (
         markdown
         .replace("“", '"').replace("”", '"')
@@ -484,7 +464,7 @@ async def post_session_startup_export_endpoint(session_id: str):
 
     return {
         "session_id": session_id,
-        "repo_url": repo_url,
+        "repo_urls": plan_row["repo_urls"],
         "markdown": markdown,
         "pdf_base64": pdf_b64,
     }

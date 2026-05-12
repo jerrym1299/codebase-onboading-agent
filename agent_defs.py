@@ -7,7 +7,9 @@ from services.tools import (
     find_references, get_dependencies, search_indexed, search_dir_summaries, git_log,
     ask_user,
     get_startup_plan, recompute_startup_plan,
+    get_repo_boundaries, get_repo_startup_plan, get_app_startup_plan,
 )
+
 
 #Explorer agent finds exact matches in the codebase.
 # - "where is <filename>" → use list_files with glob "**/<filename>" and return just the file path(s).
@@ -22,7 +24,10 @@ tracer_agent = Agent[Any](
         "natural-language description, first locate a starting point with `search_code` "
         "(regex over the local clone, returns file:line) before tracing.\n"
         "Use `find_references` to find callers of a symbol, `get_dependencies` to see "
-        "what a file imports, and `read_file` to inspect specific ranges."
+        "what a file imports, and `read_file` to inspect specific ranges.\n"
+        "Multi-repo sessions: pick the local path of the relevant repo from the "
+        "developer prompt. If the user's question is ambiguous about which repo, "
+        "use `ask_user` to clarify."
     ),
     model="gpt-5.4",
     model_settings=ModelSettings(max_tokens=16384),
@@ -45,6 +50,8 @@ explorer_agent = Agent[Any](
         "`search_indexed(query, repo_url, k)` for semantic matches against the indexed chunks. "
         "Use the GitHub-style repo_url from the developer prompt, not the local path.\n"
         "4. Use read_file only when the user wants the contents of a specific file or range.\n"
+        "Multi-repo sessions: pick the indexed_url and local path of the relevant repo "
+        "from the developer prompt. If unclear which repo, use ask_user to clarify.\n"
         "Keep responses concise — return paths or file:line entries, not prose summaries, unless asked."
     ),
     model="gpt-5.4",
@@ -68,6 +75,8 @@ explainer_agent = Agent[Any](
         "search_indexed.\n"
         "- For exact-string / regex lookups (e.g. 'every place this constant is referenced'), "
         "hand off to the Tracer agent — you do not have a regex tool yourself.\n"
+        "Multi-repo sessions: pick the indexed_url + local path of the relevant repo from "
+        "the developer prompt. If unclear which repo, use ask_user to clarify.\n"
         "Cite file paths and line ranges in your answer."
     ),
     model="gpt-5.4",
@@ -80,14 +89,24 @@ explainer_agent = Agent[Any](
 bootstrap_agent = Agent[Any](
     name="Bootstrap",
     instructions=(
-        "You help users get a codebase running locally. You have a precomputed "
-        "startup plan for this repo, accessible via `get_startup_plan(repo_url)`. "
-        "The plan is the source of truth — start every answer by reading it.\n"
+        "You help users get a codebase running locally.\n"
+        "\n"
+        "MULTI-REPO ROUTING:\n"
+        "- For cross-stack 'how do I run everything', 'how do I start the whole app', "
+        "or anything spanning multiple repos in this session → call "
+        "`get_app_startup_plan(session_id)` first; the session_id is in the developer prompt. "
+        "That returns a consolidated markdown plan covering all repos.\n"
+        "- For single-repo questions about one specific repo → call "
+        "`get_startup_plan(repo_url)` for that repo.\n"
+        "If the session has only one repo, prefer `get_startup_plan`; if it has multiple "
+        "and the question is unscoped, prefer `get_app_startup_plan`.\n"
+        "\n"
+        "The relevant plan is the source of truth — start every answer by reading it.\n"
         "\n"
         "Routing rules:\n"
         "1. 'How do I run this' / 'how do I start this' / 'what do I need to install' → "
-        "read the plan, summarise: runtime, install command, required services, env vars, "
-        "step-by-step. Cite step numbers from the plan.\n"
+        "read the relevant plan (per-repo or app-level), summarise: runtime, install command, "
+        "required services, env vars, step-by-step. Cite step numbers from the plan.\n"
         "2. 'What env vars do I need' → list `env_vars` from the plan, marking required vs "
         "optional and flagging items where `needs_verification: true` or `example` is null.\n"
         "3. 'Why do I need X' → cite the `sources` array on the relevant plan entry. Use "
@@ -114,6 +133,7 @@ bootstrap_agent = Agent[Any](
     model_settings=ModelSettings(max_tokens=16384),
     tools=[
         get_startup_plan,
+        get_app_startup_plan,
         recompute_startup_plan,
         list_files,
         read_file,
@@ -125,7 +145,7 @@ bootstrap_agent = Agent[Any](
     handoff_description=(
         "Hand off to the bootstrap agent for any question about getting the project "
         "running locally: install commands, env vars, required services, dependencies, "
-        "Docker setup, dev-server startup, or 'how do I run this'."
+        "Docker setup, dev-server startup, or 'how do I run this' (single repo or whole stack)."
     ),
 )
 
@@ -152,15 +172,50 @@ boundary_extractor_agent = Agent[BoundaryReport](
     tools=[list_files, read_file, get_dependencies, search_code, search_indexed],
 )
 
+
+consolidator_agent = Agent[Any](
+    name="Consolidator",
+    instructions=(
+        "You produce a final, ordered startup plan for an application that spans "
+        "multiple repos. You receive (in the developer prompt): the dependency "
+        "graph (typed nodes + edges + topological order + cycle-break records), "
+        "matcher-flagged ambiguities, orchestration findings, and the list of "
+        "repos with their local paths and indexed urls.\n"
+        "Use the lookup tools (`get_repo_boundaries`, `get_repo_startup_plan`) to "
+        "read each repo's data. Use `list_files`, `read_file`, `search_indexed` "
+        "to verify cross-repo claims when the matcher's confidence is low.\n"
+        "DO NOT silently override the matcher's topo order — if you change it, "
+        "explain why in Caveats.\n"
+        "Output a single markdown document with these sections in order:\n"
+        "  # Startup plan: <app name or repo set summary>\n"
+        "  ## Prerequisites — required infra (postgres, redis, etc.) and version requirements\n"
+        "  ## Env vars — grouped by repo, marked required/optional\n"
+        "  ## Steps — one numbered step per ordered group from the topo sort, parallel commands grouped\n"
+        "  ## Dependency graph — Mermaid diagram of nodes and typed edges\n"
+        "  ## Caveats — ambiguous edges, cycle-breaking decisions, low-confidence matches, anything to verify"
+    ),
+    model="gpt-5.4",
+    model_settings=ModelSettings(max_tokens=16384),
+    tools=[
+        get_repo_boundaries,
+        get_repo_startup_plan,
+        list_files,
+        read_file,
+        search_indexed,
+    ],
+)
+
+
 router_agent = Agent[Any](
     name="Router",
     instructions=(
         "You are a router to route the users question to the appropriate agent, you can hand off to the explorer agent to find things in the codebase, the explainer agent to summarise and synthesise information, the tracer agent to trace the execution path of the codebase, or the bootstrap agent for questions about getting the repo running locally. After handing off to one agent you can hand off to another agent. You should ensure you completely and directly answer the users question and pick up all information from the previous agents/related to the question.\n"
-        "Any question about getting the repo running locally (install, env vars, services, dev-server, Docker setup, 'how do I run this') goes to the bootstrap agent.\n"
+        "Any question about getting the repo running locally (install, env vars, services, dev-server, Docker setup, 'how do I run this', 'how do I run the whole stack') goes to the bootstrap agent.\n"
         "Any git-related question (commit history, when/why something changed, recent changes, who/what touched a file, 'what changed recently') goes to the explainer agent — it is the only agent with `git_log`.\n"
         "If you believe the question is ambiguous or unfinished, you can use ask_user to clarify before proceeding. "
         "For example if they say 'trace the flow' without specifying which flow, ask which one. "
-        "Or if they ask 'how does the uploading work' and there are multiple upload workflows (e.g. files from computer to server vs server to AWS), ask which upload process they mean."
+        "Or if they ask 'how does the uploading work' and there are multiple upload workflows (e.g. files from computer to server vs server to AWS), ask which upload process they mean.\n"
+        "Multi-repo sessions: if the developer prompt lists more than one repo and the user's question doesn't clearly pick one (and isn't explicitly cross-stack), use ask_user to confirm which repo before handing off."
     ),
     model="gpt-5.4",
     tools=[ask_user],

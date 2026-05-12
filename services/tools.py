@@ -11,8 +11,10 @@ from temporalio.client import Client
 
 from services.chunk_and_embed import embed_query
 from services.db import (
-    CODE_SEARCH_SQL, DIR_SUMMARY_SEARCH_SQL, get_pool, get_startup_plan_row,
+    CODE_SEARCH_SQL, DIR_SUMMARY_SEARCH_SQL, get_app_startup_plan_row, get_pool,
+    get_repo_boundaries_row, get_startup_plan_row,
 )
+
 from services.event_bus import publish
 
 current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar("current_session_id")
@@ -292,3 +294,43 @@ async def recompute_startup_plan(repo_url: str, reason: str = "") -> str:
         f"Recompute requested for {repo_url}. "
         "The new plan will appear in a few seconds; re-call get_startup_plan to read it."
     )
+
+
+@function_tool
+async def get_repo_boundaries(repo_url: str) -> str:
+    """Return the BoundaryReport JSON for a repo, or 'no boundaries available'."""
+    row = await get_repo_boundaries_row(repo_url)
+    if row is None:
+        return "No boundary report available for this repo yet."
+    return json.dumps({
+        "report": row["report"],
+        "analysis_status": row["analysis_status"],
+        "model": row["model"],
+    }, indent=2)
+
+
+@function_tool
+async def get_repo_startup_plan(repo_url: str) -> str:
+    """Return the persisted startup plan for a repo, formatted for the LLM."""
+    row = await get_startup_plan_row(repo_url)
+    if row is None:
+        return "No startup plan available for this repo yet."
+    return _format_plan_for_llm(row)
+
+
+@function_tool
+async def get_app_startup_plan(session_id: str) -> str:
+    """Return the consolidated app-level startup plan markdown for a session."""
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT app_plan_hash FROM sessions WHERE id = %s",
+            (session_id,),
+        )
+        row = await cur.fetchone()
+    if row is None or not row[0]:
+        return "No app plan available for this session."
+    plan = await get_app_startup_plan_row(row[0])
+    if plan is None or not plan.get("plan_markdown"):
+        return "No app plan available for this session."
+    return plan["plan_markdown"]

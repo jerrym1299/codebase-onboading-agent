@@ -13,7 +13,7 @@ from agents.items import (
 )
 from agents.exceptions import MaxTurnsExceeded
 
-from agent_defs import boundary_extractor_agent, router_agent
+from agent_defs import boundary_extractor_agent, router_agent, consolidator_agent
 from services.boundary_extractor import BoundaryReport, build_developer_prompt
 from services.clone_repo import ensure_repo_dir
 from services.dependency_graph import build_graph
@@ -22,10 +22,11 @@ from services.tools import current_session_id
 from services.walk_repo import collect_file_paths
 from services.chunk_and_embed import chunk_file_list
 from services.db import (
-    get_pool, get_repo_boundaries_row, get_session_repo_urls, get_startup_plan_row,
-    store_chunks, store_dir_summaries, upsert_app_startup_plan,
+    get_app_startup_plan_row, get_pool, get_repo_boundaries_row, get_session_repo_urls,
+    get_startup_plan_row, store_chunks, store_dir_summaries, upsert_app_startup_plan,
     upsert_repo_boundaries, upsert_startup_plan,
 )
+
 from services.startup_analysis import (
     ANALYSIS_MODEL, build_context, call_llm,
 )
@@ -88,6 +89,13 @@ class BuildGraphParams:
     repo_urls: list[str]
     repo_dirs: dict[str, str]
 
+@dataclass
+class ConsolidateParams:
+    session_id: str
+    repo_set_hash: str
+    repo_urls: list[str]
+    repo_dirs: dict[str, str]
+    
 
 @activity.defn
 async def update_session_status_activity(params: SessionStatusParams) -> None:
@@ -339,6 +347,104 @@ async def build_graph_activity(params: BuildGraphParams) -> dict:
     }
 
 
+CONSOLIDATOR_MODEL = "gpt-5.4"
+
+
+def _build_consolidator_prompt(
+    repo_urls: list[str],
+    repo_dirs: dict[str, str],
+    plan_row: dict,
+) -> str:
+    repos_block = "\n".join(
+        f"- {url} (local: {repo_dirs.get(url, '?')})" for url in repo_urls
+    )
+    return (
+        "Repos in this app:\n"
+        f"{repos_block}\n\n"
+        "Dependency graph (nodes + edges + topo_order + cycle_breaks):\n"
+        f"{json.dumps(plan_row.get('graph') or {}, indent=2)}\n\n"
+        "Matcher-flagged ambiguities:\n"
+        f"{json.dumps(plan_row.get('ambiguities') or [], indent=2)}\n\n"
+        "Orchestration findings (parsed compose / Procfile):\n"
+        f"{json.dumps(plan_row.get('orchestration_findings') or [], indent=2)}\n\n"
+        "Produce the final markdown document per your instructions. "
+        "Begin output now."
+    )
+
+
+@activity.defn
+async def consolidate_plan_activity(params: ConsolidateParams) -> dict:
+    """Stream consolidator_agent. Persists final markdown to
+    app_startup_plans.plan_markdown."""
+    plan_row = await get_app_startup_plan_row(params.repo_set_hash)
+    if plan_row is None:
+        raise RuntimeError(f"app_startup_plans row missing for {params.repo_set_hash}")
+
+    prompt = _build_consolidator_prompt(params.repo_urls, params.repo_dirs, plan_row)
+    current_session_id.set(params.session_id)
+
+    await publish(params.session_id, {
+        "type": "data-consolidator-started",
+        "repo_set_hash": params.repo_set_hash,
+    })
+
+    text_chunks: list[str] = []
+    try: #run the consolidator agent with the initial prompt
+        result = Runner.run_streamed(consolidator_agent, prompt, max_turns=30)
+        async for event in result.stream_events():
+            if isinstance(event, RawResponsesStreamEvent):
+                delta = getattr(event.data, "delta", None)
+                if isinstance(delta, str) and delta:
+                    text_chunks.append(delta)
+                    await publish(params.session_id, {
+                        "type": "text-delta",
+                        "textDelta": delta,
+                    })
+            elif isinstance(event, RunItemStreamEvent):
+                item = event.item
+                if isinstance(item, ToolCallItem) and event.name == "tool_called":
+                    raw = item.raw_item
+                    await publish(params.session_id, {
+                        "type": "tool-input-available",
+                        "toolCallId": getattr(raw, "call_id", ""),
+                        "toolName": getattr(raw, "name", ""),
+                        "args": getattr(raw, "arguments", ""),
+                    })
+                elif isinstance(item, ToolCallOutputItem) and event.name == "tool_output":
+                    raw = item.raw_item
+                    call_id = raw.get("call_id", "") if isinstance(raw, dict) else getattr(raw, "call_id", "")
+                    await publish(params.session_id, {
+                        "type": "tool-output-available",
+                        "toolCallId": call_id,
+                        "output": str(item.output),
+                    })
+        markdown = str(result.final_output) if result.final_output else "".join(text_chunks)
+        status, error = "ok", None
+    except Exception as exc:
+        activity.logger.exception("consolidator failed: %s", exc)
+        markdown, status, error = "", "failed", str(exc)[:1000]
+
+    await upsert_app_startup_plan(
+        repo_set_hash=params.repo_set_hash,
+        repo_urls=params.repo_urls,
+        plan_markdown=markdown,
+        graph=plan_row["graph"],
+        ambiguities=plan_row["ambiguities"],
+        orchestration_findings=plan_row["orchestration_findings"],
+        analysis_status=status,
+        model=CONSOLIDATOR_MODEL,
+        error=error,
+    )
+
+    fresh = await get_app_startup_plan_row(params.repo_set_hash)
+    await publish(params.session_id, {
+        "type": "data-app-plan-updated",
+        "updatedAt": fresh["updated_at"] if fresh else None,
+        "repo_set_hash": params.repo_set_hash,
+    })
+
+    return {"status": status, "markdown_len": len(markdown)}
+
 @activity.defn
 async def cancel_pending_actions_activity(session_id: str) -> int:
     """Cancel all open pending_actions for a session. Returns count cancelled."""
@@ -380,11 +486,13 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
     repo_urls = await get_session_repo_urls(params.session_id)
     if not repo_urls:
         raise RuntimeError(f"Session {params.session_id} not found")
-    repo_url = repo_urls[0]
 
-    repo_dir = await ensure_repo_dir(repo_url)
-    if repo_dir is None:
-        raise RuntimeError(f"Failed to resolve repo dir for {repo_url}")
+    repo_dirs: dict[str, str] = {}
+    for url in repo_urls:
+        rd = await ensure_repo_dir(url)
+        if rd is None:
+            raise RuntimeError(f"Failed to resolve repo dir for {url}")
+        repo_dirs[url] = rd
 
     pool = await get_pool()
     # Insert placeholder assistant row
@@ -400,11 +508,21 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
     session = SQLiteSession(params.session_id, SESSION_DB_PATH)
 
     def prepend_repo_context(history, new_input):
+        repo_lines = "\n".join(
+            f"- {url.rstrip('/').split('/')[-1].removesuffix('.git')}: "
+            f"local={repo_dirs[url]}, indexed_url={url}"
+            for url in repo_urls
+        )
         context = {
             "role": "developer",
             "content": (
-                f"Local codebase path: {repo_dir}\n"
-                f"Indexed repo_url: {repo_url}\n"
+                f"Repos in this session:\n{repo_lines}\n"
+                "When you call search_indexed/search_dir_summaries, pass the indexed_url "
+                "that matches the question.\n"
+                "When you call read_file/list_files, use the local path of the relevant repo.\n"
+                "If the question is ambiguous about which repo, use ask_user to clarify "
+                "before calling any tool.\n"
+                f"Session id (for get_app_startup_plan): {params.session_id}\n"
                 "You are a senior developer and codebase expert. "
                 "Be concise but make sure to fully answer the user's question. "
                 "Cite file:line where relevant."
