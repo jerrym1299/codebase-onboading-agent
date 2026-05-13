@@ -69,7 +69,7 @@ class CodebaseChatWorkflow:
                     repo_dir=repo_dir,
                     force=force,
                 ),
-                start_to_close_timeout=timedelta(seconds=120),
+                start_to_close_timeout=timedelta(seconds=600),
                 retry_policy=RetryPolicy(maximum_attempts=2),
             )
             await workflow.execute_activity(
@@ -79,7 +79,7 @@ class CodebaseChatWorkflow:
                     repo_url=repo_url,
                     repo_dir=repo_dir,
                 ),
-                start_to_close_timeout=timedelta(seconds=240),
+                start_to_close_timeout=timedelta(seconds=600),
                 retry_policy=RetryPolicy(maximum_attempts=2),
             )
             return repo_url, repo_dir

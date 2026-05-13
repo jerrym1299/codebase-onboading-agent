@@ -20,14 +20,20 @@ from openai import OpenAI
 TOTAL_BUDGET_CHARS = 128_000
 
 # Files that must always be included (priority 0 — never dropped before
-# everything else). Env templates live here too: they're the canonical
-# source for required env vars and dropping them would silently hide
-# the variables the LLM is supposed to enumerate.
-ALWAYS_FILES = (
+# everything else). Split into two collectors: root-only canonical files
+# (README, lockfiles, workspace declarations) and recursive files that
+# legitimately vary per package in a monorepo (env templates, per-package
+# manifests, runtime-version pins). Env templates MUST be recursive: a repo
+# like hobbesBackend has the OAuth client vars in `backend/env.example`,
+# not at the root, and a root-only scan silently drops those vars from
+# the resulting plan.
+ALWAYS_FILES_ROOT_ONLY = (
     "README.md", "README.MD", "README", "README.rst", "README.txt",
-    "package.json",
     "pnpm-workspace.yaml", "pnpm-workspace.yml",
     "turbo.json", "nx.json", "lerna.json",
+)
+ALWAYS_FILES_RECURSIVE = (
+    "package.json",
     "pyproject.toml", "Pipfile", "setup.py", "setup.cfg",
     "poetry.lock", "uv.lock",
     "go.mod", "Cargo.toml",
@@ -35,8 +41,9 @@ ALWAYS_FILES = (
     "pom.xml", "build.gradle", "build.gradle.kts",
     ".env.example", ".env.sample", ".env.template", ".env.dist",
     "env.example", "env.sample", "env.template", "env.dist",
+    ".nvmrc", ".python-version", ".ruby-version", ".tool-versions",
 )
-ALWAYS_GLOBS = ("requirements*.txt", ".env/*")
+ALWAYS_GLOBS_RECURSIVE = ("requirements*.txt",)
 
 LOCKFILE_NAMES = frozenset({"poetry.lock", "uv.lock", "Cargo.toml", "Gemfile"})
 
@@ -239,16 +246,44 @@ def _read_text(path: Path, max_lines: int | None = None) -> str | None:
         return None
 
 
-def _collect_matches(repo_dir: Path, names: tuple[str, ...],
-                     globs: tuple[str, ...]) -> list[Path]:
+_PER_BUCKET_FILE_CAP = 60
+
+
+def _collect_root_only(repo_dir: Path, names: tuple[str, ...]) -> list[Path]:
+    """Pick up canonical-at-root files (README, lockfile, workspace decl).
+    Multiple READMEs across a monorepo are noise, not signal — only the root
+    one belongs in the bundle."""
     out: list[Path] = []
     for name in names:
         candidate = repo_dir / name
         if candidate.is_file():
             out.append(candidate)
-    for pattern in globs:
-        out.extend(p for p in repo_dir.glob(pattern) if p.is_file())
     return sorted(set(out))
+
+
+def _collect_recursive(repo_dir: Path, names: tuple[str, ...],
+                       globs: tuple[str, ...]) -> list[Path]:
+    """Recursively find files matching the given basenames or glob patterns,
+    pruning skip dirs. Use for files that legitimately vary per package in a
+    monorepo (env templates, per-package manifests, Dockerfile variants).
+    """
+    name_set = {n.lower() for n in names}
+    out: set[Path] = set()
+    if name_set:
+        for path in repo_dir.rglob("*"):
+            if any(part in _SCAN_SKIP_DIRS for part in path.parts):
+                continue
+            if not path.is_file():
+                continue
+            if path.name.lower() in name_set:
+                out.add(path)
+    for pattern in globs:
+        for p in repo_dir.rglob(pattern):
+            if any(part in _SCAN_SKIP_DIRS for part in p.parts):
+                continue
+            if p.is_file():
+                out.add(p)
+    return sorted(out)[:_PER_BUCKET_FILE_CAP]
 
 
 def _top_two_levels(repo_dir: Path) -> str:
@@ -280,8 +315,16 @@ def build_context(repo_dir: str) -> ContextBundle:
 
     # Priority 1 (highest): always
     always_entries: list[BundleEntry] = []
-    for path in _collect_matches(root, ALWAYS_FILES, ALWAYS_GLOBS):
-        max_lines = 200 if path.name in LOCKFILE_NAMES else None
+    always_paths = (
+        _collect_root_only(root, ALWAYS_FILES_ROOT_ONLY)
+        + _collect_recursive(root, ALWAYS_FILES_RECURSIVE, ALWAYS_GLOBS_RECURSIVE)
+    )
+    seen: set[Path] = set()
+    for path in always_paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        max_lines = 40 if path.name in LOCKFILE_NAMES else None
         text = _read_text(path, max_lines=max_lines)
         if text is not None:
             always_entries.append(BundleEntry(
@@ -306,7 +349,7 @@ def build_context(repo_dir: str) -> ContextBundle:
 
     # Priority 3: infra
     infra_entries: list[BundleEntry] = []
-    for path in _collect_matches(root, INFRA_FILES, INFRA_GLOBS):
+    for path in _collect_recursive(root, INFRA_FILES, INFRA_GLOBS):
         text = _read_text(path)
         if text is not None:
             infra_entries.append(BundleEntry(
@@ -316,7 +359,7 @@ def build_context(repo_dir: str) -> ContextBundle:
 
     # Priority 4: ci (head 200 lines each)
     ci_entries: list[BundleEntry] = []
-    for path in _collect_matches(root, CI_FILES, CI_GLOBS):
+    for path in _collect_recursive(root, CI_FILES, CI_GLOBS):
         text = _read_text(path, max_lines=200)
         if text is not None:
             ci_entries.append(BundleEntry(
@@ -326,7 +369,7 @@ def build_context(repo_dir: str) -> ContextBundle:
 
     # Priority 5: migrations
     mig_entries: list[BundleEntry] = []
-    for path in _collect_matches(root, MIGRATION_FILES, MIGRATION_GLOBS):
+    for path in _collect_recursive(root, MIGRATION_FILES, MIGRATION_GLOBS):
         text = _read_text(path)
         if text is not None:
             mig_entries.append(BundleEntry(
