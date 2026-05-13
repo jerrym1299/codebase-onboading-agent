@@ -7,6 +7,7 @@ for semantic search.
 import logging
 import os
 from collections import defaultdict
+from typing import Awaitable, Callable
 import asyncio
 import tiktoken
 from openai import AsyncOpenAI
@@ -113,25 +114,50 @@ async def summarise_one(
     return DirSummary(dir_path=rel_dir, summary=summary_text, file_list=files_in_dir)
 
 
+ProgressCallback = Callable[[int, int, str], Awaitable[None]]
+
+
+async def _summarise_with_label(
+    dir_path: str, dir_chunks: list[CodeChunk], repo_dir: str,
+) -> tuple[str, DirSummary | BaseException]:
+    try:
+        return dir_path, await summarise_one(dir_path, dir_chunks, repo_dir)
+    except BaseException as exc:  # noqa: BLE001
+        return dir_path, exc
+
+
 async def generate_dir_summaries(
     chunks: list[CodeChunk],
     repo_dir: str,
+    on_progress: ProgressCallback | None = None,
 ) -> list[DirSummary]:
     """Group chunks by directory, summarise each with gpt-5.4, embed the
-    summaries with text-embedding-3-large, and return DirSummary rows."""
-    groups = _group_by_directory(chunks)
+    summaries with text-embedding-3-large, and return DirSummary rows.
 
-    results = await asyncio.gather(
-        *[summarise_one(d, c, repo_dir) for d, c in groups.items()],
-        return_exceptions=True,
-    )
+    If on_progress is supplied, it is awaited after each per-directory
+    summary completes with (done, total, dir_path)."""
+    groups = _group_by_directory(chunks)
+    total = len(groups)
+
+    tasks = [
+        asyncio.create_task(_summarise_with_label(d, c, repo_dir))
+        for d, c in groups.items()
+    ]
 
     summaries: list[DirSummary] = []
-    for (dir_path, _), r in zip(groups.items(), results):
-        if isinstance(r, DirSummary):
-            summaries.append(r)
+    done = 0
+    for fut in asyncio.as_completed(tasks):
+        dir_path, result = await fut
+        done += 1
+        if isinstance(result, DirSummary):
+            summaries.append(result)
         else:
-            logger.warning("dir summary failed for %s: %s", dir_path, r)
+            logger.warning("dir summary failed for %s: %s", dir_path, result)
+        if on_progress is not None:
+            try:
+                await on_progress(done, total, dir_path)
+            except Exception:  # noqa: BLE001
+                logger.exception("on_progress callback raised; continuing")
 
     if summaries:
         texts = [f"Directory: {s.dir_path}\n{s.summary}" for s in summaries]

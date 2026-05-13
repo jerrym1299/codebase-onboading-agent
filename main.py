@@ -32,7 +32,7 @@ from services.clone_repo import ensure_repo_dir
 from services.db import (
     CODE_SEARCH_SQL, close_pool, get_app_startup_plan_row, get_pool,
     get_repo_boundaries_row, get_session_repo_urls, get_startup_plan_row,
-    init_schema, insert_session_repos, store_chunks,
+    init_schema, insert_session_repos, store_chunks, get_dir_summaries_for_repo,
 )
 from services.cleanup import delete_app_plan_data, delete_repo_data, delete_session_data
 from services.event_bus import subscribe, unsubscribe
@@ -398,6 +398,47 @@ async def get_per_repo_startup_plan_endpoint(session_id: str, repo_url: str):
         "truncations": plan_row["truncations"],
         "error": plan_row["error"],
         "updated_at": plan_row["updated_at"],
+    }
+
+@app.get("/sessions/{session_id}/repos/{repo_url:path}/dir-summaries")
+async def get_per_repo_dir_summaries_endpoint(session_id: str, repo_url: str):
+    """Diagnostic: per-repo dir_summaries rows. URL-encode the repo_url."""
+    repo_urls = await get_session_repo_urls(session_id)
+    if not repo_urls:
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
+    target = repo_url.rstrip("/")
+    if target not in repo_urls:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Repo not part of session.", "repo_urls": repo_urls},
+        )
+    summaries = await get_dir_summaries_for_repo(target)
+    if not summaries:
+        return JSONResponse(status_code=404, content={"status": "pending"})
+    return {
+        "repo_url": target,
+        "count": len(summaries),
+        "summaries": summaries,
+    }
+
+
+@app.get("/sessions/{session_id}/dir-summaries")
+async def get_session_dir_summaries_endpoint(session_id: str):
+    """All dir_summaries rows across every repo in the session, grouped by repo_url."""
+    repo_urls = await get_session_repo_urls(session_id)
+    if not repo_urls:
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
+    summaries_per_repo = await asyncio.gather(
+        *[get_dir_summaries_for_repo(url) for url in repo_urls]
+    )
+    repos = {
+        url: {"count": len(s), "summaries": s}
+        for url, s in zip(repo_urls, summaries_per_repo)
+    }
+    return {
+        "session_id": session_id,
+        "repo_urls": repo_urls,
+        "repos": repos,
     }
 
 

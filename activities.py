@@ -159,13 +159,52 @@ async def index_repo_activity(params: IndexParams) -> int:
         return count
 
     paths = await collect_file_paths(params.repo_dir)
+    await publish(params.session_id, {
+        "type": "data-repo-progress",
+        "repo_url": params.repo_url,
+        "stage": "walked",
+        "file_count": len(paths),
+    })
+
     chunks = chunk_file_list(paths)
+    await publish(params.session_id, {
+        "type": "data-repo-progress",
+        "repo_url": params.repo_url,
+        "stage": "chunked",
+        "chunk_count": len(chunks),
+    })
+
     await store_chunks(params.repo_url, chunks)
+    await publish(params.session_id, {
+        "type": "data-repo-progress",
+        "repo_url": params.repo_url,
+        "stage": "chunks_stored",
+        "chunk_count": len(chunks),
+    })
 
     activity.logger.info("Generating per-directory summaries for %s", params.repo_url)
-    dir_sums = await generate_dir_summaries(chunks, params.repo_dir)
+
+    async def _publish_dir_progress(done: int, total: int, dir_path: str) -> None:
+        await publish(params.session_id, {
+            "type": "data-repo-progress",
+            "repo_url": params.repo_url,
+            "stage": "summarising_dirs",
+            "done": done,
+            "total": total,
+            "dir_path": dir_path,
+        })
+
+    dir_sums = await generate_dir_summaries(
+        chunks, params.repo_dir, on_progress=_publish_dir_progress,
+    )
     await store_dir_summaries(params.repo_url, dir_sums)
     activity.logger.info("Stored %d directory summaries", len(dir_sums))
+    await publish(params.session_id, {
+        "type": "data-repo-progress",
+        "repo_url": params.repo_url,
+        "stage": "dir_summaries_stored",
+        "summary_count": len(dir_sums),
+    })
 
     await publish(params.session_id, {
         "type": "data-repo-progress",
@@ -193,8 +232,20 @@ async def analyze_startup_activity(params: AnalyzeStartupParams) -> dict:
     activity.logger.info(
         "Analyzing startup for %s (force=%s)", params.repo_url, params.force,
     )
+    await publish(params.session_id, {
+        "type": "data-repo-progress",
+        "repo_url": params.repo_url,
+        "stage": "analyzing_startup",
+    })
 
     bundle = build_context(params.repo_dir)
+    await publish(params.session_id, {
+        "type": "data-repo-progress",
+        "repo_url": params.repo_url,
+        "stage": "startup_context_built",
+        "entries": len(bundle.entries),
+        "chars": bundle.total_chars,
+    })
     activity.logger.info(
         "Context bundle: entries=%d chars=%d truncations=%s",
         len(bundle.entries), bundle.total_chars, bundle.truncations,
@@ -240,6 +291,12 @@ async def analyze_startup_activity(params: AnalyzeStartupParams) -> dict:
     await publish(params.session_id, {
         "type": "data-startup-plan-updated",
         "updatedAt": fresh["updated_at"] if fresh else None,
+    })
+    await publish(params.session_id, {
+        "type": "data-repo-progress",
+        "repo_url": params.repo_url,
+        "stage": "startup_analyzed",
+        "status": status,
     })
 
     return {"status": status, "skipped": False}

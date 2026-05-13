@@ -382,6 +382,30 @@ async def get_repo_boundaries_row(repo_url: str) -> dict | None:
         "updated_at": row[5].isoformat(),
     }
 
+DIR_SUMMARIES_SELECT_SQL = """
+    SELECT dir_path, summary, file_list, created_at
+    FROM dir_summaries
+    WHERE repo_url = %s
+    ORDER BY dir_path
+"""
+
+async def get_dir_summaries_for_repo(repo_url: str) -> list[dict]:
+    """Return all directory summaries for a repo, ordered by dir_path.
+    Returns an empty list if the repo has no summaries yet."""
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(DIR_SUMMARIES_SELECT_SQL, (repo_url,))
+        rows = await cur.fetchall()
+    return [
+        {
+            "dir_path": r[0],
+            "summary": r[1],
+            "file_list": list(r[2] or []),
+            "created_at": r[3].isoformat(),
+        }
+        for r in rows
+    ]
+
 
 async def upsert_repo_boundaries(
     repo_url: str,
