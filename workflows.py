@@ -56,7 +56,7 @@ class CodebaseChatWorkflow:
             await workflow.execute_activity(
                 index_repo_activity,
                 IndexParams(repo_url=repo_url, repo_dir=repo_dir, session_id=session_id),
-                start_to_close_timeout=timedelta(seconds=600),
+                start_to_close_timeout=timedelta(minutes=30),
                 retry_policy=RetryPolicy(maximum_attempts=2),
             )
             await workflow.execute_activity(

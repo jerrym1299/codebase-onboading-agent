@@ -4,21 +4,21 @@ using gpt-5.4 over the already-extracted code chunks, then embed them
 for semantic search.
 """
 
+import logging
 import os
 from collections import defaultdict
-
+import asyncio
 import tiktoken
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from services.chunk_and_embed import CodeChunk
 from services.db import DirSummary
 
-client = OpenAI()
+client = AsyncOpenAI()
+logger = logging.getLogger(__name__)
 
-# gpt-5.4: 1M context, 128k max output. Reserve 100k for output and
-# ~100k headroom for system prompt + formatting + tokenizer drift.
 MAX_INPUT_TOKENS = 800_000
-MAX_OUTPUT_TOKENS = 100_000
+MAX_OUTPUT_TOKENS = 10_000
 
 # o200k_base is the encoding family used since gpt-4o; safe default
 # while gpt-5.4 may not yet be registered in tiktoken's model table.
@@ -91,44 +91,55 @@ SYSTEM_PROMPT = (
     "No fluff, no boilerplate, no restating the file list."
 )
 
+SEM = asyncio.Semaphore(16)
 
-def generate_dir_summaries(
+
+async def summarise_one(
+    dir_path: str, dir_chunks: list[CodeChunk], repo_dir: str,
+) -> DirSummary:
+    context = _build_dir_context(dir_path, dir_chunks)
+    async with SEM:
+        resp = await client.chat.completions.create(
+            model="gpt-5.4",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": context},
+            ],
+            max_completion_tokens=MAX_OUTPUT_TOKENS,
+        )
+    summary_text = resp.choices[0].message.content.strip()
+    files_in_dir = sorted({os.path.basename(c.file_path) for c in dir_chunks})
+    rel_dir = os.path.relpath(dir_path, repo_dir) if dir_path != repo_dir else "."
+    return DirSummary(dir_path=rel_dir, summary=summary_text, file_list=files_in_dir)
+
+
+async def generate_dir_summaries(
     chunks: list[CodeChunk],
     repo_dir: str,
 ) -> list[DirSummary]:
     """Group chunks by directory, summarise each with gpt-5.4, embed the
     summaries with text-embedding-3-large, and return DirSummary rows."""
     groups = _group_by_directory(chunks)
+
+    results = await asyncio.gather(
+        *[summarise_one(d, c, repo_dir) for d, c in groups.items()],
+        return_exceptions=True,
+    )
+
     summaries: list[DirSummary] = []
-
-    for dir_path, dir_chunks in groups.items():
-        rel_dir = os.path.relpath(dir_path, repo_dir) if dir_path != repo_dir else "."
-        context = _build_dir_context(dir_path, dir_chunks)
-
-        resp = client.chat.completions.create(
-            model="gpt-5.4",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": context},
-            ],
-            max_tokens=MAX_OUTPUT_TOKENS,
-        )
-        summary_text = resp.choices[0].message.content.strip()
-
-        files_in_dir = sorted({os.path.basename(c.file_path) for c in dir_chunks})
-        summaries.append(DirSummary(
-            dir_path=rel_dir,
-            summary=summary_text,
-            file_list=files_in_dir,
-        ))
+    for (dir_path, _), r in zip(groups.items(), results):
+        if isinstance(r, DirSummary):
+            summaries.append(r)
+        else:
+            logger.warning("dir summary failed for %s: %s", dir_path, r)
 
     if summaries:
         texts = [f"Directory: {s.dir_path}\n{s.summary}" for s in summaries]
         BATCH = 100
         for i in range(0, len(texts), BATCH):
             batch = texts[i:i + BATCH]
-            resp = client.embeddings.create(
-                input=batch, model="text-embedding-3-large"
+            resp = await client.embeddings.create(
+                input=batch, model="text-embedding-3-large",
             )
             for s, datum in zip(summaries[i:i + BATCH], resp.data):
                 s.embedding = datum.embedding

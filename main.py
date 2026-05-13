@@ -34,6 +34,7 @@ from services.db import (
     get_repo_boundaries_row, get_session_repo_urls, get_startup_plan_row,
     init_schema, insert_session_repos, store_chunks,
 )
+from services.cleanup import delete_app_plan_data, delete_repo_data, delete_session_data
 from services.event_bus import subscribe, unsubscribe
 from services.pdf_output import write_markdown_pdf
 from services.walk_repo import collect_file_paths, walk_repo
@@ -468,5 +469,55 @@ async def post_session_startup_export_endpoint(session_id: str):
         "markdown": markdown,
         "pdf_base64": pdf_b64,
     }
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session_endpoint(session_id: str, request: Request):
+    """Delete a session and (by default) cascade-delete any per-repo and
+    app-level data that no other session is using.
+
+    Query params:
+      - cascade_orphan_repos: '1'/'0' (default '1') — when last session over
+        a repo is deleted, also drop code_chunks/dir_summaries/startup_plans/
+        repo_boundaries for that repo.
+      - delete_clones: '1'/'0' (default '0') — also rm -rf the local clone
+        directory for any orphaned repo. Safe to leave off; clones are
+        idempotently reusable.
+    """
+    params = request.query_params
+    cascade = _truthy(params.get("cascade_orphan_repos") or "1")
+    delete_clones = _truthy(params.get("delete_clones"))
+    report = await delete_session_data(
+        session_id,
+        temporal_client=app.state.temporal_client,
+        cascade_orphan_repos=cascade,
+        delete_clones=delete_clones,
+    )
+    return report.to_dict()
+
+
+@app.delete("/repos/{repo_url:path}")
+async def delete_repo_endpoint(repo_url: str, request: Request):
+    """Force-delete per-repo data regardless of session references. Use when
+    a partial index needs to be wiped so the next session reindexes cleanly.
+
+    Query params:
+      - delete_clone: '1'/'0' (default '0') — also rm -rf the local clone.
+    """
+    params = request.query_params
+    delete_clone = _truthy(params.get("delete_clone"))
+    report = await delete_repo_data(repo_url, delete_clone=delete_clone)
+    return report.to_dict()
+
+
+@app.delete("/app-plans/{repo_set_hash}")
+async def delete_app_plan_endpoint(repo_set_hash: str):
+    """Delete a consolidated app-level plan row by its repo_set_hash."""
+    report = await delete_app_plan_data(repo_set_hash)
+    return report.to_dict()
 
 
