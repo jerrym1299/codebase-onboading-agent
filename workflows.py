@@ -15,6 +15,7 @@ with workflow.unsafe.imports_passed_through():
         ExtractBoundariesParams,
         BuildGraphParams,
         ConsolidateParams,
+        PipelineFailedParams,
         clone_repo_activity,
         index_repo_activity,
         update_session_status_activity,
@@ -23,6 +24,7 @@ with workflow.unsafe.imports_passed_through():
         extract_boundaries_activity,
         build_graph_activity,
         consolidate_plan_activity,
+        publish_pipeline_failed_activity,
         cancel_pending_actions_activity,
         resolve_pending_actions_activity,
     )
@@ -109,6 +111,18 @@ class CodebaseChatWorkflow:
             retry_policy=RetryPolicy(maximum_attempts=1),
         )
 
+    async def _emit_pipeline_failed(
+        self, session_id: str, phase: str, exc: BaseException
+    ) -> None:
+        await workflow.execute_activity(
+            publish_pipeline_failed_activity,
+            PipelineFailedParams(
+                session_id=session_id, phase=phase, message=str(exc),
+            ),
+            start_to_close_timeout=timedelta(seconds=15),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+
     @workflow.run
     async def run(self, params: ChatParams) -> dict:
         self._repo_urls = list(params.repo_urls)
@@ -122,7 +136,23 @@ class CodebaseChatWorkflow:
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
 
-        await self._run_pipeline(params.session_id, force=False)
+        try:
+            await self._run_pipeline(params.session_id, force=False)
+        except Exception as exc:
+            workflow.logger.exception("initial pipeline failed: %s", exc)
+            await self._emit_pipeline_failed(
+                params.session_id, "initial_pipeline", exc,
+            )
+            self._status = "failed"
+            await workflow.execute_activity(
+                update_session_status_activity,
+                SessionStatusParams(
+                    session_id=params.session_id, status="failed",
+                ),
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            return {"session_id": params.session_id, "status": "failed"}
 
         self._status = "ready"
         await workflow.execute_activity(
@@ -155,7 +185,13 @@ class CodebaseChatWorkflow:
                     start_to_close_timeout=timedelta(seconds=30),
                     retry_policy=RetryPolicy(maximum_attempts=3),
                 )
-                await self._run_pipeline(params.session_id, force=True)
+                try:
+                    await self._run_pipeline(params.session_id, force=True)
+                except Exception as exc:
+                    workflow.logger.exception("recompute pipeline failed: %s", exc)
+                    await self._emit_pipeline_failed(
+                        params.session_id, "recompute_pipeline", exc,
+                    )
                 self._status = "ready"
                 await workflow.execute_activity(
                     update_session_status_activity,

@@ -95,7 +95,15 @@ class ConsolidateParams:
     repo_set_hash: str
     repo_urls: list[str]
     repo_dirs: dict[str, str]
-    
+
+
+@dataclass
+class PipelineFailedParams:
+    session_id: str
+    phase: str
+    message: str
+
+
 
 @activity.defn
 async def update_session_status_activity(params: SessionStatusParams) -> None:
@@ -136,83 +144,93 @@ async def clone_repo_activity(params: CloneParams) -> str:
 @activity.defn
 async def index_repo_activity(params: IndexParams) -> int:
     """Chunk and embed the repo into pgvector. Returns chunk count. Skips if already indexed."""
-    await publish(params.session_id, {
-        "type": "data-repo-progress",
-        "repo_url": params.repo_url,
-        "stage": "indexing",
-    })
-    pool = await get_pool()
-    async with pool.connection() as conn, conn.cursor() as cur:
-        await cur.execute(
-            "SELECT count(*) FROM code_chunks WHERE repo_url = %s",
-            (params.repo_url,),
+    try:
+        await publish(params.session_id, {
+            "type": "data-repo-progress",
+            "repo_url": params.repo_url,
+            "stage": "indexing",
+        })
+        pool = await get_pool()
+        async with pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT count(*) FROM code_chunks WHERE repo_url = %s",
+                (params.repo_url,),
+            )
+            count = (await cur.fetchone())[0]
+        if count > 0:
+            await publish(params.session_id, {
+                "type": "data-repo-progress",
+                "repo_url": params.repo_url,
+                "stage": "indexed",
+                "skipped": True,
+                "chunks": count,
+            })
+            return count
+
+        paths = await collect_file_paths(params.repo_dir)
+        await publish(params.session_id, {
+            "type": "data-repo-progress",
+            "repo_url": params.repo_url,
+            "stage": "walked",
+            "file_count": len(paths),
+        })
+
+        chunks = chunk_file_list(paths)
+        await publish(params.session_id, {
+            "type": "data-repo-progress",
+            "repo_url": params.repo_url,
+            "stage": "chunked",
+            "chunk_count": len(chunks),
+        })
+
+        await store_chunks(params.repo_url, chunks)
+        await publish(params.session_id, {
+            "type": "data-repo-progress",
+            "repo_url": params.repo_url,
+            "stage": "chunks_stored",
+            "chunk_count": len(chunks),
+        })
+
+        activity.logger.info("Generating per-directory summaries for %s", params.repo_url)
+
+        async def _publish_dir_progress(done: int, total: int, dir_path: str) -> None:
+            await publish(params.session_id, {
+                "type": "data-repo-progress",
+                "repo_url": params.repo_url,
+                "stage": "summarising_dirs",
+                "done": done,
+                "total": total,
+                "dir_path": dir_path,
+            })
+
+        dir_sums = await generate_dir_summaries(
+            chunks, params.repo_dir, on_progress=_publish_dir_progress,
         )
-        count = (await cur.fetchone())[0]
-    if count > 0:
+        await store_dir_summaries(params.repo_url, dir_sums)
+        activity.logger.info("Stored %d directory summaries", len(dir_sums))
+        await publish(params.session_id, {
+            "type": "data-repo-progress",
+            "repo_url": params.repo_url,
+            "stage": "dir_summaries_stored",
+            "summary_count": len(dir_sums),
+        })
+
         await publish(params.session_id, {
             "type": "data-repo-progress",
             "repo_url": params.repo_url,
             "stage": "indexed",
-            "skipped": True,
-            "chunks": count,
+            "chunks": len(chunks),
         })
-        return count
-
-    paths = await collect_file_paths(params.repo_dir)
-    await publish(params.session_id, {
-        "type": "data-repo-progress",
-        "repo_url": params.repo_url,
-        "stage": "walked",
-        "file_count": len(paths),
-    })
-
-    chunks = chunk_file_list(paths)
-    await publish(params.session_id, {
-        "type": "data-repo-progress",
-        "repo_url": params.repo_url,
-        "stage": "chunked",
-        "chunk_count": len(chunks),
-    })
-
-    await store_chunks(params.repo_url, chunks)
-    await publish(params.session_id, {
-        "type": "data-repo-progress",
-        "repo_url": params.repo_url,
-        "stage": "chunks_stored",
-        "chunk_count": len(chunks),
-    })
-
-    activity.logger.info("Generating per-directory summaries for %s", params.repo_url)
-
-    async def _publish_dir_progress(done: int, total: int, dir_path: str) -> None:
+        return len(chunks)
+    except Exception as exc:
         await publish(params.session_id, {
-            "type": "data-repo-progress",
+            "type": "data-repo-error",
             "repo_url": params.repo_url,
-            "stage": "summarising_dirs",
-            "done": done,
-            "total": total,
-            "dir_path": dir_path,
+            "stage": "indexing",
+            "message": str(exc)[:500],
+            "attempt": activity.info().attempt,
         })
-
-    dir_sums = await generate_dir_summaries(
-        chunks, params.repo_dir, on_progress=_publish_dir_progress,
-    )
-    await store_dir_summaries(params.repo_url, dir_sums)
-    activity.logger.info("Stored %d directory summaries", len(dir_sums))
-    await publish(params.session_id, {
-        "type": "data-repo-progress",
-        "repo_url": params.repo_url,
-        "stage": "dir_summaries_stored",
-        "summary_count": len(dir_sums),
-    })
-
-    await publish(params.session_id, {
-        "type": "data-repo-progress",
-        "repo_url": params.repo_url,
-        "stage": "indexed",
-        "chunks": len(chunks),
-    })
-    return len(chunks)
+        raise
 
 
 @activity.defn
@@ -364,6 +382,19 @@ async def build_graph_activity(params: BuildGraphParams) -> dict:
     rows for every repo in the session, builds a typed DependencyGraph, and
     persists into app_startup_plans with a placeholder plan_markdown="" until
     the consolidator runs."""
+    try:
+        return await _build_graph_inner(params)
+    except Exception as exc:
+        await publish(params.session_id, {
+            "type": "data-pipeline-error",
+            "stage": "build_graph",
+            "message": str(exc)[:500],
+            "attempt": activity.info().attempt,
+        })
+        raise
+
+
+async def _build_graph_inner(params: BuildGraphParams) -> dict:
     repos = []
     for repo_url in params.repo_urls:
         boundaries_row = await get_repo_boundaries_row(repo_url)
@@ -501,6 +532,17 @@ async def consolidate_plan_activity(params: ConsolidateParams) -> dict:
     })
 
     return {"status": status, "markdown_len": len(markdown)}
+
+@activity.defn
+async def publish_pipeline_failed_activity(params: PipelineFailedParams) -> None:
+    """Workflow-side hook: publish a terminal pipeline-failed SSE event after
+    Temporal retries are exhausted. Side-effect-only; does not raise."""
+    await publish(params.session_id, {
+        "type": "data-pipeline-failed",
+        "phase": params.phase,
+        "message": params.message[:500],
+    })
+
 
 @activity.defn
 async def cancel_pending_actions_activity(session_id: str) -> int:

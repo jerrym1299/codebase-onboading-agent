@@ -23,6 +23,7 @@ from activities import (
     consolidate_plan_activity,
     extract_boundaries_activity,
     index_repo_activity,
+    publish_pipeline_failed_activity,
     resolve_pending_actions_activity,
     update_session_status_activity,
 )
@@ -75,6 +76,7 @@ async def lifespan(app):
             consolidate_plan_activity,
             update_session_status_activity,
             agent_turn_activity,
+            publish_pipeline_failed_activity,
             cancel_pending_actions_activity,
             resolve_pending_actions_activity,
         ],
@@ -323,6 +325,49 @@ async def post_session_message_endpoint(session_id: str, payload: dict):
                     break
                 yield f"data: {json.dumps(event)}\n\n"
                 if event.get("type") == "finish":
+                    break
+        finally:
+            unsubscribe(session_id, queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.get("/sessions/{session_id}/events")
+async def stream_session_events_endpoint(session_id: str):
+    """SSE stream of session-level events (clone/index/analyze/extract/graph/
+    consolidate progress, plus data-repo-error and data-pipeline-failed).
+    Open this right after POST /sessions to observe the indexing pipeline.
+    Terminates when status reaches 'ready' / 'failed' / 'ended', or after a
+    15-minute idle timeout."""
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute("SELECT status FROM sessions WHERE id = %s", (session_id,))
+        row = await cur.fetchone()
+    if row is None:
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
+
+    queue = subscribe(session_id)
+
+    async def event_generator():
+        try:
+            yield f"data: {json.dumps({'type': 'data-session-status', 'status': row[0]})}\n\n"
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=900)
+                except asyncio.TimeoutError:
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("type") == "data-pipeline-failed":
+                    break
+                if event.get("type") == "data-app-plan-updated":
                     break
         finally:
             unsubscribe(session_id, queue)
