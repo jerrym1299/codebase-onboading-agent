@@ -13,7 +13,14 @@ from openai import OpenAI
 from services.chunk_and_embed import CodeChunk
 from services.db import DirSummary
 
-client = OpenAI()
+_openai_client: OpenAI | None = None
+
+
+def _client() -> OpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAI()
+    return _openai_client
 
 # gpt-5.4: 1M context, 128k max output. Reserve 100k for output and
 # ~100k headroom for system prompt + formatting + tokenizer drift.
@@ -105,7 +112,7 @@ def generate_dir_summaries(
         rel_dir = os.path.relpath(dir_path, repo_dir) if dir_path != repo_dir else "."
         context = _build_dir_context(dir_path, dir_chunks)
 
-        resp = client.chat.completions.create(
+        resp = _client().chat.completions.create(
             model="gpt-5.4",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -127,7 +134,7 @@ def generate_dir_summaries(
         BATCH = 100
         for i in range(0, len(texts), BATCH):
             batch = texts[i:i + BATCH]
-            resp = client.embeddings.create(
+            resp = _client().embeddings.create(
                 input=batch, model="text-embedding-3-large"
             )
             for s, datum in zip(summaries[i:i + BATCH], resp.data):

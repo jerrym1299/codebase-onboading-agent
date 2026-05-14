@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 
 from agents import Runner
 from agents.exceptions import MaxTurnsExceeded
@@ -24,9 +25,12 @@ from activities import (
 from services.chunk_and_embed import AST_PARSERS, chunk_file_list, dump_ast, embed_query
 from services.clone_repo import ensure_repo_dir
 from services.db import (
-    CODE_SEARCH_SQL, close_pool, get_pool, get_startup_plan_row, init_schema, store_chunks,
+    CODE_SEARCH_SQL, close_pool, get_pool, get_startup_plan_row, init_schema,
+    store_chunks, store_repo_manifest,
 )
+from services.embedding_cache import hydrate_embeddings
 from services.event_bus import subscribe, unsubscribe
+from services.repo_manifest import build_repo_manifest
 from services.walk_repo import collect_file_paths, walk_repo
 from workflows import CodebaseChatWorkflow
 
@@ -95,12 +99,25 @@ async def chunks_endpoint(repo_url: str, preview: int = 300):
     if repo_dir is None:
         return CLONE_FAILED
     paths = await collect_file_paths(repo_dir)
-    chunks = chunk_file_list(paths)
-    stored = await store_chunks(repo_url, chunks)
+    chunks = chunk_file_list(paths, embed=False)
+    manifest = build_repo_manifest(repo_dir, paths, chunks)
+    embedding_stats = await hydrate_embeddings(repo_url, chunks)
+    manifest_record = await store_repo_manifest(
+        repo_url,
+        manifest,
+        metadata={
+            "source": "chunks_endpoint",
+            "embeddings": embedding_stats,
+            "summary_generated": False,
+        },
+    )
+    stored = await store_chunks(repo_url, chunks, replace=True)
     return {
         "file_count": len(paths),
         "chunk_count": len(chunks),
         "stored": stored,
+        "manifest": manifest_record,
+        "embeddings": embedding_stats,
         "chunks": [
             {
                 "index": i,
@@ -116,6 +133,42 @@ async def chunks_endpoint(repo_url: str, preview: int = 300):
             }
             for i, c in enumerate(chunks)
         ],
+    }
+
+
+@app.get("/manifest")
+async def manifest_endpoint(repo_url: str, persist: bool = True, limit: int = 200):
+    """Clone -> collect paths -> chunk without embeddings -> return/persist manifest."""
+    repo_url = repo_url.rstrip("/")
+    repo_dir = await ensure_repo_dir(repo_url)
+    if repo_dir is None:
+        return CLONE_FAILED
+
+    paths = await collect_file_paths(repo_dir)
+    chunks = chunk_file_list(paths, embed=False)
+    manifest = build_repo_manifest(repo_dir, paths, chunks)
+    limit = max(0, min(limit, 1000))
+
+    stored = None
+    if persist:
+        stored = await store_repo_manifest(
+            repo_url,
+            manifest,
+            metadata={
+                "source": "manifest_endpoint",
+                "embedded": False,
+                "summary_generated": False,
+            },
+        )
+
+    return {
+        "repo_url": repo_url,
+        "manifest_sha256": manifest.manifest_sha256,
+        "file_count": len(manifest.files),
+        "chunk_count": len(manifest.chunks),
+        "stored": stored,
+        "files": [asdict(f) for f in manifest.files[:limit]],
+        "chunks": [asdict(c) for c in manifest.chunks[:limit]],
     }
 
 
@@ -344,5 +397,3 @@ async def post_session_startup_recompute_endpoint(session_id: str, payload: dict
     handle = app.state.temporal_client.get_workflow_handle(f"chat-{session_id}")
     await handle.signal("recompute_startup_plan", reason)
     return JSONResponse(status_code=202, content={"status": "recomputing", "session_id": session_id})
-
-

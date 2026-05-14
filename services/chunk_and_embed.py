@@ -1,7 +1,7 @@
 """
 Takes a list of source file paths, parses each with Tree-sitter (Python/JS/TS/TSX),
 splits markdown by heading, and treats config/shell/markup files as whole-file chunks.
-All chunks are then split as needed to fit within text-embedding-3-small's 8191 token limit.
+All chunks are then split as needed to fit within the embedding model token limit.
 """
 
 import os
@@ -25,18 +25,26 @@ AST_PARSERS = {
     ".ts": ts_parser, ".tsx": tsx_parser,
 }
 
-# text-embedding-3-small limit is 8191, leave buffer for metadata prefix
+# text-embedding-3-large limit is 8191, leave buffer for metadata prefix
+EMBEDDING_MODEL = "text-embedding-3-large"
 MAX_TOKENS = 7500
 OVERLAP_LINES = 5  # lines of overlap when splitting oversized chunks
 
-encoder = tiktoken.encoding_for_model("text-embedding-3-large") # switched to large model
-client = OpenAI()
+encoder = tiktoken.encoding_for_model(EMBEDDING_MODEL)
+_openai_client: OpenAI | None = None
+
+
+def _client() -> OpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAI()
+    return _openai_client
 
 
 def embed_query(text: str) -> list[float]:
     """Embed a single query string with the same model used for chunks."""
-    return client.embeddings.create(
-        input=[text], model="text-embedding-3-large"
+    return _client().embeddings.create(
+        input=[text], model=EMBEDDING_MODEL
     ).data[0].embedding
 
 
@@ -60,12 +68,16 @@ class CodeChunk:
     start_line: int = 0
     end_line: int = 0
     metadata: dict = field(default_factory=dict)
+    embedding_path: str | None = None
+    chunk_sha256: str | None = None
+    embedding_sha256: str | None = None
+    embedding_model: str = EMBEDDING_MODEL
     embedding: list[float] | None = None
 
     @property
     def embedding_text(self) -> str:
         """What actually gets sent to the embedding model."""
-        prefix_parts = [f"# File: {self.file_path}"]
+        prefix_parts = [f"# File: {self.embedding_path or self.file_path}"]
         if self.parent_class:
             prefix_parts.append(f"# Class: {self.parent_class}")
         if self.name:
@@ -458,7 +470,7 @@ def _dispatch_extract(source: bytes, file_path: str) -> list[CodeChunk]:
     return extract_whole_file_chunk(source, file_path, _WHOLE_FILE_TYPES.get(ext, "file"))
 
 
-def chunk_file_list(file_paths: list[str]) -> list[CodeChunk]:
+def chunk_file_list(file_paths: list[str], *, embed: bool = True) -> list[CodeChunk]:
     """
     Main entry point. Takes a pre-filtered list of source file paths,
     dispatches to the right extractor by extension, then splits any
@@ -475,14 +487,26 @@ def chunk_file_list(file_paths: list[str]) -> list[CodeChunk]:
         for chunk in raw_chunks:
             all_chunks.extend(split_oversized(chunk))
 
+    if not embed:
+        return all_chunks
+
+    embed_chunks(all_chunks)
+    return all_chunks
+
+
+def embed_chunks(chunks: list[CodeChunk]) -> int:
+    """Embed chunks that do not already have an embedding. Returns misses embedded."""
+    pending = [c for c in chunks if c.embedding is None]
+    if not pending:
+        return 0
+
     BATCH_SIZE = 100
-    for i in range(0, len(all_chunks), BATCH_SIZE):
-        batch = all_chunks[i:i + BATCH_SIZE]
-        resp = client.embeddings.create(
+    for i in range(0, len(pending), BATCH_SIZE):
+        batch = pending[i:i + BATCH_SIZE]
+        resp = _client().embeddings.create(
             input=[c.embedding_text for c in batch],
-            model="text-embedding-3-large",
+            model=EMBEDDING_MODEL,
         )
         for chunk, datum in zip(batch, resp.data):
             chunk.embedding = datum.embedding
-
-    return all_chunks
+    return len(pending)

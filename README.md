@@ -119,10 +119,10 @@ curl -s http://localhost:8001/sessions/<session_id>/messages
 - Repo clones are stored under `/repos/<repo_name>` inside the running
   environment.
 - The OpenAI Agents SDK session store defaults to `agent_sessions.db`.
-- Indexing is idempotent for a `repo_url`: if chunks already exist, the workflow
-  skips re-indexing.
-- Debug endpoints include `/walkrepo`, `/chunks`, `/ast`, `/explore`, and
-  `/search`.
+- Indexing stores a content-addressed manifest for each run and reuses cached
+  embeddings for unchanged chunks.
+- Debug endpoints include `/walkrepo`, `/chunks`, `/manifest`, `/ast`,
+  `/explore`, and `/search`.
 
 ## Future Work
 

@@ -38,9 +38,9 @@ One **Temporal workflow per session**, one **chat thread per workflow**, one **r
 
 ## Vector indexing pipeline
 
-All embeddings — for chunks, directory summaries, and live queries — use OpenAI `text-embedding-3-small` (1536-dim). Tokenisation budget is enforced with `tiktoken.encoding_for_model("text-embedding-3-small")`.
+All embeddings — for chunks, directory summaries, and live queries — use OpenAI `text-embedding-3-large` (3072-dim). Tokenisation budget is enforced with `tiktoken.encoding_for_model("text-embedding-3-large")`.
 
-Indexing happens once per repo, on first session creation, inside `index_repo_activity`. It is **idempotent**: if `code_chunks` already has rows for the `repo_url`, the activity returns early.
+Indexing runs through `index_repo_activity`. Each run builds a content-addressed file/chunk manifest, reuses cached embeddings keyed by `embedding_sha256`, embeds only misses, and skips directory-summary regeneration when the manifest is unchanged.
 
 1. **Clone** (`services/clone_repo.py::ensure_repo_dir`) — clones into `/repos/<repo_name>` if not already present; reuses the directory across sessions of the same repo. Tokens are stripped from any error logs.
 2. **Walk** (`services/walk_repo.py::collect_file_paths`) — depth-first walk skipping vendored/build dirs (`node_modules`, `.next`, `dist`, …) and keeping source + markup + docs extensions only.
@@ -50,11 +50,12 @@ Indexing happens once per repo, on first session creation, inside `index_repo_ac
    - **Markdown** (`extract_markdown_chunks`): split on `#`/`##`/`###` headings into named sections.
    - **JSON / YAML / CSS / HTML / shell** (`extract_whole_file_chunk`): treated as one chunk per file with a typed label (`config`, `stylesheet`, `markup`, `shell`).
 4. **Token-budget split** (`split_oversized`) — any chunk whose `embedding_text` exceeds `MAX_TOKENS = 7500` is recut at line boundaries with `OVERLAP_LINES = 5` overlap, preserving `chunk_type`, `name`, `parent_class` and recording `part N` in the name.
-5. **Prefix + embed** — each chunk's `embedding_text` is `"# File: <path>\n# Class: <parent>\n# <chunk_type>: <name>\n<content>"`. Chunks are batched (size 100) into `client.embeddings.create(model="text-embedding-3-small")` → 1536-dim vectors.
-6. **Upsert** (`services/db.py::store_chunks`) — `INSERT … ON CONFLICT ON CONSTRAINT code_chunks_unique` on `(repo_url, file_path, start_line, chunk_type, name)` (NULLS NOT DISTINCT) so re-indexing rewrites in place.
-7. **Directory summaries** (`services/dir_summaries.py::generate_dir_summaries`) — group files by parent dir, build a compact context (file list + first 40 lines of each, capped at 12k chars), call `gpt-4o-mini` with a senior-engineer summarisation prompt, embed the result, upsert into `dir_summaries`.
+5. **Manifest + cache** (`services/repo_manifest.py`, `services/embedding_cache.py`) — compute relative-path file hashes, stable chunk hashes, and embedding hashes. Cached embeddings are hydrated before new embedding calls.
+6. **Prefix + embed** — each chunk's `embedding_text` is `"# File: <relative path>\n# Class: <parent>\n# <chunk_type>: <name>\n<content>"`. Cache misses are batched into `client.embeddings.create(model="text-embedding-3-large")` → 3072-dim vectors.
+7. **Upsert** (`services/db.py::store_chunks`) — chunks upsert by `(repo_url, chunk_sha256)`, and stale chunks are pruned on replacement indexes.
+8. **Directory summaries** (`services/dir_summaries.py::generate_dir_summaries`) — group files by parent dir, build a compact context, call the summary model, embed the result, upsert into `dir_summaries`.
 
-**Querying.** Both vector tables use `ivfflat (embedding vector_cosine_ops)` with `lists = 100`. Lookups are `1 - (embedding <=> query_vec)` cosine similarity, scoped by `repo_url`. The query is embedded with the same `text-embedding-3-small` model via `embed_query` so vectors live in the same space.
+**Querying.** Vector tables use HNSW halfvec cosine indexes. Lookups are `1 - (embedding <=> query_vec)` cosine similarity, scoped by `repo_url`. The query is embedded with the same `text-embedding-3-large` model via `embed_query` so vectors live in the same space.
 
 ## Agents
 
@@ -103,8 +104,12 @@ All four agents are `openai-agents` SDK `Agent` objects on `gpt-4.1-mini`. Each 
 
 | Table | Purpose | Key fields |
 |---|---|---|
-| `code_chunks` | AST-level chunks + 1536-dim embeddings. ivfflat cosine index. | `repo_url`, `file_path`, `chunk_type`, `name`, `parent_class`, `start_line`, `end_line`, `content`, `embedding`. Unique on `(repo_url, file_path, start_line, chunk_type, name)` NULLS NOT DISTINCT. |
+| `code_chunks` | AST-level chunks + 3072-dim embeddings. HNSW halfvec cosine index. | `repo_url`, `file_path`, `chunk_sha256`, `embedding_sha256`, `chunk_type`, `name`, `parent_class`, `start_line`, `end_line`, `content`, `embedding`. Upserts by `(repo_url, chunk_sha256)` when hashes are available. |
 | `dir_summaries` | LLM-summarised directories + embeddings. | `dir_path`, `summary`, `file_list TEXT[]`, `embedding`. Unique on `(repo_url, dir_path)`. |
+| `repo_index_runs` | Append-only manifest history. | `repo_url`, `manifest_sha256`, `file_count`, `chunk_count`, `metadata jsonb`, `created_at`. |
+| `repo_files` | Latest file inventory. | `repo_url`, `file_path`, `file_sha256`, `size_bytes`, `language`, generated/vendor flags. |
+| `repo_chunk_manifests` | Latest chunk inventory. | `repo_url`, `chunk_sha256`, `embedding_sha256`, `file_path`, `file_sha256`, line range, token count. |
+| `repo_embedding_cache` | Repo-scoped embedding cache. | `repo_url`, `embedding_sha256`, `embedding_model`, `embedding`, `last_used_at`. |
 | `sessions` | One row per chat session. | `id uuid`, `repo_url`, `status (indexing\|ready\|ended)`, `created_at`, `last_seen_at`. |
 | `messages` | Persisted chat transcript (the source of truth for the **frontend**). | `role (user\|assistant\|system\|tool)`, `parts jsonb` (AI-SDK-v6 UI Message parts so the FE renders directly). |
 | `pending_actions` | Backs human-in-the-loop pauses. | `kind`, `payload jsonb`, `status (open\|resolved\|cancelled)`, `resolved_value jsonb`, `resolved_at`. |
@@ -164,7 +169,7 @@ If the turn ends with an open `pending_actions` row, `agent_turn_activity` retur
 | Activity | Params | `start_to_close` | Retry attempts | Purpose |
 |---|---|---|---|---|
 | `clone_repo_activity` | `repo_url: str` | 120s | 3 | `ensure_repo_dir`; raises if clone fails. |
-| `index_repo_activity` | `IndexParams(repo_url, repo_dir)` | 600s | 2 | Walk → AST chunk → embed → `store_chunks` → `generate_dir_summaries` → `store_dir_summaries`. Idempotent: returns early if `code_chunks` already has rows for `repo_url`. |
+| `index_repo_activity` | `IndexParams(repo_url, repo_dir)` | 600s | 2 | Walk → AST chunk → manifest → hydrate embedding cache → embed misses → `store_chunks` → regenerate summaries only when the manifest changed. |
 | `update_session_status_activity` | `SessionStatusParams(session_id, status)` | 30s | 3 | `UPDATE sessions SET status, last_seen_at`. |
 | `agent_turn_activity` | `AgentTurnParams(session_id, content)` | 300s | 1 | Stream one `Runner.run_streamed(router_agent, …)` turn; emits to `event_bus` + appends parts to the placeholder `messages` row. |
 | `resolve_pending_actions_activity` | `session_id: str` | 15s | 3 | Mark all `open` pending_actions for the session `resolved`. Called when a user reply is interpreted as the answer to an open clarification. |
@@ -186,7 +191,7 @@ If the turn ends with an open `pending_actions` row, `agent_turn_activity` retur
 
 1. `update_session_status_activity("indexing")`.
 2. `clone_repo_activity(repo_url)` → repo dir.
-3. `index_repo_activity(repo_url, repo_dir)` (skipped fast-path if already indexed).
+3. `index_repo_activity(repo_url, repo_dir)` (manifest/cache-aware incremental path).
 4. `update_session_status_activity("ready")`.
 5. **Wait loop:** `workflow.wait_condition(self._user_messages or self._clarifications or self._ended)`.
    - On `user_message`: if a pending action is open, clear `self._pending` and call `resolve_pending_actions_activity`, then run `agent_turn_activity`. If the result is `{"kind": "paused"}`, stash `self._pending[pending_id] = payload`.
@@ -197,7 +202,7 @@ If the turn ends with an open `pending_actions` row, `agent_turn_activity` retur
 - **No comments** unless the *why* is non-obvious. Names should carry the meaning.
 - **Activity params are dataclasses** so Temporal can (de)serialise cleanly.
 - **Workflow determinism** — no I/O or wall-clock logic inside `@workflow.run`; everything is an activity.
-- **Idempotency at boundaries** — `ensure_repo_dir` short-circuits if the clone exists; `index_repo_activity` skips if `code_chunks` already has rows for the `repo_url`; all schema uses `IF NOT EXISTS`; unique constraints back upserts.
+- **Idempotency at boundaries** — `ensure_repo_dir` short-circuits if the clone exists; `index_repo_activity` hashes the current repo state, reuses cached embeddings, and skips summary regeneration when the manifest is unchanged; all schema uses `IF NOT EXISTS`; unique constraints back upserts.
 - **`repo_url` is always `.rstrip('/')`-normalised** at the HTTP boundary before touching the DB.
 - **Session id propagation** — `agent_turn_activity` sets `current_session_id` (a `ContextVar`) so deep-down tools like `ask_user` can locate their session without the agent having to pass it explicitly.
 
