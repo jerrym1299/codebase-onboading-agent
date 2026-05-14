@@ -1,9 +1,13 @@
+import asyncio
 import contextvars
 import json
 import os
 import re
 import subprocess
+import time
 import uuid
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 from agents import function_tool
@@ -474,3 +478,340 @@ async def update_repo_startup_plan(
     })
 
     return f"Startup plan updated for {repo_url}."
+
+
+_OUTPUT_MAX_LINES_CAP = 5000
+
+
+def _tail_lines(text: str, max_lines: int) -> str:
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    kept = lines[-max_lines:]
+    dropped = len(lines) - max_lines
+    return f"[...truncated {dropped} earlier lines; showing last {max_lines}]\n" + "\n".join(kept)
+
+
+def _format_shell_result(
+    *,
+    command: str,
+    cwd: str,
+    exit_code: int | None,
+    duration_ms: int,
+    timed_out: bool,
+    stdout: str,
+    stderr: str,
+    max_output_lines: int,
+) -> str:
+    return (
+        f"$ {command}\n"
+        f"(cwd={cwd or '<default>'}, exit_code={exit_code}, "
+        f"duration_ms={duration_ms}, timed_out={timed_out})\n"
+        f"--- stdout ---\n{_tail_lines(stdout, max_output_lines)}\n"
+        f"--- stderr ---\n{_tail_lines(stderr, max_output_lines)}"
+    )
+
+
+@function_tool
+async def run_shell(
+    command: str,
+    cwd: str = "",
+    timeout_seconds: int = 30,
+    max_output_lines: int = 200,
+) -> str:
+    """Run a shell command inside the agent's container and return the result.
+
+    Use for one-shot blocking commands needed to verify a startup plan —
+    `pnpm install`, `pip install -r requirements.txt`, `curl localhost:3000`,
+    `node --version`, etc. Commands run via `bash -c <command>` so pipes,
+    redirects, env vars, and command chains all work.
+
+    `cwd` should usually be the local repo path from the developer prompt
+    (e.g. /repos/<repo_name>). Leave empty to use the container's default cwd.
+
+    `timeout_seconds` is hard-capped to 600. Long-running dev servers will not
+    return on their own — use `start_background_process` for those.
+
+    `max_output_lines` caps how many of the *last* lines of stdout and stderr
+    are returned (each stream is tailed independently). Defaults to 200,
+    hard-capped at 5000. Bump it when you need to see more of a long install
+    log; keep it small for quick probes.
+
+    Returns a formatted block with: command, cwd, exit code, duration,
+    timed-out flag, tail of stdout, tail of stderr.
+    """
+    timeout_seconds = max(1, min(int(timeout_seconds), 600))
+    max_output_lines = max(1, min(int(max_output_lines), _OUTPUT_MAX_LINES_CAP))
+    if not command or not command.strip():
+        return "ERROR: command is empty."
+
+    start = time.monotonic()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "bash", "-c", command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd or None,
+        )
+    except (OSError, FileNotFoundError) as e:
+        return f"ERROR: failed to start command: {e}"
+
+    timed_out = False
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout_seconds
+        )
+    except asyncio.TimeoutError:
+        timed_out = True
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            stdout_b, stderr_b = await proc.communicate()
+        except Exception:
+            stdout_b, stderr_b = b"", b""
+
+    duration_ms = int((time.monotonic() - start) * 1000)
+    stdout = (stdout_b or b"").decode("utf-8", errors="replace")
+    stderr = (stderr_b or b"").decode("utf-8", errors="replace")
+
+    return _format_shell_result(
+        command=command,
+        cwd=cwd,
+        exit_code=proc.returncode,
+        duration_ms=duration_ms,
+        timed_out=timed_out,
+        stdout=stdout,
+        stderr=stderr,
+        max_output_lines=max_output_lines,
+    )
+
+
+# The background-process registry — a session-scoped lookup table for
+# long-running shell commands the agent has spawned (typically dev servers).
+#
+# There are two distinct "buffers" involved per background process:
+#   1. The OS pipe between child and us. Fixed size (~64KB). If we never
+#      drain it, the child's next write blocks and the dev server freezes.
+#   2. Our own ring buffer (a `deque` with maxlen), where each drained line
+#      is stored so `read_background_process_output` can return the last N lines.
+#      `deque(maxlen=N)` silently drops the oldest entry when full, so
+#      memory stays bounded for a process that runs for hours.
+
+_BG_LOG_MAX_LINES = 5000
+
+
+@dataclass
+class _BackgroundProcess:
+    handle: str
+    session_id: str
+    command: str
+    cwd: str
+    name: str
+    pid: int
+    proc: "asyncio.subprocess.Process"
+    output: "deque[str]"
+    started_at: float
+    reader_task: asyncio.Task | None = None
+    ended_at: float | None = None
+    exit_code: int | None = None
+
+
+_background: dict[str, _BackgroundProcess] = {}
+
+
+async def _drain_background_output(bg: _BackgroundProcess) -> None:
+    """Background task that empties the child's OS pipe one line at a time
+    and appends each line to our ring buffer. Must run for the lifetime of
+    the child — without it, the OS pipe fills and the child blocks on its
+    next print/log. One drainer task per background process."""
+    assert bg.proc.stdout is not None
+    try:
+        while True:
+            line = await bg.proc.stdout.readline()
+            if not line:
+                break
+            bg.output.append(line.decode("utf-8", errors="replace").rstrip("\n"))
+    finally:
+        rc = await bg.proc.wait()
+        bg.exit_code = rc
+        bg.ended_at = time.monotonic()
+
+
+@function_tool
+async def start_background_process(
+    command: str,
+    cwd: str = "",
+    name: str = "",
+) -> str:
+    """Spawn a long-running shell command in the background and return a handle.
+
+    Use for dev servers and anything that won't exit on its own
+    (`pnpm dev`, `next dev`, `uvicorn ... --reload`, etc.). For one-shot
+    blocking commands use `run_shell` instead.
+
+    The process inherits this container's env and network namespace. Its
+    combined stdout+stderr is captured in-memory (ring buffer of ~5000 lines).
+    Use `read_background_process_output(handle, tail_lines)` to read what it printed.
+
+    The process is scoped to the current session — handles from other
+    sessions cannot be read or stopped from here.
+
+    Returns a handle string plus the pid and command for confirmation.
+    """
+    try:
+        session_id = current_session_id.get()
+    except LookupError:
+        return "[start_background_process unavailable: no active session context]"
+
+    if not command or not command.strip():
+        return "ERROR: command is empty."
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "bash", "-c", command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=cwd or None,
+        )
+    except (OSError, FileNotFoundError) as e:
+        return f"ERROR: failed to start command: {e}"
+
+    handle = str(uuid.uuid4())
+    bg = _BackgroundProcess(
+        handle=handle,
+        session_id=session_id,
+        command=command,
+        cwd=cwd,
+        name=name or command[:40],
+        pid=proc.pid,
+        proc=proc,
+        output=deque(maxlen=_BG_LOG_MAX_LINES),
+        started_at=time.monotonic(),
+    )
+    bg.reader_task = asyncio.create_task(_drain_background_output(bg))
+    _background[handle] = bg
+
+    return (
+        f"Started background process.\n"
+        f"handle: {handle}\n"
+        f"pid: {proc.pid}\n"
+        f"command: {command}\n"
+        f"cwd: {cwd or '<default>'}\n"
+        f"Use read_background_process_output(handle) to see what it prints."
+    )
+
+
+@function_tool
+async def read_background_process_output(handle: str, tail_lines: int = 200) -> str:
+    """Return the most recent output lines from a background process.
+
+    `handle` is the value returned by `start_background_process`. `tail_lines` caps
+    how many of the most-recent lines to return (default 200, hard-capped
+    at 5000). Pick a small value for quick health checks, a larger one to
+    inspect a crash log.
+
+    The response includes process status: running (with pid) or exited
+    (with exit code).
+    """
+    try:
+        session_id = current_session_id.get()
+    except LookupError:
+        return "[read_background_process_output unavailable: no active session context]"
+
+    bg = _background.get(handle)
+    if bg is None:
+        return f"ERROR: no background process with handle={handle!r}."
+    if bg.session_id != session_id:
+        return f"ERROR: handle {handle!r} does not belong to this session."
+
+    tail_lines = max(1, min(int(tail_lines), _BG_LOG_MAX_LINES))
+    lines = list(bg.output)[-tail_lines:]
+
+    if bg.exit_code is not None:
+        status = f"exited (code={bg.exit_code})"
+    elif bg.proc.returncode is None:
+        status = f"running (pid={bg.pid})"
+    else:
+        status = f"exited (code={bg.proc.returncode})"
+
+    body = "\n".join(lines) if lines else "<no output yet>"
+    return (
+        f"handle: {handle}\n"
+        f"command: {bg.command}\n"
+        f"cwd: {bg.cwd or '<default>'}\n"
+        f"status: {status}\n"
+        f"--- output (last {len(lines)} lines) ---\n{body}"
+    )
+
+
+@function_tool
+async def stop_background_process(handle: str, grace_seconds: int = 5) -> str:
+    """Stop a background process started with `start_background_process`.
+
+    Sends SIGTERM first to let the process clean up (close ports, flush logs).
+    If it hasn't exited after `grace_seconds` (default 5, capped at 60),
+    sends SIGKILL.
+
+    Call this when you're done verifying — leaks of e.g. `pnpm dev` will
+    keep ports bound and hold container memory until the container restarts.
+
+    The handle stays in the registry so you can still call
+    `read_background_process_output` to inspect the final output afterwards.
+    Returns the exit code and the last 20 lines of output.
+    """
+    try:
+        session_id = current_session_id.get()
+    except LookupError:
+        return "[stop_background_process unavailable: no active session context]"
+
+    bg = _background.get(handle)
+    if bg is None:
+        return f"ERROR: no background process with handle={handle!r}."
+    if bg.session_id != session_id:
+        return f"ERROR: handle {handle!r} does not belong to this session."
+
+    grace_seconds = max(0, min(int(grace_seconds), 60))
+
+    if bg.proc.returncode is not None:
+        tail = list(bg.output)[-20:]
+        return (
+            f"handle: {handle}\n"
+            f"status: already exited (code={bg.proc.returncode})\n"
+            f"--- last {len(tail)} lines ---\n" + ("\n".join(tail) or "<no output>")
+        )
+
+    signal_used = "SIGTERM"
+    try:
+        bg.proc.terminate()
+    except ProcessLookupError:
+        pass
+
+    try:
+        await asyncio.wait_for(bg.proc.wait(), timeout=grace_seconds)
+    except asyncio.TimeoutError:
+        signal_used = "SIGTERM then SIGKILL"
+        try:
+            bg.proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(bg.proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            pass
+
+    if bg.reader_task is not None:
+        try:
+            await asyncio.wait_for(bg.reader_task, timeout=2)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+
+    tail = list(bg.output)[-20:]
+    return (
+        f"handle: {handle}\n"
+        f"command: {bg.command}\n"
+        f"stopped via: {signal_used}\n"
+        f"exit_code: {bg.proc.returncode}\n"
+        f"--- last {len(tail)} lines ---\n" + ("\n".join(tail) or "<no output>")
+    )

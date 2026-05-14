@@ -1,5 +1,19 @@
 FROM python:3.12-slim
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+
+# System tools: git for clones; curl + ca-certificates for HTTPS and the
+# verifier agent's HTTP probes; gnupg for NodeSource repo signing.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git curl ca-certificates gnupg \
+ && rm -rf /var/lib/apt/lists/*
+
+# Node.js 22 LTS + pnpm/yarn via corepack — used by the verifier agent to
+# run `pnpm install` / `pnpm dev` (and friends) against cloned repos.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && rm -rf /var/lib/apt/lists/* \
+ && corepack enable \
+ && corepack prepare pnpm@latest --activate
+
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
