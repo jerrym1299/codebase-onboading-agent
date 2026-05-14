@@ -123,6 +123,8 @@ curl -s http://localhost:8001/sessions/<session_id>/messages
   embeddings for unchanged chunks.
 - Debug endpoints include `/walkrepo`, `/chunks`, `/manifest`, `/ast`,
   `/explore`, and `/search`.
+- Run `python3 scripts/eval_indexing.py` against the Docker stack to validate
+  manifest stability, DB persistence, and embedding-cache behavior.
 
 ## Future Work
 
