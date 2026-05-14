@@ -3,7 +3,8 @@ from typing import Any
 from agents import Agent, ModelSettings, handoff
 from services.tools import (
     list_files, search_code, read_file,
-    find_references, get_dependencies, search_indexed, search_dir_summaries, git_log,
+    find_references, get_dependencies, search_indexed, search_exact_indexed,
+    search_dir_summaries, git_log,
     ask_user,
     get_startup_plan, recompute_startup_plan,
 )
@@ -20,12 +21,20 @@ tracer_agent = Agent[Any](
         "If you are given a file:line, start there. If you are given a symbol or a "
         "natural-language description, first locate a starting point with `search_code` "
         "(regex over the local clone, returns file:line) before tracing.\n"
-        "Use `find_references` to find callers of a symbol, `get_dependencies` to see "
+        "Use `search_exact_indexed` for repo-indexed exact-string or regex lookups, "
+        "`find_references` to find callers of a symbol, `get_dependencies` to see "
         "what a file imports, and `read_file` to inspect specific ranges."
     ),
     model="gpt-5.4",
     model_settings=ModelSettings(max_tokens=16384),
-    tools=[read_file, search_code, find_references, get_dependencies, ask_user],
+    tools=[
+        read_file,
+        search_code,
+        search_exact_indexed,
+        find_references,
+        get_dependencies,
+        ask_user,
+    ],
     handoff_description="Hand off to the tracer agent to trace the execution path of the codebase, follow execution paths, what calls X, what does X call, execution call follow execution paths",
 )
 
@@ -38,7 +47,7 @@ explorer_agent = Agent[Any](
         "list_files with glob '**/<filename>' and respond with just the matching file path(s). "
         "Do NOT include line numbers for file lookups.\n"
         "2. If the user asks for a SYMBOL (function, class, variable, JSX component, etc.), call "
-        "search_code and respond with file:line matches.\n"
+        "search_exact_indexed or search_code and respond with file:line matches.\n"
         "3. If the user describes functionality in natural language and exact-string search "
         "would miss it (e.g. 'the part that handles auth tokens'), fall back to "
         "`search_indexed(query, repo_url, k)` for semantic matches against the indexed chunks. "
@@ -48,7 +57,14 @@ explorer_agent = Agent[Any](
     ),
     model="gpt-5.4",
     model_settings=ModelSettings(max_tokens=16384),
-    tools=[list_files, search_code, search_indexed, read_file, ask_user],
+    tools=[
+        list_files,
+        search_code,
+        search_exact_indexed,
+        search_indexed,
+        read_file,
+        ask_user,
+    ],
     handoff_description="Hand off to the explorer agent to find things in the codebase, give paths/file:lines, to search for specific functionality, symbols, classes or functions",
 )
 

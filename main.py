@@ -26,9 +26,10 @@ from services.chunk_and_embed import AST_PARSERS, chunk_file_list, dump_ast, emb
 from services.clone_repo import ensure_repo_dir
 from services.db import (
     CODE_SEARCH_SQL, close_pool, get_pool, get_startup_plan_row, init_schema,
-    store_chunks, store_repo_manifest,
+    search_repo_text_lines, store_chunks, store_repo_manifest, store_repo_text_lines,
 )
 from services.embedding_cache import hydrate_embeddings
+from services.exact_search import build_text_lines
 from services.event_bus import subscribe, unsubscribe
 from services.repo_manifest import build_repo_manifest
 from services.walk_repo import collect_file_paths, walk_repo
@@ -101,6 +102,8 @@ async def chunks_endpoint(repo_url: str, preview: int = 300):
     paths = await collect_file_paths(repo_dir)
     chunks = chunk_file_list(paths, embed=False)
     manifest = build_repo_manifest(repo_dir, paths, chunks)
+    text_lines = build_text_lines(repo_dir, manifest)
+    text_lines_stored = await store_repo_text_lines(repo_url, text_lines, manifest.files)
     embedding_stats = await hydrate_embeddings(repo_url, chunks)
     manifest_record = await store_repo_manifest(
         repo_url,
@@ -109,6 +112,8 @@ async def chunks_endpoint(repo_url: str, preview: int = 300):
             "source": "chunks_endpoint",
             "embeddings": embedding_stats,
             "summary_generated": False,
+            "text_line_count": len(text_lines),
+            "text_lines_stored": text_lines_stored,
         },
     )
     stored = await store_chunks(repo_url, chunks, replace=True)
@@ -116,6 +121,8 @@ async def chunks_endpoint(repo_url: str, preview: int = 300):
         "file_count": len(paths),
         "chunk_count": len(chunks),
         "stored": stored,
+        "text_line_count": len(text_lines),
+        "text_lines_stored": text_lines_stored,
         "manifest": manifest_record,
         "embeddings": embedding_stats,
         "chunks": [
@@ -147,10 +154,13 @@ async def manifest_endpoint(repo_url: str, persist: bool = True, limit: int = 20
     paths = await collect_file_paths(repo_dir)
     chunks = chunk_file_list(paths, embed=False)
     manifest = build_repo_manifest(repo_dir, paths, chunks)
+    text_lines = build_text_lines(repo_dir, manifest)
     limit = max(0, min(limit, 1000))
 
     stored = None
+    text_lines_stored = None
     if persist:
+        text_lines_stored = await store_repo_text_lines(repo_url, text_lines, manifest.files)
         stored = await store_repo_manifest(
             repo_url,
             manifest,
@@ -158,6 +168,8 @@ async def manifest_endpoint(repo_url: str, persist: bool = True, limit: int = 20
                 "source": "manifest_endpoint",
                 "embedded": False,
                 "summary_generated": False,
+                "text_line_count": len(text_lines),
+                "text_lines_stored": text_lines_stored,
             },
         )
 
@@ -166,6 +178,8 @@ async def manifest_endpoint(repo_url: str, persist: bool = True, limit: int = 20
         "manifest_sha256": manifest.manifest_sha256,
         "file_count": len(manifest.files),
         "chunk_count": len(manifest.chunks),
+        "text_line_count": len(text_lines),
+        "text_lines_stored": text_lines_stored,
         "stored": stored,
         "files": [asdict(f) for f in manifest.files[:limit]],
         "chunks": [asdict(c) for c in manifest.chunks[:limit]],
@@ -244,6 +258,33 @@ async def search_endpoint(repo_url: str, request: Request, k: int = 10):
             for r in rows
         ],
     }
+
+
+@app.get("/search-exact")
+async def search_exact_endpoint(
+    repo_url: str,
+    request: Request,
+    limit: int = 50,
+    regex: bool = False,
+    path: str = "",
+    language: str = "",
+):
+    query = _raw_query_param(request, "query")
+    if not query:
+        return {"error": "Missing 'query' parameter."}
+    repo_url = repo_url.rstrip("/")
+    try:
+        results = await search_repo_text_lines(
+            repo_url,
+            query,
+            regex=regex,
+            path=path,
+            language=language,
+            limit=limit,
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return {"results": results}
 
 @app.post("/sessions")
 async def create_session_endpoint(payload: dict):

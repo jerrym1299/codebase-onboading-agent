@@ -12,7 +12,8 @@ this project.
 
 - Creates one chat session per GitHub repository.
 - Uses Temporal to run durable clone, indexing, and chat-turn workflow steps.
-- Stores source chunks and directory summaries in Postgres with pgvector.
+- Stores source chunks, file inventories, exact line search, and directory
+  summaries in Postgres with pgvector.
 - Streams agent responses over Server-Sent Events using AI SDK style message
   parts.
 - Supports human-in-the-loop clarification through pending actions.
@@ -119,12 +120,13 @@ curl -s http://localhost:8001/sessions/<session_id>/messages
 - Repo clones are stored under `/repos/<repo_name>` inside the running
   environment.
 - The OpenAI Agents SDK session store defaults to `agent_sessions.db`.
-- Indexing stores a content-addressed manifest for each run and reuses cached
-  embeddings for unchanged chunks.
+- Indexing stores a content-addressed manifest, exact line-search inventory,
+  and cached embeddings for unchanged chunks.
 - Debug endpoints include `/walkrepo`, `/chunks`, `/manifest`, `/ast`,
-  `/explore`, and `/search`.
+  `/explore`, `/search`, and `/search-exact`.
 - Run `python3 scripts/eval_indexing.py` against the Docker stack to validate
-  manifest stability, DB persistence, and embedding-cache behavior.
+  manifest stability, DB persistence, exact search, and embedding-cache
+  behavior.
 - Add `--with-openai` to that eval when the FastAPI container has an
   `OPENAI_API_KEY`; it validates real embeddings and vector search.
 

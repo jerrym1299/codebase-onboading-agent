@@ -3,7 +3,8 @@ eval_indexing.py - local quality gate for content-addressed indexing.
 
 Checks the manifest path, DB persistence, and embedding-cache behavior without
 requiring a real OpenAI key. The cache smoke runs inside the fastapi container
-and monkeypatches embedding generation to deterministic vectors.
+and monkeypatches embedding generation to deterministic vectors. It also checks
+the persisted exact line-search inventory.
 
 Usage:
     python3 scripts/eval_indexing.py
@@ -26,6 +27,8 @@ from pathlib import Path
 DEFAULT_BASE = "http://localhost:8001"
 DEFAULT_REPO = "https://github.com/octocat/Spoon-Knife"
 DEFAULT_EXPECTED_FILES = "README.md,index.html,styles.css"
+DEFAULT_EXACT_QUERY = "Well hello there!"
+DEFAULT_EXACT_EXPECTED_PATH = "README.md"
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -79,6 +82,15 @@ def _fetch_chunks(base: str, repo: str) -> dict:
     return _http_json(f"{base}/chunks?repo_url={encoded_repo}&preview=0", timeout=300)
 
 
+def _fetch_exact(base: str, repo: str, query: str, limit: int = 20) -> dict:
+    encoded_repo = urllib.parse.quote(repo, safe="")
+    encoded_query = query.replace(" ", "+")
+    return _http_json(
+        f"{base}/search-exact?repo_url={encoded_repo}&query={encoded_query}&limit={limit}",
+        timeout=120,
+    )
+
+
 def _validate_manifest(manifest: dict, expected_files: set[str]) -> None:
     assert manifest["file_count"] > 0, f"expected files, got {manifest}"
     assert manifest["chunk_count"] > 0, f"expected chunks, got {manifest}"
@@ -110,6 +122,7 @@ def _validate_db(repo: str, manifest: dict) -> None:
     repo_sql = _sql_literal(repo)
     files = int(_psql(f"SELECT count(*) FROM repo_files WHERE repo_url={repo_sql};"))
     chunks = int(_psql(f"SELECT count(*) FROM repo_chunk_manifests WHERE repo_url={repo_sql};"))
+    text_lines = int(_psql(f"SELECT count(*) FROM repo_text_lines WHERE repo_url={repo_sql};"))
     runs = int(_psql(f"SELECT count(*) FROM repo_index_runs WHERE repo_url={repo_sql};"))
     latest = _psql(
         "SELECT manifest_sha256 FROM repo_index_runs "
@@ -120,8 +133,30 @@ def _validate_db(repo: str, manifest: dict) -> None:
     assert chunks == manifest["chunk_count"], (
         f"repo_chunk_manifests={chunks}, manifest={manifest['chunk_count']}"
     )
+    assert text_lines == manifest["text_line_count"], (
+        f"repo_text_lines={text_lines}, manifest={manifest['text_line_count']}"
+    )
     assert runs >= 2, f"expected at least two manifest runs, got {runs}"
     assert latest == manifest["manifest_sha256"], "latest manifest hash mismatch"
+
+
+def _validate_exact_search(
+    base: str,
+    repo: str,
+    query: str,
+    expected_path: str,
+) -> dict:
+    result = _fetch_exact(base, repo, query)
+    rows = result.get("results") or []
+    assert rows, f"expected exact-search results for {query!r}"
+    result_paths = {row["file_path"] for row in rows}
+    assert expected_path in result_paths, (
+        f"{expected_path} not in exact-search results: {result}"
+    )
+    for row in rows:
+        assert row["line_number"] > 0, row
+        assert query.lower() in row["line_text"].lower(), row
+    return result
 
 
 def _clear_cache_rows(repo: str) -> None:
@@ -256,7 +291,10 @@ def main() -> None:
     parser.add_argument("--base", default=DEFAULT_BASE)
     parser.add_argument("--repo", default=DEFAULT_REPO)
     parser.add_argument("--expected-files", default=DEFAULT_EXPECTED_FILES)
+    parser.add_argument("--exact-query", default=DEFAULT_EXACT_QUERY)
+    parser.add_argument("--exact-expected-path", default=DEFAULT_EXACT_EXPECTED_PATH)
     parser.add_argument("--skip-db", action="store_true")
+    parser.add_argument("--skip-exact", action="store_true")
     parser.add_argument("--skip-cache-smoke", action="store_true")
     parser.add_argument(
         "--with-openai",
@@ -291,6 +329,16 @@ def main() -> None:
         print("Checking persisted manifest tables ...")
         _validate_db(args.repo, second_manifest)
         print("  DB counts match manifest")
+
+    if not args.skip_exact:
+        print("Checking exact line search ...")
+        result = _validate_exact_search(
+            args.base,
+            args.repo,
+            args.exact_query,
+            args.exact_expected_path,
+        )
+        print(f"  exact search returned {len(result['results'])} match(es)")
 
     if not args.skip_cache_smoke:
         print("Checking embedding cache behavior with deterministic fake embeddings ...")

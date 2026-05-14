@@ -31,7 +31,8 @@ One **Temporal workflow per session**, one **chat thread per workflow**, one **r
 | `services/walk_repo.py` | Filtered file iteration (skips `node_modules`, `.git`, build dirs; keeps source/markup/docs extensions). |
 | `services/chunk_and_embed.py` | Tree-sitter AST chunking for Python/JS/TS/TSX, markdown heading split, whole-file fallback for config/HTML/CSS/shell. Token-budget splitter + OpenAI batch embedding. |
 | `services/dir_summaries.py` | LLM-generated per-directory natural-language summaries, then embedded for high-level semantic browsing. |
-| `services/db.py` | Postgres + pgvector pool, schema bootstrap, upserts for `code_chunks` and `dir_summaries`. |
+| `services/db.py` | Postgres + pgvector pool, schema bootstrap, upserts for chunks, summaries, manifests, and exact-search lines. |
+| `services/exact_search.py` | Builds line-level exact-search inventories from the content-addressed manifest. |
 | `services/tools.py` | Function tools exposed to the agents (file/code search, semantic search, references, deps, git log, `ask_user`). Owns the `current_session_id` ContextVar. |
 | `services/event_bus.py` | In-process per-session asyncio `Queue` fan-out used to bridge the activity → SSE response. |
 | `scripts/` | Manual debugging helpers (`show_chunks.py`, `show_ast.py`, `test_ask_question.py`). |
@@ -50,12 +51,12 @@ Indexing runs through `index_repo_activity`. Each run builds a content-addressed
    - **Markdown** (`extract_markdown_chunks`): split on `#`/`##`/`###` headings into named sections.
    - **JSON / TOML / YAML / INI / env / CSS / HTML / shell** (`extract_whole_file_chunk`): treated as one chunk per file with a typed label (`config`, `stylesheet`, `markup`, `shell`).
 4. **Token-budget split** (`split_oversized`) — any chunk whose `embedding_text` exceeds `MAX_TOKENS = 7500` is recut at line boundaries with `OVERLAP_LINES = 5` overlap, preserving `chunk_type`, `name`, `parent_class` and recording `part N` in the name.
-5. **Manifest + cache** (`services/repo_manifest.py`, `services/embedding_cache.py`) — compute relative-path file hashes, stable chunk hashes, and embedding hashes. Cached embeddings are hydrated before new embedding calls.
+5. **Manifest + exact lines + cache** (`services/repo_manifest.py`, `services/exact_search.py`, `services/embedding_cache.py`) — compute relative-path file hashes, stable chunk hashes, embedding hashes, and a non-empty line inventory. Cached embeddings are hydrated before new embedding calls.
 6. **Prefix + embed** — each chunk's `embedding_text` is `"# File: <relative path>\n# Class: <parent>\n# <chunk_type>: <name>\n<content>"`. Cache misses are batched into `client.embeddings.create(model="text-embedding-3-large")` → 3072-dim vectors.
-7. **Upsert** (`services/db.py::store_chunks`) — chunks upsert by `(repo_url, chunk_sha256)`, and stale chunks are pruned on replacement indexes.
+7. **Upsert** (`services/db.py::store_chunks`, `store_repo_text_lines`) — chunks upsert by `(repo_url, chunk_sha256)`, stale chunks are pruned on replacement indexes, and exact-search lines are rewritten only for files whose content hash changed.
 8. **Directory summaries** (`services/dir_summaries.py::generate_dir_summaries`) — group files by parent dir, build a compact context, call the summary model, embed the result, upsert into `dir_summaries`.
 
-**Querying.** Vector tables use HNSW halfvec cosine indexes. Lookups are `1 - (embedding <=> query_vec)` cosine similarity, scoped by `repo_url`. The query is embedded with the same `text-embedding-3-large` model via `embed_query` so vectors live in the same space.
+**Querying.** Vector tables use HNSW halfvec cosine indexes. Lookups are `1 - (embedding <=> query_vec)` cosine similarity, scoped by `repo_url`. The query is embedded with the same `text-embedding-3-large` model via `embed_query` so vectors live in the same space. Exact lookup uses `repo_text_lines` with pg_trgm-backed substring search or case-insensitive Postgres regex, also scoped by `repo_url`.
 
 ## Agents
 
@@ -92,7 +93,8 @@ All four agents are `openai-agents` SDK `Agent` objects on `gpt-4.1-mini`. Each 
 |---|---|---|
 | `list_files` | `(dir_path, glob="**/*") -> list[str]` | Glob the local clone. |
 | `read_file` | `(file_path, start_line=0, end_line=-1) -> str` | Read full file or slice; rejects directories. |
-| `search_code` | `(dir_path, query, file_type="") -> list[str]` | Regex over file contents → `file:line` results, optionally filtered by extension. |
+| `search_code` | `(dir_path, query, file_type="") -> list[str]` | Regex over local clone contents → `file:line` results, optionally filtered by extension. |
+| `search_exact_indexed` | `(query, repo_url, limit=50, regex=False, path="", language="") -> str` (async) | Exact string or regex over persisted line inventory → `file:line: text` results. |
 | `find_references` | `(symbol, dir_path) -> list[str]` | Same regex shape as `search_code`, framed as "where is symbol used". |
 | `get_dependencies` | `(file_path) -> list[str]` | Extract imports — `import X from "y"` / `require()` / `import()` for JS, `from X import` / `import X` for Python. |
 | `search_indexed` | `(query, repo_url, k=10) -> str` (async) | Embed query + cosine similarity over `code_chunks`, returns top-k formatted blocks `[score] path (type: name) Lstart-end\n<content>`. |
@@ -108,6 +110,7 @@ All four agents are `openai-agents` SDK `Agent` objects on `gpt-4.1-mini`. Each 
 | `dir_summaries` | LLM-summarised directories + embeddings. | `dir_path`, `summary`, `file_list TEXT[]`, `embedding`. Unique on `(repo_url, dir_path)`. |
 | `repo_index_runs` | Append-only manifest history. | `repo_url`, `manifest_sha256`, `file_count`, `chunk_count`, `metadata jsonb`, `created_at`. |
 | `repo_files` | Latest file inventory. | `repo_url`, `file_path`, `file_sha256`, `size_bytes`, `language`, generated/vendor flags. |
+| `repo_text_lines` | Latest non-empty line inventory for exact lookup. | `repo_url`, `file_path`, `file_sha256`, `language`, `line_number`, `line_text`. |
 | `repo_chunk_manifests` | Latest chunk inventory. | `repo_url`, `chunk_sha256`, `embedding_sha256`, `file_path`, `file_sha256`, line range, token count. |
 | `repo_embedding_cache` | Repo-scoped embedding cache. | `repo_url`, `embedding_sha256`, `embedding_model`, `embedding`, `last_used_at`. |
 | `sessions` | One row per chat session. | `id uuid`, `repo_url`, `status (indexing\|ready\|ended)`, `created_at`, `last_seen_at`. |
@@ -133,9 +136,11 @@ Do not try to unify them; they have different consumers.
 **Exploratory / debug endpoints (no session, direct one-shot):**
 - `GET /walkrepo` — flat tree dump.
 - `GET /chunks` — clone + chunk + store, returns chunk metadata + previews.
+- `GET /manifest` — clone + chunk without embeddings, persists file/chunk/line inventories when `persist=true`.
 - `GET /ast` — tree-sitter AST dump for source files.
 - `GET /explore` — one-shot run of `explorer_agent` with `Runner.run` (not streamed).
 - `GET /search` — direct cosine search over `code_chunks`. `query` is read raw via `_raw_query_param` so `%`/special chars are kept literal.
+- `GET /search-exact` — direct exact string or regex search over `repo_text_lines`; supports `limit`, `regex`, `path`, and `language`.
 
 ## Streaming protocol
 
@@ -169,7 +174,7 @@ If the turn ends with an open `pending_actions` row, `agent_turn_activity` retur
 | Activity | Params | `start_to_close` | Retry attempts | Purpose |
 |---|---|---|---|---|
 | `clone_repo_activity` | `repo_url: str` | 120s | 3 | `ensure_repo_dir`; raises if clone fails. |
-| `index_repo_activity` | `IndexParams(repo_url, repo_dir)` | 600s | 2 | Walk → AST chunk → manifest → hydrate embedding cache → embed misses → `store_chunks` → regenerate summaries only when the manifest changed. |
+| `index_repo_activity` | `IndexParams(repo_url, repo_dir)` | 600s | 2 | Walk → AST chunk → manifest → exact line inventory → hydrate embedding cache → embed misses → `store_chunks` → regenerate summaries only when the manifest changed. |
 | `update_session_status_activity` | `SessionStatusParams(session_id, status)` | 30s | 3 | `UPDATE sessions SET status, last_seen_at`. |
 | `agent_turn_activity` | `AgentTurnParams(session_id, content)` | 300s | 1 | Stream one `Runner.run_streamed(router_agent, …)` turn; emits to `event_bus` + appends parts to the placeholder `messages` row. |
 | `resolve_pending_actions_activity` | `session_id: str` | 15s | 3 | Mark all `open` pending_actions for the session `resolved`. Called when a user reply is interpreted as the answer to an open clarification. |

@@ -306,6 +306,7 @@ sendMessage({ text: "User login flow" });
 | `dir_summaries` | Per-directory LLM-generated summaries + embeddings. |
 | `repo_index_runs` | Append-only content manifest history for each indexing/debug run. |
 | `repo_files` | Latest content-addressed file inventory keyed by `(repo_url, file_path)`. |
+| `repo_text_lines` | Latest non-empty line inventory for exact string and regex lookup. |
 | `repo_chunk_manifests` | Latest content-addressed chunk inventory keyed by `(repo_url, chunk_sha256)`. |
 | `repo_embedding_cache` | Repo-scoped embedding cache keyed by `(repo_url, embedding_sha256)`. |
 
@@ -329,6 +330,7 @@ All agents have access to `ask_user` for clarification. The Router decides which
 | `list_files(dir_path, glob)` | Explorer, Explainer | Find files by pattern |
 | `read_file(path, start, end)` | Explorer, Explainer, Tracer | Read file contents |
 | `search_code(dir_path, query)` | Explorer | Regex search across files |
+| `search_exact_indexed(query, repo_url, limit, regex, path, language)` | Explorer, Tracer | Exact string or regex search over persisted line inventory |
 | `find_references(symbol, dir_path)` | Tracer | Find all references to a symbol |
 | `get_dependencies(file_path)` | Tracer | Extract import dependencies |
 | `search_indexed(query, repo_url, k)` | Explainer | Semantic search over pgvector chunks |
@@ -350,3 +352,4 @@ These endpoints predate the session-based flow and are useful for debugging:
 | `GET /ast?repo_url=...` | Tree-sitter AST dump |
 | `GET /explore?repo_url=...&query=...` | One-shot agent query (no session) |
 | `GET /search?repo_url=...&query=...` | Raw pgvector similarity search |
+| `GET /search-exact?repo_url=...&query=...` | Exact string or regex search over indexed lines |

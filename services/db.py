@@ -7,6 +7,7 @@ overwrites existing rows instead of duplicating them.
 """
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 
@@ -15,12 +16,14 @@ from pgvector.psycopg import register_vector_async
 from psycopg_pool import AsyncConnectionPool
 
 from services.chunk_and_embed import CodeChunk
-from services.repo_manifest import RepoManifest
+from services.exact_search import RepoTextLine
+from services.repo_manifest import RepoFileManifest, RepoManifest
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql://postgres:postgres@postgres:5432/codebase_agent",
 )
+logger = logging.getLogger(__name__)
 
 CODE_SEARCH_SQL = """
     SELECT file_path, chunk_type, name, start_line, end_line, content,
@@ -152,6 +155,26 @@ CREATE INDEX IF NOT EXISTS repo_files_sha_idx
 CREATE INDEX IF NOT EXISTS repo_files_language_idx
     ON repo_files (repo_url, language);
 
+CREATE TABLE IF NOT EXISTS repo_text_lines (
+    repo_url TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    file_sha256 TEXT NOT NULL,
+    language TEXT,
+    line_number INT NOT NULL,
+    line_text TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (repo_url, file_path, line_number)
+);
+
+CREATE INDEX IF NOT EXISTS repo_text_lines_repo_idx
+    ON repo_text_lines (repo_url);
+
+CREATE INDEX IF NOT EXISTS repo_text_lines_file_idx
+    ON repo_text_lines (repo_url, file_path);
+
+CREATE INDEX IF NOT EXISTS repo_text_lines_language_idx
+    ON repo_text_lines (repo_url, language);
+
 CREATE TABLE IF NOT EXISTS repo_chunk_manifests (
     repo_url TEXT NOT NULL,
     chunk_sha256 TEXT NOT NULL,
@@ -252,6 +275,11 @@ CREATE TABLE IF NOT EXISTS startup_plans (
 );
 """
 
+TRIGRAM_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS repo_text_lines_text_trgm_idx
+    ON repo_text_lines USING gin (line_text gin_trgm_ops);
+"""
+
 
 async def init_schema():
     # Create the extension on a raw connection first — the pool's
@@ -260,11 +288,22 @@ async def init_schema():
     async with await psycopg.AsyncConnection.connect(DATABASE_URL, autocommit=True) as conn:
         async with conn.cursor() as cur:
             await cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            try:
+                await cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+            except psycopg.Error as exc:
+                logger.warning("Skipping pg_trgm extension setup: %s", exc)
 
     pool = await get_pool()
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(SCHEMA_SQL)
+
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(TRIGRAM_INDEX_SQL)
+    except psycopg.Error as exc:
+        logger.warning("Skipping repo_text_lines trigram index: %s", exc)
 
 
 async def store_chunks(repo_url: str, chunks: list[CodeChunk], *, replace: bool = False) -> int:
@@ -566,6 +605,152 @@ async def store_repo_manifest(
         "file_count": len(manifest.files),
         "chunk_count": len(manifest.chunks),
     }
+
+
+def _contains_like_pattern(value: str) -> str:
+    escaped = (
+        value
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    return f"%{escaped}%"
+
+
+async def store_repo_text_lines(
+    repo_url: str,
+    lines: list[RepoTextLine],
+    files: list[RepoFileManifest],
+) -> int:
+    """Persist line inventory, rewriting only files whose content hash changed."""
+    current_file_paths = sorted({file.file_path for file in files})
+    current_sha_by_path = {file.file_path: file.file_sha256 for file in files}
+
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        if not current_file_paths:
+            await cur.execute(
+                "DELETE FROM repo_text_lines WHERE repo_url = %s",
+                (repo_url,),
+            )
+            return 0
+
+        await cur.execute(
+            """
+            DELETE FROM repo_text_lines
+            WHERE repo_url = %s
+              AND NOT (file_path = ANY(%s::text[]))
+            """,
+            (repo_url, current_file_paths),
+        )
+        await cur.execute(
+            """
+            SELECT file_path, file_sha256
+            FROM repo_text_lines
+            WHERE repo_url = %s
+            GROUP BY file_path, file_sha256
+            """,
+            (repo_url,),
+        )
+        existing_sha_by_path = {row[0]: row[1] for row in await cur.fetchall()}
+        changed_paths = sorted(
+            path for path, sha in current_sha_by_path.items()
+            if existing_sha_by_path.get(path) != sha
+        )
+        changed_path_set = set(changed_paths)
+
+        if changed_paths:
+            await cur.execute(
+                """
+                DELETE FROM repo_text_lines
+                WHERE repo_url = %s
+                  AND file_path = ANY(%s::text[])
+                """,
+                (repo_url, changed_paths),
+            )
+
+        rows = [
+            (
+                repo_url,
+                line.file_path,
+                line.file_sha256,
+                line.language,
+                line.line_number,
+                line.line_text,
+            )
+            for line in lines
+            if line.file_path in changed_path_set
+        ]
+
+        if rows:
+            await cur.executemany(
+                """
+                INSERT INTO repo_text_lines
+                    (repo_url, file_path, file_sha256, language, line_number,
+                     line_text, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                """,
+                rows,
+            )
+    return len(rows)
+
+
+async def search_repo_text_lines(
+    repo_url: str,
+    query: str,
+    *,
+    regex: bool = False,
+    path: str = "",
+    language: str = "",
+    limit: int = 50,
+) -> list[dict]:
+    """Search the persisted line inventory with literal substring or regex."""
+    limit = max(1, min(limit, 200))
+    where = ["repo_url = %s"]
+    params: list[object] = [repo_url]
+
+    if regex:
+        where.append("line_text ~* %s")
+        params.append(query)
+    else:
+        where.append("line_text ILIKE %s ESCAPE '\\'")
+        params.append(_contains_like_pattern(query))
+
+    if path:
+        where.append("file_path ILIKE %s ESCAPE '\\'")
+        params.append(_contains_like_pattern(path))
+
+    if language:
+        where.append("language = %s")
+        params.append(language)
+
+    params.append(limit)
+    sql = f"""
+        SELECT file_path, line_number, line_text, language, file_sha256
+        FROM repo_text_lines
+        WHERE {' AND '.join(where)}
+        ORDER BY file_path, line_number
+        LIMIT %s
+    """
+
+    pool = await get_pool()
+    try:
+        async with pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(sql, params)
+            rows = await cur.fetchall()
+    except psycopg.errors.InvalidRegularExpression as exc:
+        raise ValueError(f"Invalid regex: {query}") from exc
+
+    return [
+        {
+            "file_path": row[0],
+            "line_number": row[1],
+            "line_text": row[2],
+            "language": row[3],
+            "file_sha256": row[4],
+        }
+        for row in rows
+    ]
 
 
 async def get_latest_repo_manifest_sha(

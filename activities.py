@@ -21,10 +21,11 @@ from services.walk_repo import collect_file_paths
 from services.chunk_and_embed import chunk_file_list
 from services.db import (
     get_latest_repo_manifest_sha, get_startup_plan_row, store_chunks, store_dir_summaries,
-    store_repo_manifest,
+    store_repo_manifest, store_repo_text_lines,
     upsert_startup_plan,
 )
 from services.embedding_cache import hydrate_embeddings
+from services.exact_search import build_text_lines
 from services.repo_manifest import build_repo_manifest
 from services.startup_analysis import (
     ANALYSIS_MODEL, build_context, call_llm,
@@ -92,6 +93,12 @@ async def index_repo_activity(params: IndexParams) -> int:
     paths = await collect_file_paths(params.repo_dir)
     chunks = chunk_file_list(paths, embed=False)
     manifest = build_repo_manifest(params.repo_dir, paths, chunks)
+    text_lines = build_text_lines(params.repo_dir, manifest)
+    text_lines_stored = await store_repo_text_lines(
+        params.repo_url,
+        text_lines,
+        manifest.files,
+    )
     previous_manifest_sha = await get_latest_repo_manifest_sha(params.repo_url)
     previous_summary_manifest_sha = await get_latest_repo_manifest_sha(
         params.repo_url,
@@ -106,6 +113,8 @@ async def index_repo_activity(params: IndexParams) -> int:
         "previous_summary_manifest_sha256": previous_summary_manifest_sha,
         "manifest_changed": previous_manifest_sha != manifest.manifest_sha256,
         "embeddings": embedding_stats,
+        "text_line_count": len(text_lines),
+        "text_lines_stored": text_lines_stored,
     }
 
     if previous_summary_manifest_sha == manifest.manifest_sha256:
