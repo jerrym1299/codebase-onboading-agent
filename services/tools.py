@@ -334,3 +334,138 @@ async def get_app_startup_plan(session_id: str) -> str:
     if plan is None or not plan.get("plan_markdown"):
         return "No app plan available for this session."
     return plan["plan_markdown"]
+
+UPDATE_APP_PLAN_MARKDOWN_SQL = """
+    UPDATE app_startup_plans
+       SET plan_markdown = %s,
+           updated_at    = NOW()
+     WHERE repo_set_hash = %s
+"""
+
+
+@function_tool
+async def update_startup_plan(plan_markdown: str, change_summary: str = "") -> str:
+    """Persist an updated app-level startup plan for the current session.
+
+    Use this after gathering user feedback via `ask_user` to resolve ambiguities
+    or incorporate corrections/updates from the user into the plan. Workflow:
+      1. Read the current plan with `get_app_startup_plan(session_id)`.
+      2. Identify ambiguities or fields the user might want to correct (env
+         values, service ports, ordering, etc.). For each one, call `ask_user`
+         to confirm or get a value.
+      3. Construct the FULL updated markdown (replaces plan_markdown wholesale,
+         keep the same six sections: Startup plan, Prerequisites, Env vars,
+         Steps, Dependency graph, Caveats).
+      4. Call this tool with the new markdown.
+
+    `change_summary` is a one-line description of what changed, used only for
+    the SSE event payload.
+    """
+    try:
+        session_id = current_session_id.get()
+    except LookupError:
+        return "[update_startup_plan unavailable: no active session context]"
+
+    if not plan_markdown or not plan_markdown.strip():
+        return "ERROR: plan_markdown is empty; nothing to persist."
+
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT app_plan_hash FROM sessions WHERE id = %s",
+            (session_id,),
+        )
+        row = await cur.fetchone()
+        if row is None or not row[0]:
+            return "ERROR: no app plan exists for this session yet."
+        repo_set_hash = row[0]
+
+        await cur.execute(UPDATE_APP_PLAN_MARKDOWN_SQL, (plan_markdown, repo_set_hash))
+        if cur.rowcount == 0:
+            return f"ERROR: no app_startup_plans row found for repo_set_hash={repo_set_hash}."
+
+    fresh = await get_app_startup_plan_row(repo_set_hash)
+    await publish(session_id, {
+        "type": "data-app-plan-updated",
+        "updatedAt": fresh["updated_at"] if fresh else None,
+        "repo_set_hash": repo_set_hash,
+        "change_summary": change_summary or None,
+    })
+
+    return f"App startup plan updated ({len(plan_markdown)} chars) for repo_set_hash={repo_set_hash}."
+
+
+UPDATE_REPO_PLAN_SQL = """
+    UPDATE startup_plans
+       SET plan       = %s::jsonb,
+           updated_at = NOW()
+     WHERE repo_url = %s
+"""
+
+
+@function_tool
+async def update_repo_startup_plan(
+    repo_url: str,
+    plan: dict,
+    change_summary: str = "",
+) -> str:
+    """Persist an updated per-repo startup plan for one repo in the current session.
+
+    Use this for targeted corrections to a single repo's plan — fixing an env
+    var value, adding a missing step, correcting a service port, etc. — instead
+    of re-running the full analysis with `recompute_startup_plan`.
+
+    Workflow:
+      1. Read the current per-repo plan with `get_startup_plan(repo_url)`.
+      2. For every ambiguity or missing value the user's change implies, call
+         `ask_user` to confirm or get a value before guessing.
+      3. Construct the FULL updated plan as a JSON object matching the existing
+         schema (top-level keys: `summary`, `packages[]`, `warnings[]`; each
+         package has `path`, `framework`, `runtime`, `package_manager`,
+         `external_tools[]`, `services[]`, `env_vars[]`, `steps[]`). Preserve
+         every field you aren't changing — this replaces `plan` wholesale.
+      4. Call this tool. `repo_url` must be one of the repos in this session.
+
+    `change_summary` is a one-line description of what changed, used only for
+    the SSE event payload.
+    """
+    try:
+        session_id = current_session_id.get()
+    except LookupError:
+        return "[update_repo_startup_plan unavailable: no active session context]"
+
+    if not repo_url or not repo_url.strip():
+        return "ERROR: repo_url is empty."
+    if not isinstance(plan, dict) or not plan:
+        return "ERROR: plan must be a non-empty JSON object."
+
+    repo_url = repo_url.rstrip("/")
+
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT 1 FROM session_repos WHERE session_id = %s AND repo_url = %s",
+            (session_id, repo_url),
+        )
+        if await cur.fetchone() is None:
+            return (
+                f"ERROR: repo_url {repo_url!r} is not part of this session. "
+                "Use one of the repos listed in the developer prompt."
+            )
+
+        await cur.execute(UPDATE_REPO_PLAN_SQL, (json.dumps(plan), repo_url))
+        if cur.rowcount == 0:
+            return (
+                f"ERROR: no startup_plans row exists for {repo_url}. "
+                "Run `recompute_startup_plan` first to create one."
+            )
+
+    fresh = await get_startup_plan_row(repo_url)
+    await publish(session_id, {
+        "type": "data-startup-plan-updated",
+        "updatedAt": fresh["updated_at"] if fresh else None,
+        "repo_url": repo_url,
+        "change_summary": change_summary or None,
+    })
+
+    return f"Startup plan updated for {repo_url}."

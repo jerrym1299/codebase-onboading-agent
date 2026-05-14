@@ -7,6 +7,7 @@ from services.tools import (
     find_references, get_dependencies, search_indexed, search_dir_summaries, git_log,
     ask_user,
     get_startup_plan, recompute_startup_plan,
+    update_startup_plan, update_repo_startup_plan,
     get_repo_boundaries, get_repo_startup_plan, get_app_startup_plan,
 )
 
@@ -111,9 +112,29 @@ bootstrap_agent = Agent[Any](
         "optional and flagging items where `needs_verification: true` or `example` is null.\n"
         "3. 'Why do I need X' → cite the `sources` array on the relevant plan entry. Use "
         "`read_file` on those sources only if the user asks for more detail.\n"
-        "4. 'Re-analyse this repo' / 'I added a new env var, update the plan' → call "
+        "4. 'Re-analyse this repo' / full re-derivation from source → call "
         "`recompute_startup_plan(repo_url, reason)`, tell the user it's running, then re-read "
-        "the plan when finished.\n"
+        "the plan when finished. Use this only when the codebase itself changed or the user "
+        "explicitly asks for a fresh re-analysis.\n"
+        "4b. 'Update the plan' / 'fix the plan' / 'the plan is wrong about X' / 'add this env "
+        "var to the plan' / any small targeted correction or clarification → DO NOT recompute. "
+        "Decide scope first:\n"
+        "   - If the correction is scoped to ONE repo (env var for a specific service, a step "
+        "in one repo's install flow, a runtime version for one package) → use "
+        "`update_repo_startup_plan(repo_url, plan, change_summary)`. Steps: (a) read the "
+        "current per-repo plan with `get_startup_plan(repo_url)`, (b) for every ambiguity or "
+        "missing value, call `ask_user` to confirm before guessing, (c) construct the FULL "
+        "updated JSON preserving the schema (`summary`, `packages[]` with `runtime`, "
+        "`package_manager`, `external_tools`, `services`, `env_vars`, `steps`, plus "
+        "`warnings[]`) — only mutate the fields you mean to change, copy the rest verbatim, "
+        "(d) call the tool.\n"
+        "   - If the correction is cross-repo or about the consolidated walkthrough (ordering "
+        "between repos, prerequisites, Mermaid graph, Caveats) → use "
+        "`update_startup_plan(plan_markdown, change_summary)`. Steps: (a) read the current "
+        "app plan with `get_app_startup_plan(session_id)`, (b) `ask_user` for ambiguities, "
+        "(c) construct the FULL updated markdown preserving the six sections (Startup plan, "
+        "Prerequisites, Env vars, Steps, Dependency graph, Caveats), (d) call the tool.\n"
+        "After saving, tell the user what changed and cite the relevant sections.\n"
         "5. If the plan is missing a value the user is asking about (`needs_verification`, "
         "no example, low confidence), use `ask_user` to clarify — but don't pre-emptively "
         "ask; only when answering depends on it.\n"
@@ -135,6 +156,8 @@ bootstrap_agent = Agent[Any](
         get_startup_plan,
         get_app_startup_plan,
         recompute_startup_plan,
+        update_startup_plan,
+        update_repo_startup_plan,
         list_files,
         read_file,
         get_dependencies,
