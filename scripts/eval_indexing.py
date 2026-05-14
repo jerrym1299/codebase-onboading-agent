@@ -8,6 +8,7 @@ and monkeypatches embedding generation to deterministic vectors.
 Usage:
     python3 scripts/eval_indexing.py
     python3 scripts/eval_indexing.py --base http://localhost:8001
+    python3 scripts/eval_indexing.py --with-openai
     python3 scripts/eval_indexing.py --skip-cache-smoke
 """
 
@@ -73,6 +74,11 @@ def _fetch_manifest(base: str, repo: str) -> dict:
     return _http_json(f"{base}/manifest?repo_url={encoded_repo}&limit=1000", timeout=120)
 
 
+def _fetch_chunks(base: str, repo: str) -> dict:
+    encoded_repo = urllib.parse.quote(repo, safe="")
+    return _http_json(f"{base}/chunks?repo_url={encoded_repo}&preview=0", timeout=300)
+
+
 def _validate_manifest(manifest: dict, expected_files: set[str]) -> None:
     assert manifest["file_count"] > 0, f"expected files, got {manifest}"
     assert manifest["chunk_count"] > 0, f"expected chunks, got {manifest}"
@@ -122,6 +128,18 @@ def _clear_cache_rows(repo: str) -> None:
     repo_sql = _sql_literal(repo)
     _psql(f"DELETE FROM repo_embedding_cache WHERE repo_url={repo_sql};")
     _psql(f"DELETE FROM code_chunks WHERE repo_url={repo_sql};")
+
+
+def _validate_container_openai_key() -> None:
+    result = _run([
+        "docker", "compose", "exec", "-T", "fastapi",
+        "sh", "-lc",
+        "test -n \"$OPENAI_API_KEY\" && printf present || printf missing",
+    ])
+    assert result == "present", (
+        "fastapi container is missing OPENAI_API_KEY. "
+        "Restart it with the key before running --with-openai."
+    )
 
 
 def _cache_smoke(repo: str) -> dict:
@@ -187,6 +205,52 @@ def _validate_cache_smoke(repo: str, manifest: dict) -> dict:
     return result
 
 
+def _validate_real_openai(base: str, repo: str, manifest: dict) -> dict:
+    _validate_container_openai_key()
+    _clear_cache_rows(repo)
+
+    first = _fetch_chunks(base, repo)
+    assert first["file_count"] == manifest["file_count"], first
+    assert first["chunk_count"] == manifest["chunk_count"], first
+    assert first["stored"] == manifest["chunk_count"], first
+    assert first["embeddings"]["cached"] == 0, first["embeddings"]
+    assert first["embeddings"]["embedded"] == manifest["chunk_count"], first["embeddings"]
+    assert first["embeddings"]["stored"] == manifest["chunk_count"], first["embeddings"]
+
+    for row in first["chunks"]:
+        embedding = row.get("embedding")
+        assert isinstance(embedding, list), f"missing embedding: {row}"
+        assert len(embedding) == 3072, f"unexpected embedding dim: {len(embedding)}"
+
+    second = _fetch_chunks(base, repo)
+    assert second["embeddings"]["cached"] == manifest["chunk_count"], second["embeddings"]
+    assert second["embeddings"]["embedded"] == 0, second["embeddings"]
+    assert second["embeddings"]["stored"] == 0, second["embeddings"]
+
+    repo_sql = _sql_literal(repo)
+    cached = int(_psql(
+        f"SELECT count(*) FROM repo_embedding_cache WHERE repo_url={repo_sql};"
+    ))
+    indexed = int(_psql(
+        f"SELECT count(*) FROM code_chunks WHERE repo_url={repo_sql};"
+    ))
+    assert cached == manifest["chunk_count"], f"cached embeddings={cached}"
+    assert indexed == manifest["chunk_count"], f"code chunks={indexed}"
+
+    search = _http_json(
+        f"{base}/search?repo_url={urllib.parse.quote(repo, safe='')}&query=stylesheet&k=3",
+        timeout=120,
+    )
+    result_paths = {row["file_path"].split("/")[-1] for row in search.get("results", [])}
+    assert "styles.css" in result_paths, f"styles.css not in search results: {search}"
+
+    return {
+        "first": first["embeddings"],
+        "second": second["embeddings"],
+        "search_paths": sorted(result_paths),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default=DEFAULT_BASE)
@@ -194,6 +258,11 @@ def main() -> None:
     parser.add_argument("--expected-files", default=DEFAULT_EXPECTED_FILES)
     parser.add_argument("--skip-db", action="store_true")
     parser.add_argument("--skip-cache-smoke", action="store_true")
+    parser.add_argument(
+        "--with-openai",
+        action="store_true",
+        help="Run real OpenAI embedding and vector-search checks.",
+    )
     args = parser.parse_args()
 
     expected_files = {
@@ -229,6 +298,15 @@ def main() -> None:
         print(
             "  cache smoke: "
             f"first={result['first']['stats']} second={result['second']['stats']}"
+        )
+
+    if args.with_openai:
+        print("Checking real OpenAI embeddings and vector search ...")
+        result = _validate_real_openai(args.base, args.repo, second_manifest)
+        print(
+            "  OpenAI smoke: "
+            f"first={result['first']} second={result['second']} "
+            f"search_paths={result['search_paths']}"
         )
 
     print("\nALL INDEXING EVALS PASSED.")

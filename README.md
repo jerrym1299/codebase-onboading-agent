@@ -125,6 +125,8 @@ curl -s http://localhost:8001/sessions/<session_id>/messages
   `/explore`, and `/search`.
 - Run `python3 scripts/eval_indexing.py` against the Docker stack to validate
   manifest stability, DB persistence, and embedding-cache behavior.
+- Add `--with-openai` to that eval when the FastAPI container has an
+  `OPENAI_API_KEY`; it validates real embeddings and vector search.
 
 ## Future Work
 
