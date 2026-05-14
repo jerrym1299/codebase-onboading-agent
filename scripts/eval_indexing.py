@@ -124,9 +124,23 @@ def _validate_db(repo: str, manifest: dict) -> None:
     chunks = int(_psql(f"SELECT count(*) FROM repo_chunk_manifests WHERE repo_url={repo_sql};"))
     text_lines = int(_psql(f"SELECT count(*) FROM repo_text_lines WHERE repo_url={repo_sql};"))
     runs = int(_psql(f"SELECT count(*) FROM repo_index_runs WHERE repo_url={repo_sql};"))
+    connections = int(_psql(f"SELECT count(*) FROM repo_connections WHERE repo_url={repo_sql};"))
+    indexes = int(_psql(f"SELECT count(*) FROM repo_indexes WHERE repo_url={repo_sql};"))
+    indexed_runs = int(_psql(
+        f"SELECT count(*) FROM repo_index_runs WHERE repo_url={repo_sql} "
+        "AND repo_index_id IS NOT NULL;"
+    ))
     latest = _psql(
         "SELECT manifest_sha256 FROM repo_index_runs "
         f"WHERE repo_url={repo_sql} ORDER BY created_at DESC LIMIT 1;"
+    )
+    latest_index = _psql(
+        "SELECT ri.manifest_sha256 "
+        "FROM repo_latest_indexes li "
+        "JOIN repo_indexes ri ON ri.id = li.repo_index_id "
+        "JOIN repo_connections rc ON rc.id = li.repo_connection_id "
+        f"WHERE rc.repo_url={repo_sql} "
+        "ORDER BY li.updated_at DESC LIMIT 1;"
     )
 
     assert files == manifest["file_count"], f"repo_files={files}, manifest={manifest['file_count']}"
@@ -138,6 +152,10 @@ def _validate_db(repo: str, manifest: dict) -> None:
     )
     assert runs >= 2, f"expected at least two manifest runs, got {runs}"
     assert latest == manifest["manifest_sha256"], "latest manifest hash mismatch"
+    assert connections >= 1, "expected repo_connection for indexed repo"
+    assert indexes >= 1, "expected repo_index for indexed repo"
+    assert indexed_runs >= 1, "expected repo_index_runs.repo_index_id to be populated"
+    assert latest_index == manifest["manifest_sha256"], "latest repo_index hash mismatch"
 
 
 def _validate_exact_search(

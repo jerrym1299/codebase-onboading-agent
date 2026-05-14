@@ -121,9 +121,13 @@ curl -s http://localhost:8001/sessions/<session_id>/messages
   environment.
 - The OpenAI Agents SDK session store defaults to `agent_sessions.db`.
 - Indexing stores a content-addressed manifest, exact line-search inventory,
-  and cached embeddings for unchanged chunks.
+  cached embeddings for unchanged chunks, and tenant/repo/index/job metadata.
 - Debug endpoints include `/walkrepo`, `/chunks`, `/manifest`, `/ast`,
   `/explore`, `/search`, and `/search-exact`.
+- Phase 1 indexing job endpoints are `/repo-connections`, `/repo-index-jobs`,
+  and `/repo-index-jobs/<job_id>`.
+- Run one queued indexing job locally with
+  `python -m workers.index_one --job-id <job_id>` inside the FastAPI runtime.
 - Run `python3 scripts/eval_indexing.py` against the Docker stack to validate
   manifest stability, DB persistence, exact search, and embedding-cache
   behavior.

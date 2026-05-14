@@ -1,8 +1,13 @@
 from services.chunk_and_embed import CodeChunk, embed_chunks
-from services.db import get_cached_chunk_embeddings, store_cached_chunk_embeddings
+from services.db import RepoIndexContext, get_cached_chunk_embeddings, store_cached_chunk_embeddings
 
 
-async def hydrate_embeddings(repo_url: str, chunks: list[CodeChunk]) -> dict:
+async def hydrate_embeddings(
+    repo_url: str,
+    chunks: list[CodeChunk],
+    *,
+    index_context: RepoIndexContext | None = None,
+) -> dict:
     """Attach cached embeddings where possible, then embed/cache misses."""
     cached = await get_cached_chunk_embeddings(repo_url, chunks)
     cached_count = 0
@@ -33,7 +38,11 @@ async def hydrate_embeddings(repo_url: str, chunks: list[CodeChunk]) -> dict:
         if chunk.embedding is None and chunk.embedding_sha256 in embedded_by_hash:
             chunk.embedding = embedded_by_hash[chunk.embedding_sha256]
 
-    stored_count = await store_cached_chunk_embeddings(repo_url, unique_pending)
+    stored_count = await store_cached_chunk_embeddings(
+        repo_url,
+        unique_pending,
+        index_context=index_context,
+    )
     return {
         "cached": cached_count,
         "embedded": embedded_count,

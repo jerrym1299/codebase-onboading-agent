@@ -25,8 +25,10 @@ from activities import (
 from services.chunk_and_embed import AST_PARSERS, chunk_file_list, dump_ast, embed_query
 from services.clone_repo import ensure_repo_dir
 from services.db import (
-    CODE_SEARCH_SQL, close_pool, get_pool, get_startup_plan_row, init_schema,
-    search_repo_text_lines, store_chunks, store_repo_manifest, store_repo_text_lines,
+    CODE_SEARCH_SQL, close_pool, create_repo_index_job, ensure_repo_connection,
+    get_pool, get_repo_index_job, get_startup_plan_row, init_schema,
+    prepare_repo_index, search_repo_text_lines, store_chunks,
+    store_repo_manifest, store_repo_text_lines,
 )
 from services.embedding_cache import hydrate_embeddings
 from services.exact_search import build_text_lines
@@ -84,6 +86,58 @@ def read_root():
     return {"Hello": "world"}
 
 
+@app.get("/health")
+def health_endpoint():
+    return {"status": "ok"}
+
+
+@app.post("/repo-connections")
+async def create_repo_connection_endpoint(payload: dict):
+    repo_url = (payload or {}).get("repo_url", "").rstrip("/")
+    if not repo_url:
+        return JSONResponse(status_code=400, content={"error": "Missing 'repo_url'."})
+    metadata = (payload or {}).get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return JSONResponse(status_code=400, content={"error": "'metadata' must be an object."})
+    connection = await ensure_repo_connection(
+        repo_url,
+        tenant_id=(payload or {}).get("tenant_id"),
+        provider=(payload or {}).get("provider"),
+        default_branch=(payload or {}).get("default_branch"),
+        installation_id=(payload or {}).get("installation_id"),
+        metadata=metadata,
+    )
+    return connection
+
+
+@app.post("/repo-index-jobs")
+async def create_repo_index_job_endpoint(payload: dict):
+    payload = payload or {}
+    try:
+        job = await create_repo_index_job(
+            repo_url=(payload.get("repo_url") or "").rstrip("/") or None,
+            repo_connection_id=payload.get("repo_connection_id"),
+            tenant_id=payload.get("tenant_id"),
+            requested_by=payload.get("requested_by"),
+            trigger=payload.get("trigger") or "manual",
+            target_ref=payload.get("target_ref") or "HEAD",
+            target_commit_sha=payload.get("target_commit_sha"),
+            priority=int(payload.get("priority") or 100),
+            metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else None,
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return JSONResponse(status_code=202, content=job)
+
+
+@app.get("/repo-index-jobs/{job_id}")
+async def get_repo_index_job_endpoint(job_id: str):
+    job = await get_repo_index_job(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"error": "Job not found."})
+    return job
+
+
 @app.get("/walkrepo")
 async def walkrepo_endpoint(repo_url: str):
     repo_dir = await ensure_repo_dir(repo_url)
@@ -103,8 +157,29 @@ async def chunks_endpoint(repo_url: str, preview: int = 300):
     chunks = chunk_file_list(paths, embed=False)
     manifest = build_repo_manifest(repo_dir, paths, chunks)
     text_lines = build_text_lines(repo_dir, manifest)
-    text_lines_stored = await store_repo_text_lines(repo_url, text_lines, manifest.files)
-    embedding_stats = await hydrate_embeddings(repo_url, chunks)
+    index_context = await prepare_repo_index(
+        repo_url,
+        manifest,
+        text_line_count=len(text_lines),
+        metadata={"source": "chunks_endpoint"},
+    )
+    text_lines_stored = await store_repo_text_lines(
+        repo_url,
+        text_lines,
+        manifest.files,
+        index_context=index_context,
+    )
+    embedding_stats = await hydrate_embeddings(
+        repo_url,
+        chunks,
+        index_context=index_context,
+    )
+    stored = await store_chunks(
+        repo_url,
+        chunks,
+        replace=True,
+        index_context=index_context,
+    )
     manifest_record = await store_repo_manifest(
         repo_url,
         manifest,
@@ -115,8 +190,8 @@ async def chunks_endpoint(repo_url: str, preview: int = 300):
             "text_line_count": len(text_lines),
             "text_lines_stored": text_lines_stored,
         },
+        index_context=index_context,
     )
-    stored = await store_chunks(repo_url, chunks, replace=True)
     return {
         "file_count": len(paths),
         "chunk_count": len(chunks),
@@ -160,7 +235,22 @@ async def manifest_endpoint(repo_url: str, persist: bool = True, limit: int = 20
     stored = None
     text_lines_stored = None
     if persist:
-        text_lines_stored = await store_repo_text_lines(repo_url, text_lines, manifest.files)
+        index_context = await prepare_repo_index(
+            repo_url,
+            manifest,
+            text_line_count=len(text_lines),
+            metadata={
+                "source": "manifest_endpoint",
+                "embedded": False,
+                "summary_generated": False,
+            },
+        )
+        text_lines_stored = await store_repo_text_lines(
+            repo_url,
+            text_lines,
+            manifest.files,
+            index_context=index_context,
+        )
         stored = await store_repo_manifest(
             repo_url,
             manifest,
@@ -171,6 +261,7 @@ async def manifest_endpoint(repo_url: str, persist: bool = True, limit: int = 20
                 "text_line_count": len(text_lines),
                 "text_lines_stored": text_lines_stored,
             },
+            index_context=index_context,
         )
 
     return {
