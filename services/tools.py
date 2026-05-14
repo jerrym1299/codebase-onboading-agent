@@ -406,7 +406,7 @@ UPDATE_REPO_PLAN_SQL = """
 @function_tool
 async def update_repo_startup_plan(
     repo_url: str,
-    plan: dict,
+    plan_json: str,
     change_summary: str = "",
 ) -> str:
     """Persist an updated per-repo startup plan for one repo in the current session.
@@ -424,7 +424,8 @@ async def update_repo_startup_plan(
          package has `path`, `framework`, `runtime`, `package_manager`,
          `external_tools[]`, `services[]`, `env_vars[]`, `steps[]`). Preserve
          every field you aren't changing — this replaces `plan` wholesale.
-      4. Call this tool. `repo_url` must be one of the repos in this session.
+      4. Serialise the plan to a JSON string and pass it as `plan_json`.
+         `repo_url` must be one of the repos in this session.
 
     `change_summary` is a one-line description of what changed, used only for
     the SSE event payload.
@@ -436,8 +437,12 @@ async def update_repo_startup_plan(
 
     if not repo_url or not repo_url.strip():
         return "ERROR: repo_url is empty."
+    try:
+        plan = json.loads(plan_json)
+    except json.JSONDecodeError as e:
+        return f"ERROR: plan_json is not valid JSON: {e}"
     if not isinstance(plan, dict) or not plan:
-        return "ERROR: plan must be a non-empty JSON object."
+        return "ERROR: plan_json must decode to a non-empty JSON object."
 
     repo_url = repo_url.rstrip("/")
 
