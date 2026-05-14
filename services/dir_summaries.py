@@ -25,7 +25,7 @@ def _client() -> OpenAI:
 # gpt-5.4: 1M context, 128k max output. Reserve 100k for output and
 # ~100k headroom for system prompt + formatting + tokenizer drift.
 MAX_INPUT_TOKENS = 800_000
-MAX_OUTPUT_TOKENS = 100_000
+MAX_OUTPUT_TOKENS = int(os.environ.get("DIR_SUMMARY_MAX_OUTPUT_TOKENS", "4096"))
 
 # o200k_base is the encoding family used since gpt-4o; safe default
 # while gpt-5.4 may not yet be registered in tiktoken's model table.
@@ -118,7 +118,7 @@ def generate_dir_summaries(
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": context},
             ],
-            max_tokens=MAX_OUTPUT_TOKENS,
+            max_completion_tokens=MAX_OUTPUT_TOKENS,
         )
         summary_text = resp.choices[0].message.content.strip()
 

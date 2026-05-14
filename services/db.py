@@ -759,6 +759,9 @@ async def update_repo_index_job_status(
         set_sql.append("started_at = COALESCE(started_at, NOW())")
     if status in {"complete", "failed", "cancelled"}:
         set_sql.append("completed_at = NOW()")
+    if status == "complete":
+        set_sql.append("error_code = NULL")
+        set_sql.append("error_message = NULL")
     if increment_attempt:
         set_sql.append("attempt_count = attempt_count + 1")
     if repo_index_id is not None:
