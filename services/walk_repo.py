@@ -8,7 +8,8 @@ SKIP_DIRS = {
 CODE_EXTS = (
     ".py", ".js", ".ts", ".jsx", ".tsx",
     ".html", ".css", ".scss",
-    ".json", ".yaml", ".yml",
+    ".json", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".conf",
+    ".env", ".env.example", ".env.sample", ".env.template",
     ".md", ".txt", ".csv",
     ".xls", ".xlsx", ".ppt", ".pptx",
 )

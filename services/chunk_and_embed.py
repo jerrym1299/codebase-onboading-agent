@@ -451,7 +451,9 @@ def extract_whole_file_chunk(source: bytes, file_path: str, chunk_type: str) -> 
 
 _JS_EXT_PARSERS = {".js": js_parser, ".jsx": js_parser, ".ts": ts_parser, ".tsx": tsx_parser}
 _WHOLE_FILE_TYPES = {
-    ".json": "config", ".yaml": "config", ".yml": "config",
+    ".json": "config", ".toml": "config", ".yaml": "config", ".yml": "config",
+    ".ini": "config", ".cfg": "config", ".conf": "config",
+    ".env": "config", ".example": "config", ".sample": "config", ".template": "config",
     ".css": "stylesheet",
     ".html": "markup", ".htm": "markup",
     ".sh": "shell",
@@ -477,7 +479,7 @@ def chunk_file_list(file_paths: list[str], *, embed: bool = True) -> list[CodeCh
     oversized chunks to fit the embedding model token limit.
 
     Supported extensions:
-      .py .js .jsx .ts .tsx .md .json .yaml .yml .css .html .sh
+      .py .js .jsx .ts .tsx .md .json .toml .yaml .yml .ini .cfg .conf .css .html .sh
     """
     all_chunks = []
     for path in file_paths:
