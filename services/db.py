@@ -10,7 +10,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 import psycopg
 from pgvector.psycopg import register_vector_async
@@ -20,10 +20,25 @@ from services.chunk_and_embed import CodeChunk, EMBEDDING_MODEL
 from services.exact_search import RepoTextLine
 from services.repo_manifest import RepoFileManifest, RepoManifest
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://postgres:postgres@postgres:5432/codebase_agent",
-)
+def _database_url_from_env() -> str:
+    if os.environ.get("DATABASE_URL"):
+        return os.environ["DATABASE_URL"]
+
+    host = os.environ.get("DATABASE_HOST")
+    password = os.environ.get("DATABASE_PASSWORD")
+    if host and password:
+        user = os.environ.get("DATABASE_USER", "postgres")
+        port = os.environ.get("DATABASE_PORT", "5432")
+        name = os.environ.get("DATABASE_NAME", "codebase_agent")
+        return (
+            f"postgresql://{quote_plus(user)}:{quote_plus(password)}"
+            f"@{host}:{port}/{quote_plus(name)}"
+        )
+
+    return "postgresql://postgres:postgres@postgres:5432/codebase_agent"
+
+
+DATABASE_URL = _database_url_from_env()
 logger = logging.getLogger(__name__)
 
 CODE_SEARCH_SQL = """

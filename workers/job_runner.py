@@ -19,7 +19,11 @@ def _git_output(repo_dir: str, *args: str) -> str | None:
     return result.stdout.strip() or None
 
 
-async def process_repo_index_job(job_id: str) -> dict:
+async def process_repo_index_job(
+    job_id: str,
+    *,
+    generate_summaries: bool = True,
+) -> dict:
     job = await get_repo_index_job(job_id)
     if job is None:
         raise ValueError(f"Unknown repo_index_job: {job_id}")
@@ -56,7 +60,7 @@ async def process_repo_index_job(job_id: str) -> dict:
             job_id=job_id,
             commit_sha=commit_sha,
             branch=branch,
-            generate_summaries=True,
+            generate_summaries=generate_summaries,
         )
         updated = await update_repo_index_job_status(
             job_id,
