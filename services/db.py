@@ -641,6 +641,9 @@ async def create_repo_index_job(
     repo_url: str | None = None,
     repo_connection_id: str | None = None,
     tenant_id: str | None = None,
+    provider: str | None = None,
+    default_branch: str | None = None,
+    installation_id: str | None = None,
     requested_by: str | None = None,
     trigger: str = "manual",
     target_ref: str | None = "HEAD",
@@ -656,6 +659,9 @@ async def create_repo_index_job(
         connection = await ensure_repo_connection(
             repo_url,
             tenant_id=tenant_id,
+            provider=provider,
+            default_branch=default_branch,
+            installation_id=installation_id,
             metadata=metadata,
         )
         repo_connection_id = connection["id"]
@@ -695,7 +701,8 @@ async def get_repo_index_job(job_id: str) -> dict | None:
         await cur.execute(
             """
             SELECT j.id, j.tenant_id, j.repo_connection_id, j.repo_index_id,
-                   c.repo_url, j.requested_by, j.trigger, j.target_ref,
+                   c.repo_url, c.provider, c.default_branch, c.installation_id,
+                   c.metadata, j.requested_by, j.trigger, j.target_ref,
                    j.target_commit_sha, j.status, j.attempt_count, j.priority,
                    j.started_at, j.completed_at, j.error_code, j.error_message,
                    j.metrics, j.created_at, j.updated_at
@@ -714,20 +721,24 @@ async def get_repo_index_job(job_id: str) -> dict | None:
         "repo_connection_id": str(row[2]),
         "repo_index_id": str(row[3]) if row[3] is not None else None,
         "repo_url": row[4],
-        "requested_by": row[5],
-        "trigger": row[6],
-        "target_ref": row[7],
-        "target_commit_sha": row[8],
-        "status": row[9],
-        "attempt_count": row[10],
-        "priority": row[11],
-        "started_at": _iso_or_none(row[12]),
-        "completed_at": _iso_or_none(row[13]),
-        "error_code": row[14],
-        "error_message": row[15],
-        "metrics": row[16] or {},
-        "created_at": row[17].isoformat(),
-        "updated_at": row[18].isoformat(),
+        "provider": row[5],
+        "default_branch": row[6],
+        "installation_id": row[7],
+        "repo_connection_metadata": row[8] or {},
+        "requested_by": row[9],
+        "trigger": row[10],
+        "target_ref": row[11],
+        "target_commit_sha": row[12],
+        "status": row[13],
+        "attempt_count": row[14],
+        "priority": row[15],
+        "started_at": _iso_or_none(row[16]),
+        "completed_at": _iso_or_none(row[17]),
+        "error_code": row[18],
+        "error_message": row[19],
+        "metrics": row[20] or {},
+        "created_at": row[21].isoformat(),
+        "updated_at": row[22].isoformat(),
     }
 
 

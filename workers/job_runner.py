@@ -1,9 +1,16 @@
 import os
 import subprocess
+from urllib.parse import urlparse
 
 from services.clone_repo import ensure_repo_dir
 from services.db import get_repo_index_job, update_repo_index_job_status
+from services.github_app import GitHubAppError, GitHubAppService
 from services.indexing import index_repo_path
+
+
+def _is_github_repo(repo_url: str) -> bool:
+    parsed = urlparse(repo_url)
+    return parsed.netloc.endswith("github.com")
 
 
 def _git_output(repo_dir: str, *args: str) -> str | None:
@@ -17,6 +24,28 @@ def _git_output(repo_dir: str, *args: str) -> str | None:
     except (OSError, subprocess.CalledProcessError):
         return None
     return result.stdout.strip() or None
+
+
+async def _github_clone_token_for_job(job: dict) -> str | None:
+    if not _is_github_repo(job["repo_url"]):
+        return None
+
+    metadata = job.get("repo_connection_metadata") or {}
+    installation_id = job.get("installation_id") or metadata.get("github_installation_id")
+    if not installation_id:
+        return None
+
+    repository_id = metadata.get("github_repository_id")
+    try:
+        token = await GitHubAppService().create_installation_access_token(
+            installation_id,
+            repository_id=repository_id,
+        )
+    except GitHubAppError as exc:
+        raise RuntimeError(
+            f"Failed to mint GitHub App installation token for installation {installation_id}"
+        ) from exc
+    return token.token
 
 
 async def process_repo_index_job(
@@ -36,9 +65,11 @@ async def process_repo_index_job(
             "cloning",
             increment_attempt=job["status"] != "cloning",
         )
+        github_token = await _github_clone_token_for_job(job)
         repo_dir = await ensure_repo_dir(
             job["repo_url"],
             base_dir=os.environ.get("REPO_WORKDIR", "/repos"),
+            github_token=github_token,
         )
         if repo_dir is None:
             raise RuntimeError(f"Failed to clone {job['repo_url']}")
