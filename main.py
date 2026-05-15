@@ -361,6 +361,8 @@ async def stream_session_events_endpoint(session_id: str):
     async def event_generator():
         try:
             yield f"data: {json.dumps({'type': 'data-session-status', 'status': row[0]})}\n\n"
+            if row[0] in {"ready", "failed", "ended"}:
+                return
             while True:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=900)
@@ -607,4 +609,3 @@ async def delete_app_plan_endpoint(repo_set_hash: str):
     """Delete a consolidated app-level plan row by its repo_set_hash."""
     report = await delete_app_plan_data(repo_set_hash)
     return report.to_dict()
-

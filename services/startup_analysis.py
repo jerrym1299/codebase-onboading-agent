@@ -49,7 +49,6 @@ LOCKFILE_NAMES = frozenset({"poetry.lock", "uv.lock", "Cargo.toml", "Gemfile"})
 
 INFRA_FILES = (
     "Dockerfile", "Procfile", "Makefile", "justfile",
-    ".tool-versions", ".nvmrc", ".python-version", ".ruby-version",
 )
 INFRA_GLOBS = ("Dockerfile.*", "docker-compose*.yml", "docker-compose*.yaml",
                "compose*.yml", "compose*.yaml")
@@ -625,5 +624,4 @@ def call_llm(bundle: ContextBundle) -> AnalysisResult:
         prompt_tokens=getattr(usage, "prompt_tokens", 0),
         completion_tokens=getattr(usage, "completion_tokens", 0),
     )
-
 

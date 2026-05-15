@@ -80,6 +80,8 @@ _INFRA_ALIASES = {
     "mysql": "mysql", "mariadb": "mysql",
     "redis": "redis",
     "elasticsearch": "elasticsearch", "elastic": "elasticsearch",
+    "sqlite": "other", "mongodb": "other", "mongo": "other",
+    "other": "other",
 }
 
 

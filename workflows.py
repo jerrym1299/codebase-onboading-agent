@@ -87,8 +87,23 @@ class CodebaseChatWorkflow:
             )
             return repo_url, repo_dir
 
-        results = await asyncio.gather(*[per_repo(u) for u in self._repo_urls])
-        self._repo_dirs = dict(results)
+        results = await asyncio.gather(
+            *[per_repo(u) for u in self._repo_urls],
+            return_exceptions=True,
+        )
+        successes: list[tuple[str, str]] = []
+        failures: list[str] = []
+        for repo_url, result in zip(self._repo_urls, results):
+            if isinstance(result, BaseException):
+                failures.append(f"{repo_url}: {result}")
+            else:
+                successes.append(result)
+        self._repo_dirs = dict(successes)
+        if failures:
+            raise RuntimeError(
+                "One or more repositories failed during pipeline setup: "
+                + "; ".join(failures)
+            )
 
         await workflow.execute_activity(
             build_graph_activity,
@@ -212,6 +227,16 @@ class CodebaseChatWorkflow:
                     await self._emit_pipeline_failed(
                         params.session_id, "recompute_pipeline", exc,
                     )
+                    self._status = "failed"
+                    await workflow.execute_activity(
+                        update_session_status_activity,
+                        SessionStatusParams(
+                            session_id=params.session_id, status="failed",
+                        ),
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                    continue
                 self._status = "ready"
                 await workflow.execute_activity(
                     update_session_status_activity,
