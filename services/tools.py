@@ -18,7 +18,7 @@ from temporalio.client import Client
 from services.chunk_and_embed import embed_query
 from services.db import (
     CODE_SEARCH_SQL, DIR_SUMMARY_SEARCH_SQL, get_app_startup_plan_row, get_pool,
-    get_repo_boundaries_row, get_startup_plan_row,
+    get_repo_boundaries_row, get_startup_plan_row, search_repo_text_lines,
 )
 from services.startup_analysis import PLAN_JSON_SCHEMA
 
@@ -144,6 +144,36 @@ async def search_indexed(query: str, repo_url: str, k: int = 10) -> str:
             f"[{r[6]:.3f}] {r[0]} ({r[1]}: {r[2]}) L{r[3]}-{r[4]}\n{r[5][:500]}"
         )
     return "\n---\n".join(results) if results else "No matching chunks found."
+
+
+@function_tool
+async def search_exact_indexed(
+    query: str,
+    repo_url: str,
+    limit: int = 50,
+    regex: bool = False,
+    path: str = "",
+    language: str = "",
+) -> str:
+    """Search the indexed line inventory for exact strings or regexes."""
+    try:
+        rows = await search_repo_text_lines(
+            repo_url.rstrip("/"),
+            query,
+            regex=regex,
+            path=path,
+            language=language,
+            limit=limit,
+        )
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+
+    if not rows:
+        return "No exact matches found."
+    return "\n".join(
+        f"{row['file_path']}:{row['line_number']}: {row['line_text']}"
+        for row in rows
+    )
 
 
 @function_tool

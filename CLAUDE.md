@@ -36,20 +36,24 @@ One **Temporal workflow per session**, one **chat thread per workflow**, **N rep
 | `services/walk_repo.py` | Filtered file iteration (skips `node_modules`, `.git`, build dirs; keeps source/markup/docs extensions). |
 | `services/chunk_and_embed.py` | Tree-sitter AST chunking for Python/JS/TS/TSX, markdown heading split, whole-file fallback for config/HTML/CSS/shell. Token-budget splitter + OpenAI batch embedding. |
 | `services/dir_summaries.py` | LLM-generated (`gpt-5.4`) per-directory natural-language summaries, then embedded for high-level semantic browsing. |
-| `services/db.py` | Postgres + pgvector pool, schema bootstrap, upserts and getters for `code_chunks`, `dir_summaries`, `sessions`, `session_repos`, `startup_plans`, `repo_boundaries`, `app_startup_plans`. |
+| `services/db.py` | Postgres + pgvector pool, schema bootstrap, upserts and getters for repo connections, index jobs, content-addressed manifests, exact-search lines, sessions, startup plans, repo boundaries, and app startup plans. |
+| `services/exact_search.py` | Builds line-level exact-search inventories from the content-addressed manifest. |
+| `services/embedding_cache.py` | Hydrates and stores cached embeddings keyed by repo + embedding hash. |
+| `services/repo_manifest.py` | Builds stable file and chunk manifests for incremental indexing. |
+| `services/indexing.py` | Shared manifest/cache-aware indexing entrypoint used by Temporal activities and workers. |
 | `services/startup_analysis.py` | Builds a curated context bundle (`README`, manifests, env templates, infra/CI files, top-level skeleton; budget-capped at ~32k chars), calls OpenAI (`STARTUP_ANALYSIS_MODEL`, default `gpt-5.4`) with a JSON-schema-constrained response → produces the `startup_plans.plan` JSON. |
 | `services/boundary_extractor.py` | Pydantic `BoundaryReport` schema (exposed/consumed HTTP, consumed DB, dev_proxy, required_services, ambiguities) + the developer-prompt builder used by `extract_boundaries_activity`. |
 | `services/dependency_graph.py` | Deterministic cross-repo matcher (no LLM). Parses orchestration files, dedupes infra nodes by `(kind, target_env)`, matches HTTP edges by port+path then env-name fallback, classifies hard vs soft, runs `graphlib.TopologicalSorter` over hard edges, and breaks cycles by demoting hard edges. Returns a typed `DependencyGraph`. |
 | `services/pdf_output.py` | `write_markdown_pdf` — converts the consolidated app-level markdown to PDF (used by `POST /sessions/:id/startup-plan/export`). |
-| `services/tools.py` | Function tools exposed to the agents (file/code search, semantic search, references, deps, git log, `ask_user`, `get_startup_plan`, `recompute_startup_plan`, `get_repo_startup_plan`, `get_repo_boundaries`, `get_app_startup_plan`). Owns the `current_session_id` ContextVar. |
+| `services/tools.py` | Function tools exposed to the agents (file/code search, exact search, semantic search, references, deps, git log, `ask_user`, `get_startup_plan`, `recompute_startup_plan`, `get_repo_startup_plan`, `get_repo_boundaries`, `get_app_startup_plan`). Owns the `current_session_id` ContextVar. |
 | `services/event_bus.py` | In-process per-session asyncio `Queue` fan-out used to bridge the activity → SSE response. |
 | `scripts/` | Manual debugging helpers (`show_chunks.py`, `show_ast.py`, `test_ask_question.py`, `test_startup_plan.py`, `test_dependency_graph.py`). |
 
 ## Vector indexing pipeline
 
-All embeddings — for chunks, directory summaries, and live queries — use OpenAI `text-embedding-3-large` (3072-dim, stored as pgvector `halfvec(3072)`). Tokenisation budget is enforced with `tiktoken.encoding_for_model("text-embedding-3-large")`. The 7500-token cap on `embedding_text` leaves headroom under the model's 8191-token limit.
+All embeddings — for chunks, directory summaries, and live queries — use OpenAI `text-embedding-3-large` (3072-dim, stored as pgvector `halfvec(3072)`). Tokenisation budget is enforced with `tiktoken.encoding_for_model("text-embedding-3-large")`; ordinary chunks target a smaller window and hard-fail before provider calls if anything still exceeds the model limit.
 
-Indexing happens once per repo, on first session creation, inside `index_repo_activity`. It is **idempotent**: if `code_chunks` already has rows for the `repo_url`, the activity returns early.
+Indexing runs through `index_repo_activity`. Each run builds a content-addressed file/chunk manifest, reuses cached embeddings keyed by `embedding_sha256`, embeds only misses, and skips directory-summary regeneration when the manifest is unchanged.
 
 1. **Clone** (`services/clone_repo.py::ensure_repo_dir`) — clones into `/repos/<repo_name>` if not already present; reuses the directory across sessions of the same repo. Tokens are stripped from any error logs.
 2. **Walk** (`services/walk_repo.py::collect_file_paths`) — depth-first walk skipping vendored/build dirs (`node_modules`, `.next`, `dist`, …) and keeping source + markup + docs extensions only.
@@ -57,14 +61,15 @@ Indexing happens once per repo, on first session creation, inside `index_repo_ac
    - **Python** (`extract_chunks_from_file`): module docstring, grouped imports block, top-level functions (incl. decorated), classes. Classes <60 lines stay whole; larger classes split into a header chunk + one chunk per method (with `parent_class` set).
    - **JS/JSX/TS/TSX** (`extract_js_chunks`): top-level functions, classes, interfaces, type aliases, enums, lexical/variable declarations. `export` wrappers are unwrapped to inspect the inner declaration. Imports are grouped into one chunk. Files with no extractable top-level decls (mostly JSX) fall back to a single whole-file chunk.
    - **Markdown** (`extract_markdown_chunks`): split on `#`/`##`/`###` headings into named sections.
-   - **JSON / YAML / CSS / HTML / shell** (`extract_whole_file_chunk`): treated as one chunk per file with a typed label (`config`, `stylesheet`, `markup`, `shell`).
-4. **Token-budget split** (`split_oversized`) — any chunk whose `embedding_text` exceeds `MAX_TOKENS = 7500` is recut at line boundaries with `OVERLAP_LINES = 5` overlap, preserving `chunk_type`, `name`, `parent_class` and recording `part N` in the name.
-5. **Prefix + embed** — each chunk's `embedding_text` is `"# File: <path>\n# Class: <parent>\n# <chunk_type>: <name>\n<content>"`. Chunks are batched into `client.embeddings.create(model="text-embedding-3-large")` → 3072-dim vectors.
-6. **Upsert** (`services/db.py::store_chunks`) — `INSERT … ON CONFLICT ON CONSTRAINT code_chunks_unique` on `(repo_url, file_path, start_line, chunk_type, name)` (NULLS NOT DISTINCT) so re-indexing rewrites in place.
-7. **Directory summaries** (`services/dir_summaries.py::generate_dir_summaries`) — group files by parent dir, build a compact context (file list + first 40 lines of each, capped at 12k chars), call `gpt-5.4` with a senior-engineer summarisation prompt, embed the result, upsert into `dir_summaries`.
-8. **Startup analysis** (`services/startup_analysis.py` → `analyze_startup_activity`) — separately, after indexing, build a curated context bundle (`README`, manifests, env templates, infra/CI files, top-level skeleton), call `gpt-5.4` with a JSON-schema-constrained completion, persist into `startup_plans`. Idempotent on `repo_url` unless `force=True`.
+   - **JSON / TOML / YAML / INI / env / CSS / HTML / shell** (`extract_whole_file_chunk`): treated as one chunk per file with a typed label (`config`, `stylesheet`, `markup`, `shell`).
+4. **Token-budget split** (`split_oversized`) — chunks are recut at line or token boundaries with overlap, preserving `chunk_type`, `name`, `parent_class` and recording `part N` in the name.
+5. **Manifest + exact lines + cache** (`services/repo_manifest.py`, `services/exact_search.py`, `services/embedding_cache.py`) — compute relative-path file hashes, stable chunk hashes, embedding hashes, and a non-empty line inventory. Cached embeddings are hydrated before new embedding calls.
+6. **Prefix + embed** — each chunk's `embedding_text` is `"# File: <relative path>\n# Class: <parent>\n# <chunk_type>: <name>\n<content>"`. Cache misses are batched into `client.embeddings.create(model="text-embedding-3-large")` → 3072-dim vectors.
+7. **Upsert** (`services/db.py::store_chunks`, `store_repo_text_lines`) — chunks upsert by `(repo_url, chunk_sha256)`, stale chunks are pruned on replacement indexes, and exact-search lines are rewritten only for files whose content hash changed.
+8. **Directory summaries** (`services/dir_summaries.py::generate_dir_summaries`) — group files by parent dir, build a compact context, call the summary model, embed the result, upsert into `dir_summaries`.
+9. **Startup analysis** (`services/startup_analysis.py` → `analyze_startup_activity`) — after indexing, build a curated context bundle, call `gpt-5.4` with a JSON-schema-constrained completion, persist into `startup_plans`. Idempotent on `repo_url` unless `force=True`.
 
-**Querying.** Both vector tables use `hnsw (embedding halfvec_cosine_ops)`. Lookups are `1 - (embedding <=> query_vec::halfvec)` cosine similarity, scoped by `repo_url`. The query is embedded with the same `text-embedding-3-large` model via `embed_query` so vectors live in the same space.
+**Querying.** Vector tables use HNSW halfvec cosine indexes. Lookups are `1 - (embedding <=> query_vec)` cosine similarity, scoped by `repo_url`. The query is embedded with the same `text-embedding-3-large` model via `embed_query` so vectors live in the same space. Exact lookup uses `repo_text_lines` with pg_trgm-backed substring search or case-insensitive Postgres regex, also scoped by `repo_url`.
 
 ## Agents
 
@@ -123,7 +128,8 @@ All seven agents are `openai-agents` SDK `Agent` objects on `gpt-5.4` with `mode
 |---|---|---|
 | `list_files` | `(dir_path, glob="**/*") -> list[str]` | Glob the local clone. |
 | `read_file` | `(file_path, start_line=0, end_line=-1) -> str` | Read full file or slice; rejects directories. |
-| `search_code` | `(dir_path, query, file_type="") -> list[str]` | Regex over file contents → `file:line` results, optionally filtered by extension. |
+| `search_code` | `(dir_path, query, file_type="") -> list[str]` | Regex over local clone contents → `file:line` results, optionally filtered by extension. |
+| `search_exact_indexed` | `(query, repo_url, limit=50, regex=False, path="", language="") -> str` (async) | Exact string or regex over persisted line inventory → `file:line: text` results. |
 | `find_references` | `(symbol, dir_path) -> list[str]` | Same regex shape as `search_code`, framed as "where is symbol used". |
 | `get_dependencies` | `(file_path) -> list[str]` | Extract imports — `import X from "y"` / `require()` / `import()` for JS, `from X import` / `import X` for Python. |
 | `search_indexed` | `(query, repo_url, k=10) -> str` (async) | Embed query + cosine similarity over `code_chunks`, returns top-k formatted blocks `[score] path (type: name) Lstart-end\n<content>`. |
@@ -140,8 +146,17 @@ All seven agents are `openai-agents` SDK `Agent` objects on `gpt-5.4` with `mode
 
 | Table | Purpose | Key fields |
 |---|---|---|
-| `code_chunks` | AST-level chunks + 3072-dim `halfvec` embeddings, hnsw cosine index. | `repo_url`, `file_path`, `chunk_type`, `name`, `parent_class`, `start_line`, `end_line`, `content`, `embedding halfvec(3072)`. Unique on `(repo_url, file_path, start_line, chunk_type, name)` NULLS NOT DISTINCT. |
-| `dir_summaries` | LLM-summarised directories + 3072-dim `halfvec` embeddings, hnsw cosine index. | `dir_path`, `summary`, `file_list TEXT[]`, `embedding halfvec(3072)`. Unique on `(repo_url, dir_path)`. |
+| `tenants` | Customer/workspace owner for indexed source and learned facts. | `slug`, `name`, `plan`. |
+| `repo_connections` | Tenant-scoped repo connection metadata. | `tenant_id`, `provider`, `repo_url`, `default_branch`, `installation_id`, `metadata`. |
+| `repo_indexes` / `repo_latest_indexes` | Versioned repo index records and latest serving pointer. | `repo_connection_id`, `manifest_sha256`, `commit_sha`, `branch`, counts, status. |
+| `repo_index_jobs` | Durable indexing job state. | `repo_connection_id`, `status`, `attempt_count`, `target_ref`, `metrics`, error fields. |
+| `code_chunks` | AST-level chunks + 3072-dim embeddings. HNSW halfvec cosine index. | `repo_url`, `file_path`, `chunk_sha256`, `embedding_sha256`, `chunk_type`, `name`, `parent_class`, `start_line`, `end_line`, `content`, `embedding`. Upserts by `(repo_url, chunk_sha256)` when hashes are available. |
+| `dir_summaries` | LLM-summarised directories + embeddings. | `dir_path`, `summary`, `file_list TEXT[]`, `embedding`. Unique on `(repo_url, dir_path)`. |
+| `repo_index_runs` | Append-only manifest history. | `repo_url`, `manifest_sha256`, `file_count`, `chunk_count`, `metadata jsonb`, `created_at`. |
+| `repo_files` | Latest file inventory. | `repo_url`, `file_path`, `file_sha256`, `size_bytes`, `language`, generated/vendor flags. |
+| `repo_text_lines` | Latest non-empty line inventory for exact lookup. | `repo_url`, `file_path`, `file_sha256`, `language`, `line_number`, `line_text`. |
+| `repo_chunk_manifests` | Latest chunk inventory. | `repo_url`, `chunk_sha256`, `embedding_sha256`, `file_path`, `file_sha256`, line range, token count. |
+| `repo_embedding_cache` | Repo-scoped embedding cache. | `repo_url`, `embedding_sha256`, `embedding_model`, `embedding`, `last_used_at`. |
 | `sessions` | One row per chat session. | `id uuid`, `status (indexing\|ready\|ended)`, `app_plan_hash` (FK-style pointer into `app_startup_plans`), `created_at`, `last_seen_at`. |
 | `session_repos` | N rows per session — one per repo in the session. | PK `(session_id, repo_url)`. |
 | `messages` | Persisted chat transcript (the source of truth for the **frontend**). | `role (user\|assistant\|system\|tool)`, `parts jsonb` (AI-SDK-v6 UI Message parts so the FE renders directly). |
@@ -176,9 +191,11 @@ Do not try to unify them; they have different consumers.
 **Exploratory / debug endpoints (no session, direct one-shot):**
 - `GET /walkrepo` — flat tree dump.
 - `GET /chunks` — clone + chunk + store, returns chunk metadata + previews.
+- `GET /manifest` — clone + chunk without embeddings, persists file/chunk/line inventories when `persist=true`.
 - `GET /ast` — tree-sitter AST dump for source files.
 - `GET /explore` — one-shot run of `explorer_agent` with `Runner.run` (not streamed).
 - `GET /search` — direct cosine search over `code_chunks`. `query` is read raw via `_raw_query_param` so `%`/special chars are kept literal.
+- `GET /search-exact` — direct exact string or regex search over `repo_text_lines`; supports `limit`, `regex`, `path`, and `language`.
 
 ## Streaming protocol
 
@@ -217,7 +234,7 @@ If the turn ends with an open `pending_actions` row, `agent_turn_activity` retur
 | Activity | Params | `start_to_close` | Retry attempts | Purpose |
 |---|---|---|---|---|
 | `clone_repo_activity` | `CloneParams(repo_url, session_id)` | 120s | 3 | `ensure_repo_dir`; raises if clone fails. Publishes `data-repo-progress`. |
-| `index_repo_activity` | `IndexParams(repo_url, repo_dir, session_id)` | 600s | 2 | Walk → AST chunk → embed → `store_chunks` → `generate_dir_summaries` → `store_dir_summaries`. Idempotent: returns early if `code_chunks` already has rows for `repo_url`. Publishes `data-repo-progress`. |
+| `index_repo_activity` | `IndexParams(repo_url, repo_dir, session_id)` | 600s | 2 | Walk → AST chunk → manifest → exact line inventory → hydrate embedding cache → embed misses → `store_chunks` → regenerate summaries only when the manifest changed. Publishes `data-repo-progress`. |
 | `analyze_startup_activity` | `AnalyzeStartupParams(session_id, repo_url, repo_dir, force=False)` | 120s | 2 | `build_context` → `call_llm` (`gpt-5.4`, JSON-schema-constrained) → `upsert_startup_plan`. Idempotent unless `force=True`; publishes `data-startup-plan-updated` either way. |
 | `extract_boundaries_activity` | `ExtractBoundariesParams(session_id, repo_url, repo_dir)` | 240s | 2 | Run `boundary_extractor_agent` (with the per-repo startup plan as prior context) → `BoundaryReport` → `upsert_repo_boundaries`. On agent failure, persists an empty report with `analysis_status='failed'`. |
 | `build_graph_activity` | `BuildGraphParams(session_id, repo_set_hash, repo_urls, repo_dirs)` | 60s | 2 | Pure-code matcher. Loads every repo's `repo_boundaries` + `startup_plans`, calls `services/dependency_graph.py::build_graph`, persists into `app_startup_plans` with placeholder `plan_markdown=""` and `analysis_status='partial'`. Publishes `data-graph-built`. |
@@ -246,7 +263,7 @@ If the turn ends with an open `pending_actions` row, `agent_turn_activity` retur
 2. `_run_pipeline(force=False)`:
    - `asyncio.gather` over each `repo_url`:
      1. `clone_repo_activity(CloneParams(repo_url, session_id))` → repo dir.
-     2. `index_repo_activity(IndexParams(repo_url, repo_dir, session_id))` (skipped fast-path if already indexed).
+     2. `index_repo_activity(IndexParams(repo_url, repo_dir, session_id))` (manifest/cache-aware incremental path).
      3. `analyze_startup_activity(AnalyzeStartupParams(session_id, repo_url, repo_dir, force))` (skipped fast-path if a `startup_plans` row already exists unless `force`).
      4. `extract_boundaries_activity(ExtractBoundariesParams(session_id, repo_url, repo_dir))`.
    - `build_graph_activity(BuildGraphParams(session_id, repo_set_hash, repo_urls, repo_dirs))` — deterministic matcher.
@@ -262,7 +279,7 @@ If the turn ends with an open `pending_actions` row, `agent_turn_activity` retur
 - **No comments** unless the *why* is non-obvious. Names should carry the meaning.
 - **Activity params are dataclasses** so Temporal can (de)serialise cleanly.
 - **Workflow determinism** — no I/O or wall-clock logic inside `@workflow.run`; everything is an activity.
-- **Idempotency at boundaries** — `ensure_repo_dir` short-circuits if the clone exists; `index_repo_activity` skips if `code_chunks` already has rows for the `repo_url`; all schema uses `IF NOT EXISTS`; unique constraints back upserts.
+- **Idempotency at boundaries** — `ensure_repo_dir` short-circuits if the clone exists; `index_repo_activity` hashes the current repo state, reuses cached embeddings, and skips summary regeneration when the manifest is unchanged; all schema uses `IF NOT EXISTS`; unique constraints back upserts.
 - **`repo_url` is always `.rstrip('/')`-normalised** at the HTTP boundary before touching the DB.
 - **Session id propagation** — `agent_turn_activity` sets `current_session_id` (a `ContextVar`) so deep-down tools like `ask_user` can locate their session without the agent having to pass it explicitly.
 

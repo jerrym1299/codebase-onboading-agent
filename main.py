@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 
 from agents import Runner
 from agents.exceptions import MaxTurnsExceeded
@@ -32,13 +33,19 @@ from activities import (
 from services.chunk_and_embed import AST_PARSERS, chunk_file_list, dump_ast, embed_query
 from services.clone_repo import ensure_repo_dir
 from services.db import (
-    CODE_SEARCH_SQL, close_pool, get_app_startup_plan_row, get_pool,
-    get_repo_boundaries_row, get_session_repo_urls, get_startup_plan_row,
-    init_schema, insert_session_repos, store_chunks, get_dir_summaries_for_repo,
+    CODE_SEARCH_SQL, close_pool, create_repo_index_job, ensure_repo_connection,
+    get_app_startup_plan_row, get_dir_summaries_for_repo, get_pool,
+    get_repo_boundaries_row, get_repo_index_job, get_session_repo_urls,
+    get_startup_plan_row, init_schema, insert_session_repos, prepare_repo_index,
+    search_repo_text_lines, store_chunks, store_repo_manifest,
+    store_repo_text_lines,
 )
 from services.cleanup import delete_app_plan_data, delete_repo_data, delete_session_data
+from services.embedding_cache import hydrate_embeddings
+from services.exact_search import build_text_lines
 from services.event_bus import subscribe, unsubscribe
 from services.pdf_output import write_markdown_pdf
+from services.repo_manifest import build_repo_manifest
 from services.walk_repo import collect_file_paths, walk_repo
 from workflows import CodebaseChatWorkflow
 
@@ -97,6 +104,61 @@ def read_root():
     return {"Hello": "world"}
 
 
+@app.get("/health")
+def health_endpoint():
+    return {"status": "ok"}
+
+
+@app.post("/repo-connections")
+async def create_repo_connection_endpoint(payload: dict):
+    repo_url = (payload or {}).get("repo_url", "").rstrip("/")
+    if not repo_url:
+        return JSONResponse(status_code=400, content={"error": "Missing 'repo_url'."})
+    metadata = (payload or {}).get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return JSONResponse(status_code=400, content={"error": "'metadata' must be an object."})
+    connection = await ensure_repo_connection(
+        repo_url,
+        tenant_id=(payload or {}).get("tenant_id"),
+        provider=(payload or {}).get("provider"),
+        default_branch=(payload or {}).get("default_branch"),
+        installation_id=(payload or {}).get("installation_id"),
+        metadata=metadata,
+    )
+    return connection
+
+
+@app.post("/repo-index-jobs")
+async def create_repo_index_job_endpoint(payload: dict):
+    payload = payload or {}
+    try:
+        job = await create_repo_index_job(
+            repo_url=(payload.get("repo_url") or "").rstrip("/") or None,
+            repo_connection_id=payload.get("repo_connection_id"),
+            tenant_id=payload.get("tenant_id"),
+            provider=payload.get("provider"),
+            default_branch=payload.get("default_branch"),
+            installation_id=payload.get("installation_id"),
+            requested_by=payload.get("requested_by"),
+            trigger=payload.get("trigger") or "manual",
+            target_ref=payload.get("target_ref") or "HEAD",
+            target_commit_sha=payload.get("target_commit_sha"),
+            priority=int(payload.get("priority") or 100),
+            metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else None,
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return JSONResponse(status_code=202, content=job)
+
+
+@app.get("/repo-index-jobs/{job_id}")
+async def get_repo_index_job_endpoint(job_id: str):
+    job = await get_repo_index_job(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"error": "Job not found."})
+    return job
+
+
 @app.get("/walkrepo")
 async def walkrepo_endpoint(repo_url: str):
     repo_dir = await ensure_repo_dir(repo_url)
@@ -113,12 +175,52 @@ async def chunks_endpoint(repo_url: str, preview: int = 300):
     if repo_dir is None:
         return CLONE_FAILED
     paths = await collect_file_paths(repo_dir)
-    chunks = chunk_file_list(paths)
-    stored = await store_chunks(repo_url, chunks)
+    chunks = chunk_file_list(paths, embed=False)
+    manifest = build_repo_manifest(repo_dir, paths, chunks)
+    text_lines = build_text_lines(repo_dir, manifest)
+    index_context = await prepare_repo_index(
+        repo_url,
+        manifest,
+        text_line_count=len(text_lines),
+        metadata={"source": "chunks_endpoint"},
+    )
+    text_lines_stored = await store_repo_text_lines(
+        repo_url,
+        text_lines,
+        manifest.files,
+        index_context=index_context,
+    )
+    embedding_stats = await hydrate_embeddings(
+        repo_url,
+        chunks,
+        index_context=index_context,
+    )
+    stored = await store_chunks(
+        repo_url,
+        chunks,
+        replace=True,
+        index_context=index_context,
+    )
+    manifest_record = await store_repo_manifest(
+        repo_url,
+        manifest,
+        metadata={
+            "source": "chunks_endpoint",
+            "embeddings": embedding_stats,
+            "summary_generated": False,
+            "text_line_count": len(text_lines),
+            "text_lines_stored": text_lines_stored,
+        },
+        index_context=index_context,
+    )
     return {
         "file_count": len(paths),
         "chunk_count": len(chunks),
         "stored": stored,
+        "text_line_count": len(text_lines),
+        "text_lines_stored": text_lines_stored,
+        "manifest": manifest_record,
+        "embeddings": embedding_stats,
         "chunks": [
             {
                 "index": i,
@@ -134,6 +236,65 @@ async def chunks_endpoint(repo_url: str, preview: int = 300):
             }
             for i, c in enumerate(chunks)
         ],
+    }
+
+
+@app.get("/manifest")
+async def manifest_endpoint(repo_url: str, persist: bool = True, limit: int = 200):
+    """Clone -> collect paths -> chunk without embeddings -> return/persist manifest."""
+    repo_url = repo_url.rstrip("/")
+    repo_dir = await ensure_repo_dir(repo_url)
+    if repo_dir is None:
+        return CLONE_FAILED
+
+    paths = await collect_file_paths(repo_dir)
+    chunks = chunk_file_list(paths, embed=False)
+    manifest = build_repo_manifest(repo_dir, paths, chunks)
+    text_lines = build_text_lines(repo_dir, manifest)
+    limit = max(0, min(limit, 1000))
+
+    stored = None
+    text_lines_stored = None
+    if persist:
+        index_context = await prepare_repo_index(
+            repo_url,
+            manifest,
+            text_line_count=len(text_lines),
+            metadata={
+                "source": "manifest_endpoint",
+                "embedded": False,
+                "summary_generated": False,
+            },
+        )
+        text_lines_stored = await store_repo_text_lines(
+            repo_url,
+            text_lines,
+            manifest.files,
+            index_context=index_context,
+        )
+        stored = await store_repo_manifest(
+            repo_url,
+            manifest,
+            metadata={
+                "source": "manifest_endpoint",
+                "embedded": False,
+                "summary_generated": False,
+                "text_line_count": len(text_lines),
+                "text_lines_stored": text_lines_stored,
+            },
+            index_context=index_context,
+        )
+
+    return {
+        "repo_url": repo_url,
+        "manifest_sha256": manifest.manifest_sha256,
+        "file_count": len(manifest.files),
+        "chunk_count": len(manifest.chunks),
+        "text_line_count": len(text_lines),
+        "text_lines_stored": text_lines_stored,
+        "stored": stored,
+        "files": [asdict(f) for f in manifest.files[:limit]],
+        "chunks": [asdict(c) for c in manifest.chunks[:limit]],
     }
 
 
@@ -210,9 +371,35 @@ async def search_endpoint(repo_url: str, request: Request, k: int = 10):
         ],
     }
 
+@app.get("/search-exact")
+async def search_exact_endpoint(
+    repo_url: str,
+    request: Request,
+    limit: int = 50,
+    regex: bool = False,
+    path: str = "",
+    language: str = "",
+):
+    query = _raw_query_param(request, "query")
+    if not query:
+        return {"error": "Missing 'query' parameter."}
+    repo_url = repo_url.rstrip("/")
+    try:
+        results = await search_repo_text_lines(
+            repo_url,
+            query,
+            regex=regex,
+            path=path,
+            language=language,
+            limit=limit,
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return {"results": results}
+
+
 def _compute_repo_set_hash(repo_urls: list[str]) -> str:
     return hashlib.sha256("\n".join(sorted(repo_urls)).encode("utf-8")).hexdigest()
-
 
 @app.post("/sessions")
 async def create_session_endpoint(payload: dict):

@@ -18,19 +18,17 @@ from services.boundary_extractor import BoundaryReport, build_developer_prompt
 from services.clone_repo import ensure_repo_dir
 from services.dependency_graph import build_graph
 from services.event_bus import publish
+from services.indexing import index_repo_path
 from services.tools import current_session_id
-from services.walk_repo import collect_file_paths
-from services.chunk_and_embed import chunk_file_list
 from services.db import (
     get_app_startup_plan_row, get_pool, get_repo_boundaries_row, get_session_repo_urls,
-    get_startup_plan_row, store_chunks, store_dir_summaries, upsert_app_startup_plan,
-    upsert_repo_boundaries, upsert_startup_plan,
+    get_startup_plan_row, upsert_app_startup_plan, upsert_repo_boundaries,
+    upsert_startup_plan,
 )
 
 from services.startup_analysis import (
     ANALYSIS_MODEL, build_context, call_llm,
 )
-from services.dir_summaries import generate_dir_summaries
 
 SESSION_DB_PATH = os.environ.get("AGENT_SESSION_DB", "agent_sessions.db")
 
@@ -150,85 +148,29 @@ async def clone_repo_activity(params: CloneParams) -> str:
 
 @activity.defn
 async def index_repo_activity(params: IndexParams) -> int:
-    """Chunk and embed the repo into pgvector. Returns chunk count. Skips if already indexed."""
+    """Run the manifest/cache-aware repo indexing path for one session repo."""
     try:
         await publish(params.session_id, {
             "type": "data-repo-progress",
             "repo_url": params.repo_url,
             "stage": "indexing",
         })
-        pool = await get_pool()
-        async with pool.connection() as conn, conn.cursor() as cur:
-            await cur.execute(
-                "SELECT count(*) FROM code_chunks WHERE repo_url = %s",
-                (params.repo_url,),
-            )
-            count = (await cur.fetchone())[0]
-        if count > 0:
-            await publish(params.session_id, {
-                "type": "data-repo-progress",
-                "repo_url": params.repo_url,
-                "stage": "indexed",
-                "skipped": True,
-                "chunks": count,
-            })
-            return count
-
-        paths = await collect_file_paths(params.repo_dir)
-        await publish(params.session_id, {
-            "type": "data-repo-progress",
-            "repo_url": params.repo_url,
-            "stage": "walked",
-            "file_count": len(paths),
-        })
-
-        chunks = chunk_file_list(paths)
-        await publish(params.session_id, {
-            "type": "data-repo-progress",
-            "repo_url": params.repo_url,
-            "stage": "chunked",
-            "chunk_count": len(chunks),
-        })
-
-        await store_chunks(params.repo_url, chunks)
-        await publish(params.session_id, {
-            "type": "data-repo-progress",
-            "repo_url": params.repo_url,
-            "stage": "chunks_stored",
-            "chunk_count": len(chunks),
-        })
-
-        activity.logger.info("Generating per-directory summaries for %s", params.repo_url)
-
-        async def _publish_dir_progress(done: int, total: int, dir_path: str) -> None:
-            await publish(params.session_id, {
-                "type": "data-repo-progress",
-                "repo_url": params.repo_url,
-                "stage": "summarising_dirs",
-                "done": done,
-                "total": total,
-                "dir_path": dir_path,
-            })
-
-        dir_sums = await generate_dir_summaries(
-            chunks, params.repo_dir, on_progress=_publish_dir_progress,
+        result = await index_repo_path(
+            repo_url=params.repo_url,
+            repo_dir=params.repo_dir,
+            source="index_repo_activity",
+            generate_summaries=True,
         )
-        await store_dir_summaries(params.repo_url, dir_sums)
-        activity.logger.info("Stored %d directory summaries", len(dir_sums))
-        await publish(params.session_id, {
-            "type": "data-repo-progress",
-            "repo_url": params.repo_url,
-            "stage": "dir_summaries_stored",
-            "summary_count": len(dir_sums),
-        })
-
         await publish(params.session_id, {
             "type": "data-repo-progress",
             "repo_url": params.repo_url,
             "stage": "indexed",
-            "chunks": len(chunks),
+            "chunks": result["chunk_count"],
+            "file_count": result["file_count"],
+            "summary_count": result["summary_count"],
+            "manifest_sha256": result["manifest_sha256"],
         })
-        return len(chunks)
+        return result["chunk_count"]
     except Exception as exc:
         await publish(params.session_id, {
             "type": "data-repo-error",

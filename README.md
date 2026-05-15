@@ -12,7 +12,8 @@ this project.
 
 - Creates one chat session per GitHub repository.
 - Uses Temporal to run durable clone, indexing, and chat-turn workflow steps.
-- Stores source chunks and directory summaries in Postgres with pgvector.
+- Stores source chunks, file inventories, exact line search, and directory
+  summaries in Postgres with pgvector.
 - Streams agent responses over Server-Sent Events using AI SDK style message
   parts.
 - Supports human-in-the-loop clarification through pending actions.
@@ -119,10 +120,19 @@ curl -s http://localhost:8001/sessions/<session_id>/messages
 - Repo clones are stored under `/repos/<repo_name>` inside the running
   environment.
 - The OpenAI Agents SDK session store defaults to `agent_sessions.db`.
-- Indexing is idempotent for a `repo_url`: if chunks already exist, the workflow
-  skips re-indexing.
-- Debug endpoints include `/walkrepo`, `/chunks`, `/ast`, `/explore`, and
-  `/search`.
+- Indexing stores a content-addressed manifest, exact line-search inventory,
+  cached embeddings for unchanged chunks, and tenant/repo/index/job metadata.
+- Debug endpoints include `/walkrepo`, `/chunks`, `/manifest`, `/ast`,
+  `/explore`, `/search`, and `/search-exact`.
+- Phase 1 indexing job endpoints are `/repo-connections`, `/repo-index-jobs`,
+  and `/repo-index-jobs/<job_id>`.
+- Run one queued indexing job locally with
+  `python -m workers.index_one --job-id <job_id>` inside the FastAPI runtime.
+- Run `python3 scripts/eval_indexing.py` against the Docker stack to validate
+  manifest stability, DB persistence, exact search, and embedding-cache
+  behavior.
+- Add `--with-openai` to that eval when the FastAPI container has an
+  `OPENAI_API_KEY`; it validates real embeddings and vector search.
 
 ## Future Work
 

@@ -4,22 +4,25 @@ using gpt-5.4 over the already-extracted code chunks, then embed them
 for semantic search.
 """
 
+import asyncio
 import logging
 import os
 from collections import defaultdict
 from typing import Awaitable, Callable
-import asyncio
+
 import tiktoken
 from openai import AsyncOpenAI
 
-from services.chunk_and_embed import CodeChunk
+from services.chunk_and_embed import CodeChunk, EMBEDDING_MODEL, embed_texts
 from services.db import DirSummary
 
 client = AsyncOpenAI()
 logger = logging.getLogger(__name__)
 
+# gpt-5.4: 1M context, 128k max output. Reserve 100k for output and
+# ~100k headroom for system prompt + formatting + tokenizer drift.
 MAX_INPUT_TOKENS = 800_000
-MAX_OUTPUT_TOKENS = 10_000
+MAX_OUTPUT_TOKENS = int(os.environ.get("DIR_SUMMARY_MAX_OUTPUT_TOKENS", "4096"))
 
 # o200k_base is the encoding family used since gpt-4o; safe default
 # while gpt-5.4 may not yet be registered in tiktoken's model table.
@@ -40,18 +43,18 @@ def _build_dir_context(dir_path: str, dir_chunks: list[CodeChunk]) -> str:
     """Build a token-bounded context string for one directory by walking the
     chunks file-by-file, sorted by line, and stopping when the budget is hit."""
     by_file: dict[str, list[CodeChunk]] = defaultdict(list)
-    for c in dir_chunks:
-        by_file[c.file_path].append(c)
-    for cs in by_file.values():
-        cs.sort(key=lambda c: c.start_line)
+    for chunk in dir_chunks:
+        by_file[chunk.file_path].append(chunk)
+    for chunks in by_file.values():
+        chunks.sort(key=lambda chunk: chunk.start_line)
 
     parts: list[str] = [f"Directory: {dir_path}", f"Files ({len(by_file)}):"]
     used = len(_encoder.encode("\n".join(parts)))
 
     truncated = False
-    for fp in sorted(by_file.keys()):
-        block = f"\n=== File: {os.path.basename(fp)} ===\n" + "\n\n".join(
-            _format_chunk(c) for c in by_file[fp]
+    for file_path in sorted(by_file.keys()):
+        block = f"\n=== File: {os.path.basename(file_path)} ===\n" + "\n\n".join(
+            _format_chunk(chunk) for chunk in by_file[file_path]
         )
         block_tokens = len(_encoder.encode(block))
         if used + block_tokens > MAX_INPUT_TOKENS:
@@ -69,8 +72,8 @@ def _build_dir_context(dir_path: str, dir_chunks: list[CodeChunk]) -> str:
 
 def _group_by_directory(chunks: list[CodeChunk]) -> dict[str, list[CodeChunk]]:
     groups: dict[str, list[CodeChunk]] = defaultdict(list)
-    for c in chunks:
-        groups[os.path.dirname(c.file_path)].append(c)
+    for chunk in chunks:
+        groups[os.path.dirname(chunk.file_path)].append(chunk)
     return dict(groups)
 
 
@@ -96,7 +99,9 @@ SEM = asyncio.Semaphore(16)
 
 
 async def summarise_one(
-    dir_path: str, dir_chunks: list[CodeChunk], repo_dir: str,
+    dir_path: str,
+    dir_chunks: list[CodeChunk],
+    repo_dir: str,
 ) -> DirSummary:
     context = _build_dir_context(dir_path, dir_chunks)
     async with SEM:
@@ -108,8 +113,8 @@ async def summarise_one(
             ],
             max_completion_tokens=MAX_OUTPUT_TOKENS,
         )
-    summary_text = resp.choices[0].message.content.strip()
-    files_in_dir = sorted({os.path.basename(c.file_path) for c in dir_chunks})
+    summary_text = (resp.choices[0].message.content or "").strip()
+    files_in_dir = sorted({os.path.basename(chunk.file_path) for chunk in dir_chunks})
     rel_dir = os.path.relpath(dir_path, repo_dir) if dir_path != repo_dir else "."
     return DirSummary(dir_path=rel_dir, summary=summary_text, file_list=files_in_dir)
 
@@ -118,7 +123,9 @@ ProgressCallback = Callable[[int, int, str], Awaitable[None]]
 
 
 async def _summarise_with_label(
-    dir_path: str, dir_chunks: list[CodeChunk], repo_dir: str,
+    dir_path: str,
+    dir_chunks: list[CodeChunk],
+    repo_dir: str,
 ) -> tuple[str, DirSummary | BaseException]:
     try:
         return dir_path, await summarise_one(dir_path, dir_chunks, repo_dir)
@@ -135,19 +142,20 @@ async def generate_dir_summaries(
     summaries with text-embedding-3-large, and return DirSummary rows.
 
     If on_progress is supplied, it is awaited after each per-directory
-    summary completes with (done, total, dir_path)."""
+    summary completes with (done, total, dir_path).
+    """
     groups = _group_by_directory(chunks)
     total = len(groups)
 
     tasks = [
-        asyncio.create_task(_summarise_with_label(d, c, repo_dir))
-        for d, c in groups.items()
+        asyncio.create_task(_summarise_with_label(dir_path, dir_chunks, repo_dir))
+        for dir_path, dir_chunks in groups.items()
     ]
 
     summaries: list[DirSummary] = []
     done = 0
-    for fut in asyncio.as_completed(tasks):
-        dir_path, result = await fut
+    for future in asyncio.as_completed(tasks):
+        dir_path, result = await future
         done += 1
         if isinstance(result, DirSummary):
             summaries.append(result)
@@ -160,14 +168,13 @@ async def generate_dir_summaries(
                 logger.exception("on_progress callback raised; continuing")
 
     if summaries:
-        texts = [f"Directory: {s.dir_path}\n{s.summary}" for s in summaries]
-        BATCH = 100
-        for i in range(0, len(texts), BATCH):
-            batch = texts[i:i + BATCH]
-            resp = await client.embeddings.create(
-                input=batch, model="text-embedding-3-large",
-            )
-            for s, datum in zip(summaries[i:i + BATCH], resp.data):
-                s.embedding = datum.embedding
+        texts = [f"Directory: {summary.dir_path}\n{summary.summary}" for summary in summaries]
+        embeddings = embed_texts(
+            texts,
+            model=EMBEDDING_MODEL,
+            allow_truncate=True,
+        )
+        for summary, embedding in zip(summaries, embeddings):
+            summary.embedding = embedding
 
     return summaries
