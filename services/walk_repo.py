@@ -5,20 +5,59 @@ SKIP_DIRS = {
     "node_modules", "dist", "build", "out", "coverage",
     ".next", ".turbo", ".nuxt", ".svelte-kit", ".vercel", ".cache",
 }
+SKIP_FILES = {
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lock",
+    "bun.lockb",
+    "poetry.lock",
+    "Pipfile.lock",
+    "Gemfile.lock",
+    "Cargo.lock",
+    "go.sum",
+}
+SKIP_FILES_LOWER = {name.lower() for name in SKIP_FILES}
+SKIP_SUFFIXES = (
+    ".map",
+    ".min.js",
+    ".min.css",
+    ".bundle.js",
+    ".bundle.css",
+    ".generated.js",
+    ".generated.ts",
+    ".generated.tsx",
+)
+MAX_INDEXED_FILE_BYTES = int(os.environ.get("CODE_INDEXING_MAX_FILE_BYTES", "1000000"))
 CODE_EXTS = (
     ".py", ".js", ".ts", ".jsx", ".tsx",
     ".html", ".css", ".scss",
     ".json", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".conf",
     ".env", ".env.example", ".env.sample", ".env.template",
     ".md", ".txt", ".csv",
-    ".xls", ".xlsx", ".ppt", ".pptx",
 )
+
+
+def _should_index_file(dirpath: str, filename: str) -> bool:
+    lower = filename.lower()
+    if filename in SKIP_FILES or lower in SKIP_FILES_LOWER:
+        return False
+    if lower.endswith(SKIP_SUFFIXES):
+        return False
+    if not lower.endswith(CODE_EXTS):
+        return False
+    try:
+        if os.path.getsize(os.path.join(dirpath, filename)) > MAX_INDEXED_FILE_BYTES:
+            return False
+    except OSError:
+        return False
+    return True
 
 
 def _walk(repo_dir: str):
     for dirpath, dirnames, filenames in os.walk(repo_dir):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        filenames[:] = [f for f in filenames if f.endswith(CODE_EXTS)]
+        filenames[:] = [f for f in filenames if _should_index_file(dirpath, f)]
         yield dirpath, dirnames, filenames
 
 

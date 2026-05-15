@@ -10,7 +10,7 @@ from collections import defaultdict
 import tiktoken
 from openai import OpenAI
 
-from services.chunk_and_embed import CodeChunk
+from services.chunk_and_embed import CodeChunk, EMBEDDING_MODEL, embed_texts
 from services.db import DirSummary
 
 _openai_client: OpenAI | None = None
@@ -131,13 +131,12 @@ def generate_dir_summaries(
 
     if summaries:
         texts = [f"Directory: {s.dir_path}\n{s.summary}" for s in summaries]
-        BATCH = 100
-        for i in range(0, len(texts), BATCH):
-            batch = texts[i:i + BATCH]
-            resp = _client().embeddings.create(
-                input=batch, model="text-embedding-3-large"
-            )
-            for s, datum in zip(summaries[i:i + BATCH], resp.data):
-                s.embedding = datum.embedding
+        embeddings = embed_texts(
+            texts,
+            model=EMBEDDING_MODEL,
+            allow_truncate=True,
+        )
+        for summary, embedding in zip(summaries, embeddings):
+            summary.embedding = embedding
 
     return summaries
