@@ -371,7 +371,10 @@ async def stream_session_events_endpoint(session_id: str):
                 yield f"data: {json.dumps(event)}\n\n"
                 if event.get("type") == "data-pipeline-failed":
                     break
-                if event.get("type") == "data-app-plan-updated":
+                if (
+                    event.get("type") == "data-app-plan-updated"
+                    and event.get("source") in {None, "pipeline"}
+                ):
                     break
         finally:
             unsubscribe(session_id, queue)

@@ -42,6 +42,21 @@ DIR_SUMMARY_SEARCH_SQL = """
 _pool: AsyncConnectionPool | None = None
 
 
+SESSION_MIGRATION_SQLS = (
+    """
+    CREATE TABLE IF NOT EXISTS sessions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        status TEXT NOT NULL,
+        app_plan_hash TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS app_plan_hash TEXT",
+    "ALTER TABLE sessions DROP COLUMN IF EXISTS repo_url",
+)
+
+
 async def get_pool() -> AsyncConnectionPool:
     global _pool
     if _pool is None:
@@ -195,6 +210,8 @@ async def init_schema():
     pool = await get_pool()
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
+            for sql in SESSION_MIGRATION_SQLS:
+                await cur.execute(sql)
             await cur.execute(SCHEMA_SQL)
 
 

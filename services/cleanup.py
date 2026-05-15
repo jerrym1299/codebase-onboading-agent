@@ -71,6 +71,8 @@ class DeletionReport:
 
 def _local_clone_path(repo_url: str) -> Path:
     repo_name = repo_url.rstrip("/").removesuffix(".git").split("/")[-1]
+    if not repo_name or repo_name in {".", ".."} or "/" in repo_name:
+        raise ValueError(f"Unsafe repo name derived from URL: {repo_url!r}")
     return Path(REPOS_BASE_DIR) / repo_name
 
 

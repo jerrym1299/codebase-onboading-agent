@@ -242,7 +242,7 @@ def _match_http_edges(
     exposed_index: list[tuple[str, int, str]] = []
     for repo_url, _repo_dir, report, _plan in repos:
         for idx, ex in enumerate(report.exposed):
-            exposed_index.append((repo_url, idx, (ex.path or "").rstrip("/")))
+            exposed_index.append((repo_url, idx, (ex.path or "/").rstrip("/") or "/"))
 
     for src_url, _src_dir, report, _plan in repos:
         for cidx, c in enumerate(report.consumed):
@@ -255,7 +255,7 @@ def _match_http_edges(
                 for tgt_url, eidx, epath in exposed_index:
                     if tgt_url == src_url:
                         continue
-                    if not path or epath == "" or epath.startswith(path) or path.startswith(epath):
+                    if not path or epath == path or epath.startswith(path + "/") or path.startswith(epath + "/"):
                         edges.append(Edge(
                             source=src_url, target=tgt_url,
                             edge_type="soft_runtime",

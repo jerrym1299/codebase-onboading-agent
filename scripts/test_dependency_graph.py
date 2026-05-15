@@ -76,6 +76,17 @@ def test_http_match_by_port():
     assert_eq(ambig, [], "no ambiguities")
 
 
+def test_root_exposed_path_does_not_match_every_path():
+    print("test_root_exposed_path_does_not_match_every_path")
+    api = BoundaryReport(repo_url=REPO_A, exposed=[ExposedHttp(method="GET", path="/")])
+    web = BoundaryReport(repo_url=REPO_B, consumed=[
+        ConsumedHttp(target_env="SERVICE_URL", resolved="http://localhost:4001/users", path="/users"),
+    ])
+    graph, _, _ = build_graph([(REPO_A, "/tmp/a", api, None), (REPO_B, "/tmp/b", web, None)])
+    edges = [e for e in graph.edges if e.source == REPO_B and e.target == REPO_A]
+    assert_eq(edges, [], "root route is not a catch-all path match")
+
+
 def test_http_match_by_env_name():
     print("test_http_match_by_env_name")
     api = BoundaryReport(repo_url=REPO_A, exposed=[ExposedHttp(method="GET", path="/")])
@@ -164,15 +175,29 @@ def test_db_consumed_creates_infra_node():
     assert_eq(infras[0].infra_kind, "mysql", "kind is mysql")
 
 
+def test_unknown_db_engine_maps_to_other_infra_node():
+    print("test_unknown_db_engine_maps_to_other_infra_node")
+    a = BoundaryReport(
+        repo_url=REPO_A,
+        consumed=[ConsumedDb(engine="mongodb", target_env="MONGO_URL")],
+    )
+    graph, _, _ = build_graph([(REPO_A, "/tmp/a", a, None)])
+    infras = [n for n in graph.nodes if n.kind == "infra"]
+    assert_eq(len(infras), 1, "one mongo infra node")
+    assert_eq(infras[0].infra_kind, "other", "unsupported db kind maps to other")
+
+
 def main():
     test_shared_infra_dedupe()
     test_http_match_by_port()
+    test_root_exposed_path_does_not_match_every_path()
     test_http_match_by_env_name()
     test_unresolved_http_becomes_ambiguity()
     test_promotion_to_hard_via_migration_step()
     test_dev_proxy_keeps_source_soft()
     test_cycle_break_via_demotion()
     test_db_consumed_creates_infra_node()
+    test_unknown_db_engine_maps_to_other_infra_node()
     print("\nALL PASSED")
 
 

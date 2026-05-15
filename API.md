@@ -309,7 +309,7 @@ Events follow the AI SDK v6 UI Message Stream protocol.
 | `data-app-plan-updated` | `updatedAt`, `repo_set_hash` | Consolidated app-level markdown persisted |
 | `finish` | — | End of stream; close the SSE connection |
 
-> **Note:** the indexing/analysis events (`data-repo-progress`, `data-startup-plan-updated`, `data-graph-built`, `data-consolidator-*`, `data-app-plan-updated`) only flow to a client that's subscribed to the per-session pubsub when they fire. Currently the only subscription happens inside `POST /sessions/:id/messages`. To watch indexing progress live without sending a chat message, the FE would need a dedicated SSE endpoint that subscribes after `POST /sessions` — not currently exposed.
+> **Note:** the indexing/analysis events (`data-repo-progress`, `data-startup-plan-updated`, `data-graph-built`, `data-consolidator-*`, `data-app-plan-updated`) only flow to a client that's subscribed to the per-session pubsub when they fire. To watch indexing progress live without sending a chat message, use `GET /sessions/{session_id}/events` after `POST /sessions`; it terminates when the session reaches `ready`, `failed`, or `ended`.
 
 ---
 

@@ -3,6 +3,7 @@ import contextvars
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 import uuid
@@ -413,6 +414,7 @@ async def update_startup_plan(plan_markdown: str, change_summary: str = "") -> s
     fresh = await get_app_startup_plan_row(repo_set_hash)
     await publish(session_id, {
         "type": "data-app-plan-updated",
+        "source": "manual_edit",
         "updatedAt": fresh["updated_at"] if fresh else None,
         "repo_set_hash": repo_set_hash,
         "change_summary": change_summary or None,
@@ -942,5 +944,11 @@ async def delete_file_or_directory(path:str) -> str:
         return "ERROR: path is empty."
     if not os.path.exists(path):
         return f"ERROR: path {path!r} does not exist."
-    os.rmdir(path)
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+        else:
+            shutil.rmtree(path)
+    except OSError as exc:
+        return f"ERROR: could not delete {path!r}: {exc}"
     return f"File or directory {path!r} deleted."

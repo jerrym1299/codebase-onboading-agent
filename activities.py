@@ -534,6 +534,7 @@ async def consolidate_plan_activity(params: ConsolidateParams) -> dict:
     fresh = await get_app_startup_plan_row(params.repo_set_hash)
     await publish(params.session_id, {
         "type": "data-app-plan-updated",
+        "source": "pipeline",
         "updatedAt": fresh["updated_at"] if fresh else None,
         "repo_set_hash": params.repo_set_hash,
     })
