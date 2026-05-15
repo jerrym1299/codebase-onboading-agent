@@ -471,6 +471,61 @@ CREATE INDEX IF NOT EXISTS pending_actions_session_idx
 CREATE INDEX IF NOT EXISTS pending_actions_session_open_idx
     ON pending_actions (session_id) WHERE status = 'open';
 
+CREATE TABLE IF NOT EXISTS sandbox_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID REFERENCES sessions(id) ON DELETE SET NULL,
+    provider TEXT NOT NULL DEFAULT 'local',
+    external_id TEXT,
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('created', 'running', 'complete', 'failed', 'cancelled')),
+    repo_set_hash TEXT,
+    preview_url TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS sandbox_runs_session_idx
+    ON sandbox_runs (session_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS sandbox_runs_provider_external_idx
+    ON sandbox_runs (provider, external_id)
+    WHERE external_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS sandbox_command_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    sandbox_run_id UUID NOT NULL REFERENCES sandbox_runs(id) ON DELETE CASCADE,
+    session_id UUID REFERENCES sessions(id) ON DELETE SET NULL,
+    run_kind TEXT NOT NULL DEFAULT 'command'
+        CHECK (run_kind IN ('command', 'background_process')),
+    command TEXT NOT NULL,
+    cwd TEXT,
+    process_handle TEXT,
+    pid INT,
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running', 'complete', 'failed', 'timed_out', 'cancelled')),
+    exit_code INT,
+    timed_out BOOLEAN NOT NULL DEFAULT FALSE,
+    duration_ms INT,
+    stdout_tail TEXT,
+    stderr_tail TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS sandbox_command_runs_sandbox_idx
+    ON sandbox_command_runs (sandbox_run_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS sandbox_command_runs_session_idx
+    ON sandbox_command_runs (session_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS sandbox_command_runs_handle_idx
+    ON sandbox_command_runs (process_handle)
+    WHERE process_handle IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS startup_plans (
     repo_url           TEXT PRIMARY KEY,
     plan               JSONB NOT NULL,
@@ -1627,6 +1682,225 @@ async def insert_session_repos(session_id: str, repo_urls: list[str]) -> None:
             "ON CONFLICT DO NOTHING",
             [(session_id, u) for u in repo_urls],
         )
+
+
+def _sandbox_run_dict(row) -> dict:
+    return {
+        "id": str(row[0]),
+        "session_id": str(row[1]) if row[1] is not None else None,
+        "provider": row[2],
+        "external_id": row[3],
+        "status": row[4],
+        "repo_set_hash": row[5],
+        "preview_url": row[6],
+        "metadata": row[7] or {},
+        "created_at": row[8].isoformat(),
+        "updated_at": row[9].isoformat(),
+        "completed_at": _iso_or_none(row[10]),
+    }
+
+
+def _sandbox_command_run_dict(row) -> dict:
+    return {
+        "id": str(row[0]),
+        "sandbox_run_id": str(row[1]),
+        "session_id": str(row[2]) if row[2] is not None else None,
+        "run_kind": row[3],
+        "command": row[4],
+        "cwd": row[5],
+        "process_handle": row[6],
+        "pid": row[7],
+        "status": row[8],
+        "exit_code": row[9],
+        "timed_out": row[10],
+        "duration_ms": row[11],
+        "stdout_tail": row[12],
+        "stderr_tail": row[13],
+        "metadata": row[14] or {},
+        "created_at": row[15].isoformat(),
+        "updated_at": row[16].isoformat(),
+        "completed_at": _iso_or_none(row[17]),
+    }
+
+
+SANDBOX_RUN_SELECT_COLUMNS = """
+    id, session_id, provider, external_id, status, repo_set_hash, preview_url,
+    metadata, created_at, updated_at, completed_at
+"""
+
+SANDBOX_COMMAND_SELECT_COLUMNS = """
+    id, sandbox_run_id, session_id, run_kind, command, cwd, process_handle, pid,
+    status, exit_code, timed_out, duration_ms, stdout_tail, stderr_tail,
+    metadata, created_at, updated_at, completed_at
+"""
+
+
+async def ensure_sandbox_run(
+    session_id: str,
+    *,
+    provider: str = "local",
+    repo_set_hash: str | None = None,
+    external_id: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Return the active sandbox run for a session/provider, creating one if needed."""
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            SELECT {SANDBOX_RUN_SELECT_COLUMNS}
+            FROM sandbox_runs
+            WHERE session_id = %s
+              AND provider = %s
+              AND status IN ('created', 'running')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (session_id, provider),
+        )
+        row = await cur.fetchone()
+        if row is not None:
+            return _sandbox_run_dict(row)
+
+        await cur.execute(
+            f"""
+            INSERT INTO sandbox_runs
+                (session_id, provider, external_id, status, repo_set_hash, metadata)
+            VALUES (%s, %s, %s, 'running', %s, %s::jsonb)
+            RETURNING {SANDBOX_RUN_SELECT_COLUMNS}
+            """,
+            (
+                session_id,
+                provider,
+                external_id,
+                repo_set_hash,
+                _json_value(metadata),
+            ),
+        )
+        row = await cur.fetchone()
+    return _sandbox_run_dict(row)
+
+
+async def create_sandbox_command_run(
+    *,
+    sandbox_run_id: str,
+    session_id: str,
+    command: str,
+    cwd: str,
+    run_kind: str,
+    process_handle: str | None = None,
+    pid: int | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            INSERT INTO sandbox_command_runs
+                (sandbox_run_id, session_id, run_kind, command, cwd,
+                 process_handle, pid, status, metadata)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'running', %s::jsonb)
+            RETURNING {SANDBOX_COMMAND_SELECT_COLUMNS}
+            """,
+            (
+                sandbox_run_id,
+                session_id,
+                run_kind,
+                command,
+                cwd or None,
+                process_handle,
+                pid,
+                _json_value(metadata),
+            ),
+        )
+        row = await cur.fetchone()
+    return _sandbox_command_run_dict(row)
+
+
+async def update_sandbox_command_run(
+    command_run_id: str,
+    *,
+    status: str | None = None,
+    exit_code: int | None = None,
+    timed_out: bool | None = None,
+    duration_ms: int | None = None,
+    stdout_tail: str | None = None,
+    stderr_tail: str | None = None,
+    metadata: dict | None = None,
+) -> dict | None:
+    assignments = ["updated_at = NOW()"]
+    params: list[object] = []
+
+    if status is not None:
+        assignments.append("status = %s")
+        params.append(status)
+        if status in {"complete", "failed", "timed_out", "cancelled"}:
+            assignments.append("completed_at = COALESCE(completed_at, NOW())")
+    if exit_code is not None:
+        assignments.append("exit_code = %s")
+        params.append(exit_code)
+    if timed_out is not None:
+        assignments.append("timed_out = %s")
+        params.append(timed_out)
+    if duration_ms is not None:
+        assignments.append("duration_ms = %s")
+        params.append(duration_ms)
+    if stdout_tail is not None:
+        assignments.append("stdout_tail = %s")
+        params.append(stdout_tail)
+    if stderr_tail is not None:
+        assignments.append("stderr_tail = %s")
+        params.append(stderr_tail)
+    if metadata is not None:
+        assignments.append("metadata = metadata || %s::jsonb")
+        params.append(_json_value(metadata))
+
+    params.append(command_run_id)
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            UPDATE sandbox_command_runs
+            SET {', '.join(assignments)}
+            WHERE id = %s
+            RETURNING {SANDBOX_COMMAND_SELECT_COLUMNS}
+            """,
+            params,
+        )
+        row = await cur.fetchone()
+    return _sandbox_command_run_dict(row) if row is not None else None
+
+
+async def list_sandbox_runs_for_session(session_id: str) -> list[dict]:
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            SELECT {SANDBOX_RUN_SELECT_COLUMNS}
+            FROM sandbox_runs
+            WHERE session_id = %s
+            ORDER BY created_at DESC
+            """,
+            (session_id,),
+        )
+        rows = await cur.fetchall()
+    return [_sandbox_run_dict(row) for row in rows]
+
+
+async def list_sandbox_command_runs(sandbox_run_id: str) -> list[dict]:
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            SELECT {SANDBOX_COMMAND_SELECT_COLUMNS}
+            FROM sandbox_command_runs
+            WHERE sandbox_run_id = %s
+            ORDER BY created_at ASC
+            """,
+            (sandbox_run_id,),
+        )
+        rows = await cur.fetchall()
+    return [_sandbox_command_run_dict(row) for row in rows]
 
 
 REPO_BOUNDARIES_SELECT_SQL = """
