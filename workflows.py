@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import timedelta
 
 from temporalio import workflow
@@ -16,6 +17,7 @@ with workflow.unsafe.imports_passed_through():
         BuildGraphParams,
         ConsolidateParams,
         PipelineFailedParams,
+        ResolvePendingActionParams,
         clone_repo_activity,
         index_repo_activity,
         update_session_status_activity,
@@ -26,6 +28,7 @@ with workflow.unsafe.imports_passed_through():
         consolidate_plan_activity,
         publish_pipeline_failed_activity,
         cancel_pending_actions_activity,
+        resolve_pending_action_activity,
         resolve_pending_actions_activity,
     )
 
@@ -123,6 +126,23 @@ class CodebaseChatWorkflow:
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
 
+    async def _run_agent_turn(self, session_id: str, content: str) -> None:
+        result = await workflow.execute_activity(
+            agent_turn_activity,
+            AgentTurnParams(session_id=session_id, content=content),
+            start_to_close_timeout=timedelta(seconds=300),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        if result.get("kind") == "paused":
+            self._pending[result["pending_id"]] = result.get("payload", {})
+
+    def _clarification_content(self, value: dict) -> str:
+        for key in ("content", "text", "answer", "value"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return json.dumps(value, sort_keys=True)
+
     @workflow.run
     async def run(self, params: ChatParams) -> dict:
         self._repo_urls = list(params.repo_urls)
@@ -201,6 +221,25 @@ class CodebaseChatWorkflow:
                 )
                 continue
 
+            if self._clarifications:
+                pending_id, value = self._clarifications.pop(0)
+                self._pending.pop(pending_id, None)
+                await workflow.execute_activity(
+                    resolve_pending_action_activity,
+                    ResolvePendingActionParams(
+                        session_id=params.session_id,
+                        pending_id=pending_id,
+                        resolved_value=value,
+                    ),
+                    start_to_close_timeout=timedelta(seconds=15),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+                await self._run_agent_turn(
+                    params.session_id,
+                    self._clarification_content(value),
+                )
+                continue
+
             if self._user_messages:
                 content = self._user_messages.pop(0)
 
@@ -213,14 +252,7 @@ class CodebaseChatWorkflow:
                         retry_policy=RetryPolicy(maximum_attempts=3),
                     )
 
-                result = await workflow.execute_activity(
-                    agent_turn_activity,
-                    AgentTurnParams(session_id=params.session_id, content=content),
-                    start_to_close_timeout=timedelta(seconds=300),
-                    retry_policy=RetryPolicy(maximum_attempts=1),
-                )
-                if result.get("kind") == "paused":
-                    self._pending[result["pending_id"]] = result.get("payload", {})
+                await self._run_agent_turn(params.session_id, content)
 
         await workflow.execute_activity(
             cancel_pending_actions_activity,

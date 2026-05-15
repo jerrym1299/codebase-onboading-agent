@@ -1,5 +1,6 @@
 fastapi==0.135.3
 fpdf2
+jsonschema
 markdown
 openai
 openai-agents

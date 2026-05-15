@@ -24,6 +24,7 @@ from activities import (
     extract_boundaries_activity,
     index_repo_activity,
     publish_pipeline_failed_activity,
+    resolve_pending_action_activity,
     resolve_pending_actions_activity,
     update_session_status_activity,
 )
@@ -78,6 +79,7 @@ async def lifespan(app):
             agent_turn_activity,
             publish_pipeline_failed_activity,
             cancel_pending_actions_activity,
+            resolve_pending_action_activity,
             resolve_pending_actions_activity,
         ],
 
@@ -605,5 +607,4 @@ async def delete_app_plan_endpoint(repo_set_hash: str):
     """Delete a consolidated app-level plan row by its repo_set_hash."""
     report = await delete_app_plan_data(repo_set_hash)
     return report.to_dict()
-
 

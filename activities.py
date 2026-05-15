@@ -8,7 +8,7 @@ from agents import (
     RawResponsesStreamEvent, RunItemStreamEvent, AgentUpdatedStreamEvent,
 )
 from agents.items import (
-    MessageOutputItem, ToolCallItem, ToolCallOutputItem,
+    ToolCallItem, ToolCallOutputItem,
     HandoffCallItem, HandoffOutputItem,
 )
 from agents.exceptions import MaxTurnsExceeded
@@ -102,6 +102,13 @@ class PipelineFailedParams:
     session_id: str
     phase: str
     message: str
+
+
+@dataclass
+class ResolvePendingActionParams:
+    session_id: str
+    pending_id: str
+    resolved_value: dict
 
 
 
@@ -570,6 +577,20 @@ async def resolve_pending_actions_activity(session_id: str) -> int:
         return cur.rowcount
 
 
+@activity.defn
+async def resolve_pending_action_activity(params: ResolvePendingActionParams) -> int:
+    """Resolve one pending action with the structured value supplied by a signal."""
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE pending_actions "
+            "SET status = 'resolved', resolved_value = %s::jsonb, resolved_at = NOW() "
+            "WHERE id = %s AND session_id = %s AND status = 'open'",
+            (json.dumps(params.resolved_value), params.pending_id, params.session_id),
+        )
+        return cur.rowcount
+
+
 async def _append_part(pool, msg_id: str, part: dict):
     async with pool.connection() as conn, conn.cursor() as cur:
         await cur.execute(
@@ -650,14 +671,7 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
             elif isinstance(event, RunItemStreamEvent):
                 item = event.item
 
-                if isinstance(item, MessageOutputItem) and event.name == "message_output_completed":
-                    texts = []
-                    for block in getattr(item.raw_item, "content", []):
-                        texts.append(getattr(block, "text", ""))
-                    part = {"type": "text", "text": "".join(texts)}
-                    await _append_part(pool, msg_id, part)
-
-                elif isinstance(item, ToolCallItem) and event.name == "tool_called":
+                if isinstance(item, ToolCallItem) and event.name == "tool_called":
                     raw = item.raw_item
                     part = {
                         "type": "tool-input-available",

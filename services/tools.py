@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agents import function_tool
+from jsonschema import Draft202012Validator
 from temporalio.client import Client
 
 from services.chunk_and_embed import embed_query
@@ -18,8 +19,20 @@ from services.db import (
     CODE_SEARCH_SQL, DIR_SUMMARY_SEARCH_SQL, get_app_startup_plan_row, get_pool,
     get_repo_boundaries_row, get_startup_plan_row,
 )
+from services.startup_analysis import PLAN_JSON_SCHEMA
 
 from services.event_bus import publish
+
+_PLAN_VALIDATOR = Draft202012Validator(PLAN_JSON_SCHEMA["schema"])
+
+REQUIRED_APP_PLAN_HEADINGS = (
+    "# Startup plan",
+    "## Prerequisites",
+    "## Env vars",
+    "## Steps",
+    "## Dependency graph",
+    "## Caveats",
+)
 
 current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar("current_session_id")
 
@@ -357,9 +370,10 @@ async def update_startup_plan(plan_markdown: str, change_summary: str = "") -> s
       2. Identify ambiguities or fields the user might want to correct (env
          values, service ports, ordering, etc.). For each one, call `ask_user`
          to confirm or get a value.
-      3. Construct the FULL updated markdown (replaces plan_markdown wholesale,
-         keep the same six sections: Startup plan, Prerequisites, Env vars,
-         Steps, Dependency graph, Caveats).
+      3. Construct the FULL updated markdown (replaces plan_markdown wholesale).
+         The markdown is REJECTED unless it contains all six section headings
+         exactly: `# Startup plan`, `## Prerequisites`, `## Env vars`,
+         `## Steps`, `## Dependency graph`, `## Caveats`.
       4. Call this tool with the new markdown.
 
     `change_summary` is a one-line description of what changed, used only for
@@ -372,6 +386,14 @@ async def update_startup_plan(plan_markdown: str, change_summary: str = "") -> s
 
     if not plan_markdown or not plan_markdown.strip():
         return "ERROR: plan_markdown is empty; nothing to persist."
+
+    missing = [h for h in REQUIRED_APP_PLAN_HEADINGS if h not in plan_markdown]
+    if missing:
+        return (
+            "ERROR: plan_markdown is missing required section heading(s): "
+            f"{', '.join(missing)}. The app plan must contain all six headings: "
+            f"{', '.join(REQUIRED_APP_PLAN_HEADINGS)}."
+        )
 
     pool = await get_pool()
     async with pool.connection() as conn, conn.cursor() as cur:
@@ -420,14 +442,63 @@ async def update_repo_startup_plan(
     of re-running the full analysis with `recompute_startup_plan`.
 
     Workflow:
-      1. Read the current per-repo plan with `get_startup_plan(repo_url)`.
+      1. Read the current per-repo plan with `get_startup_plan(repo_url)` (or
+         use `get_repo_startup_plan(repo_url)`) to obtain the existing JSON.
       2. For every ambiguity or missing value the user's change implies, call
          `ask_user` to confirm or get a value before guessing.
-      3. Construct the FULL updated plan as a JSON object matching the existing
-         schema (top-level keys: `summary`, `packages[]`, `warnings[]`; each
-         package has `path`, `framework`, `runtime`, `package_manager`,
-         `external_tools[]`, `services[]`, `env_vars[]`, `steps[]`). Preserve
-         every field you aren't changing — this replaces `plan` wholesale.
+      3. Construct the FULL updated plan as a JSON object. Preserve every
+         field you aren't changing — this REPLACES `plan` wholesale and is
+         validated against the strict schema.
+
+    Required schema (additionalProperties is false at every level; every key
+    listed is required, even when the value is null):
+
+      {
+        "schema_version": "<string>",
+        "summary": "<string>",
+        "is_monorepo": <bool>,
+        "packages": [
+          {
+            "path": "<string>",
+            "name": "<string|null>",
+            "framework": "<string|null>",
+            "runtime": {
+              "language": "<string>",
+              "version": "<string|null>",
+              "version_source": "<string|null>",
+              "confidence": <number>
+            },
+            "package_manager": {
+              "name": "<string>",
+              "version": "<string|null>",
+              "source": "<string|null>",
+              "confidence": <number>
+            },
+            "external_tools": [
+              {"name": "<string>", "required": <bool>, "reason": "<string>", "confidence": <number>}
+            ],
+            "services": [
+              {"name": "<string>", "image": "<string|null>", "source": "<string|null>", "confidence": <number>}
+            ],
+            "env_vars": [
+              {
+                "name": "<string>", "required": <bool>, "example": "<string|null>",
+                "sources": ["<string>", ...], "confidence": <number>,
+                "needs_verification": <bool>
+              }
+            ],
+            "steps": [
+              {
+                "order": <int>, "title": "<string>", "command": "<string>",
+                "cwd": "<string>", "explain": "<string>", "confidence": <number>,
+                "needs_verification": <bool>
+              }
+            ]
+          }
+        ],
+        "warnings": ["<string>", ...]
+      }
+
       4. Serialise the plan to a JSON string and pass it as `plan_json`.
          `repo_url` must be one of the repos in this session.
 
@@ -447,6 +518,21 @@ async def update_repo_startup_plan(
         return f"ERROR: plan_json is not valid JSON: {e}"
     if not isinstance(plan, dict) or not plan:
         return "ERROR: plan_json must decode to a non-empty JSON object."
+
+    errors = sorted(_PLAN_VALIDATOR.iter_errors(plan), key=lambda e: list(e.absolute_path))
+    if errors:
+        lines = []
+        for err in errors[:8]:
+            path = "/".join(str(p) for p in err.absolute_path) or "<root>"
+            lines.append(f"  - {path}: {err.message}")
+        more = f"\n  ...and {len(errors) - 8} more" if len(errors) > 8 else ""
+        return (
+            "ERROR: plan_json does not match the startup-plan schema. Fix these "
+            "and call again (every field is required, including nullable ones — "
+            "use null rather than omitting):\n"
+            + "\n".join(lines)
+            + more
+        )
 
     repo_url = repo_url.rstrip("/")
 
@@ -815,3 +901,46 @@ async def stop_background_process(handle: str, grace_seconds: int = 5) -> str:
         f"exit_code: {bg.proc.returncode}\n"
         f"--- last {len(tail)} lines ---\n" + ("\n".join(tail) or "<no output>")
     )
+
+@function_tool
+async def create_directory(path:str) -> str:
+    """Create a directory at the given path."""
+    if not path or not path.strip():
+        return "ERROR: path is empty."
+    if os.path.exists(path):
+        return f"ERROR: path {path!r} already exists."
+    os.makedirs(path)
+    return f"Directory {path!r} created."
+
+@function_tool
+async def create_file(path:str, content:str) -> str:
+    """Create a file at the given path with the given content."""
+    if not path or not path.strip():
+        return "ERROR: path is empty."
+    if os.path.exists(path):
+        return f"ERROR: path {path!r} already exists."
+    with open(path, "w") as f:
+        f.write(content)
+    return f"File {path!r} created."
+
+@function_tool
+async def move_file_or_directory(source_path:str, destination_path:str) -> str:
+    """Move a file or directory from the source path to the destination path."""
+    if not source_path or not source_path.strip():
+        return "ERROR: source path is empty."
+    if not destination_path or not destination_path.strip():
+        return "ERROR: destination path is empty."
+    if os.path.exists(destination_path):
+        return f"ERROR: destination path {destination_path!r} already exists."
+    os.rename(source_path, destination_path)
+    return f"File or directory {source_path!r} moved to {destination_path!r}."
+
+@function_tool
+async def delete_file_or_directory(path:str) -> str:
+    """Delete a file or directory at the given path."""
+    if not path or not path.strip():
+        return "ERROR: path is empty."
+    if not os.path.exists(path):
+        return f"ERROR: path {path!r} does not exist."
+    os.rmdir(path)
+    return f"File or directory {path!r} deleted."
