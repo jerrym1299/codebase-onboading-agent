@@ -455,8 +455,18 @@ sendMessage({ text: "User login flow" });
 | `sessions` | One row per chat session. Fields: `id`, `repo_url`, `status`, `created_at`, `last_seen_at`. |
 | `messages` | Chat messages with AI-SDK-style `parts[]` JSONB. Fields: `id`, `session_id`, `role`, `parts`, `created_at`. |
 | `pending_actions` | Tracks agent questions awaiting user response. Fields: `id`, `session_id`, `kind`, `payload`, `status`, `resolved_value`, `created_at`, `resolved_at`. |
-| `code_chunks` | AST-level code chunks + 1536-dim embeddings (pgvector). Idempotent upsert on re-index. |
+| `tenants` | Customer/workspace owner for indexed source and learned facts. |
+| `repo_connections` | Tenant-scoped repo connection metadata keyed by repo URL/provider. |
+| `repo_indexes` | Versioned index records keyed by repo connection and manifest hash. |
+| `repo_latest_indexes` | Latest serving pointer for each repo connection. |
+| `repo_index_jobs` | Durable queue/job record with status, attempts, metrics, and errors. |
+| `code_chunks` | AST-level code chunks + 3072-dim embeddings (pgvector), keyed by content-addressed chunk hashes. |
 | `dir_summaries` | Per-directory LLM-generated summaries + embeddings. |
+| `repo_index_runs` | Append-only content manifest history for each indexing/debug run. |
+| `repo_files` | Latest content-addressed file inventory keyed by `(repo_url, file_path)`. |
+| `repo_text_lines` | Latest non-empty line inventory for exact string and regex lookup. |
+| `repo_chunk_manifests` | Latest content-addressed chunk inventory keyed by `(repo_url, chunk_sha256)`. |
+| `repo_embedding_cache` | Repo-scoped embedding cache keyed by `(repo_url, embedding_sha256)`. |
 
 ---
 
@@ -478,6 +488,7 @@ All agents have access to `ask_user` for clarification. The Router decides which
 | `list_files(dir_path, glob)` | Explorer, Explainer | Find files by pattern |
 | `read_file(path, start, end)` | Explorer, Explainer, Tracer | Read file contents |
 | `search_code(dir_path, query)` | Explorer | Regex search across files |
+| `search_exact_indexed(query, repo_url, limit, regex, path, language)` | Explorer, Tracer | Exact string or regex search over persisted line inventory |
 | `find_references(symbol, dir_path)` | Tracer | Find all references to a symbol |
 | `get_dependencies(file_path)` | Tracer | Extract import dependencies |
 | `search_indexed(query, repo_url, k)` | Explainer | Semantic search over pgvector chunks |
@@ -494,7 +505,12 @@ These endpoints predate the session-based flow and are useful for debugging:
 | Endpoint | Purpose |
 |---|---|
 | `GET /walkrepo?repo_url=...` | Directory tree of a repo |
+| `POST /repo-connections` | Create or update a tenant-scoped repo connection |
+| `POST /repo-index-jobs` | Create a durable repo indexing job |
+| `GET /repo-index-jobs/{job_id}` | Read indexing job status, metrics, and errors |
 | `GET /chunks?repo_url=...` | Chunk + embed a repo, return metadata |
+| `GET /manifest?repo_url=...` | Chunk without embeddings, return/persist file and chunk hashes |
 | `GET /ast?repo_url=...` | Tree-sitter AST dump |
 | `GET /explore?repo_url=...&query=...` | One-shot agent query (no session) |
 | `GET /search?repo_url=...&query=...` | Raw pgvector similarity search |
+| `GET /search-exact?repo_url=...&query=...` | Exact string or regex search over indexed lines |

@@ -1,7 +1,7 @@
 """
 Takes a list of source file paths, parses each with Tree-sitter (Python/JS/TS/TSX),
 splits markdown by heading, and treats config/shell/markup files as whole-file chunks.
-All chunks are then split as needed to fit within text-embedding-3-small's 8191 token limit.
+All chunks are then split as needed to fit within the embedding model token limit.
 """
 
 import os
@@ -25,19 +25,35 @@ AST_PARSERS = {
     ".ts": ts_parser, ".tsx": tsx_parser,
 }
 
-# text-embedding-3-small limit is 8191, leave buffer for metadata prefix
-MAX_TOKENS = 7500
-OVERLAP_LINES = 5  # lines of overlap when splitting oversized chunks
+EMBEDDING_MODEL = "text-embedding-3-large"
+EMBEDDING_CONTEXT_WINDOW_TOKENS = int(os.environ.get("CODE_EMBEDDING_CONTEXT_WINDOW_TOKENS", "8191"))
+EMBEDDING_SAFETY_MARGIN_TOKENS = int(os.environ.get("CODE_EMBEDDING_SAFETY_MARGIN_TOKENS", "256"))
+EMBEDDING_HARD_MAX_TOKENS = max(1, EMBEDDING_CONTEXT_WINDOW_TOKENS - EMBEDDING_SAFETY_MARGIN_TOKENS)
 
-encoder = tiktoken.encoding_for_model("text-embedding-3-large") # switched to large model
-client = OpenAI()
+# Retrieval quality is better when code chunks stay focused. Keep the hard
+# model limit as a final guard, but split ordinary code well below it.
+MAX_TOKENS = min(
+    EMBEDDING_HARD_MAX_TOKENS,
+    int(os.environ.get("CODE_EMBEDDING_TARGET_TOKENS", "1800")),
+)
+OVERLAP_LINES = int(os.environ.get("CODE_EMBEDDING_OVERLAP_LINES", "8"))
+OVERLAP_TOKENS = int(os.environ.get("CODE_EMBEDDING_OVERLAP_TOKENS", "96"))
+EMBEDDING_BATCH_SIZE = int(os.environ.get("CODE_EMBEDDING_BATCH_SIZE", "64"))
+
+encoder = tiktoken.encoding_for_model(EMBEDDING_MODEL)
+_openai_client: OpenAI | None = None
+
+
+def _client() -> OpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAI()
+    return _openai_client
 
 
 def embed_query(text: str) -> list[float]:
     """Embed a single query string with the same model used for chunks."""
-    return client.embeddings.create(
-        input=[text], model="text-embedding-3-large"
-    ).data[0].embedding
+    return embed_texts([text], allow_truncate=True)[0]
 
 
 def dump_ast(node, src: bytes, depth: int = 0, max_depth: int | None = 3) -> list[str]:
@@ -60,12 +76,16 @@ class CodeChunk:
     start_line: int = 0
     end_line: int = 0
     metadata: dict = field(default_factory=dict)
+    embedding_path: str | None = None
+    chunk_sha256: str | None = None
+    embedding_sha256: str | None = None
+    embedding_model: str = EMBEDDING_MODEL
     embedding: list[float] | None = None
 
     @property
     def embedding_text(self) -> str:
         """What actually gets sent to the embedding model."""
-        prefix_parts = [f"# File: {self.file_path}"]
+        prefix_parts = [f"# File: {self.embedding_path or self.file_path}"]
         if self.parent_class:
             prefix_parts.append(f"# Class: {self.parent_class}")
         if self.name:
@@ -78,15 +98,100 @@ class CodeChunk:
         return len(encoder.encode(self.embedding_text))
 
 
+def _embedding_prefix_token_count(chunk: CodeChunk) -> int:
+    probe = CodeChunk(
+        content="",
+        chunk_type=chunk.chunk_type,
+        file_path=chunk.file_path,
+        name=chunk.name,
+        parent_class=chunk.parent_class,
+    )
+    probe.embedding_path = chunk.embedding_path
+    return probe.token_count
+
+
+def _clone_piece(
+    chunk: CodeChunk,
+    *,
+    content: str,
+    part_num: int,
+    start_line: int,
+    end_line: int,
+    split_strategy: str,
+) -> CodeChunk:
+    piece_name = f"{chunk.name} (part {part_num})" if chunk.name else f"part {part_num}"
+    piece = CodeChunk(
+        content=content,
+        chunk_type=chunk.chunk_type,
+        file_path=chunk.file_path,
+        name=piece_name,
+        parent_class=chunk.parent_class,
+        start_line=start_line,
+        end_line=end_line,
+        metadata={
+            **chunk.metadata,
+            "part": part_num,
+            "split_strategy": split_strategy,
+            "source_start_line": chunk.start_line,
+            "source_end_line": chunk.end_line,
+        },
+        embedding_path=chunk.embedding_path,
+        embedding_model=chunk.embedding_model,
+    )
+    return piece
+
+
+def _split_text_by_tokens(
+    chunk: CodeChunk,
+    *,
+    text: str,
+    start_line: int,
+    end_line: int,
+    first_part_num: int,
+) -> list[CodeChunk]:
+    prefix_tokens = _embedding_prefix_token_count(chunk)
+    available_tokens = max(1, MAX_TOKENS - prefix_tokens)
+    overlap = min(OVERLAP_TOKENS, max(0, available_tokens // 8))
+    tokens = encoder.encode(text)
+    pieces: list[CodeChunk] = []
+    token_start = 0
+
+    while token_start < len(tokens):
+        token_end = min(token_start + available_tokens, len(tokens))
+        while True:
+            content = encoder.decode(tokens[token_start:token_end])
+            piece = _clone_piece(
+                chunk,
+                content=content,
+                part_num=first_part_num + len(pieces),
+                start_line=start_line,
+                end_line=end_line,
+                split_strategy="token",
+            )
+            if piece.token_count <= MAX_TOKENS or token_end <= token_start + 1:
+                break
+            token_end -= max(1, piece.token_count - MAX_TOKENS + 8)
+        pieces.append(piece)
+        if token_end >= len(tokens):
+            break
+        token_start = max(token_end - overlap, token_start + 1)
+
+    return pieces
+
+
 def split_oversized(chunk: CodeChunk) -> list[CodeChunk]:
     """
     If a chunk exceeds MAX_TOKENS, split it at line boundaries
-    with OVERLAP_LINES of overlap between consecutive pieces.
+    with overlap between consecutive pieces. Very long single lines are
+    split by token window so no embedding request can exceed the model limit.
     """
     if chunk.token_count <= MAX_TOKENS:
         return [chunk]
 
     lines = chunk.content.splitlines(keepends=True)
+    if not lines:
+        return [chunk]
+
     pieces: list[CodeChunk] = []
     start_idx = 0
 
@@ -95,7 +200,31 @@ def split_oversized(chunk: CodeChunk) -> list[CodeChunk]:
         current_text = ""
 
         while end_idx < len(lines):
-            candidate = current_text + lines[end_idx]
+            line = lines[end_idx]
+            line_probe = CodeChunk(
+                content=line,
+                chunk_type=chunk.chunk_type,
+                file_path=chunk.file_path,
+                name=chunk.name,
+                parent_class=chunk.parent_class,
+            )
+            line_probe.embedding_path = chunk.embedding_path
+            line_probe.embedding_model = chunk.embedding_model
+            if line_probe.token_count > MAX_TOKENS:
+                if current_text:
+                    break
+                pieces.extend(_split_text_by_tokens(
+                    chunk,
+                    text=line,
+                    start_line=chunk.start_line + start_idx,
+                    end_line=chunk.start_line + start_idx,
+                    first_part_num=len(pieces) + 1,
+                ))
+                end_idx += 1
+                current_text = ""
+                break
+
+            candidate = current_text + line
             temp = CodeChunk(
                 content=candidate,
                 chunk_type=chunk.chunk_type,
@@ -103,28 +232,73 @@ def split_oversized(chunk: CodeChunk) -> list[CodeChunk]:
                 name=chunk.name,
                 parent_class=chunk.parent_class,
             )
-            if temp.token_count > MAX_TOKENS and end_idx > start_idx:
+            temp.embedding_path = chunk.embedding_path
+            temp.embedding_model = chunk.embedding_model
+            if temp.token_count > MAX_TOKENS:
                 break
             current_text = candidate
             end_idx += 1
 
-        part_num = len(pieces) + 1
-        pieces.append(CodeChunk(
-            content=current_text,
-            chunk_type=chunk.chunk_type,
-            file_path=chunk.file_path,
-            name=f"{chunk.name} (part {part_num})" if chunk.name else f"part {part_num}",
-            parent_class=chunk.parent_class,
-            start_line=chunk.start_line + start_idx,
-            end_line=chunk.start_line + end_idx - 1,
-            metadata={**chunk.metadata, "part": part_num},
-        ))
+        if current_text:
+            pieces.append(_clone_piece(
+                chunk,
+                content=current_text,
+                part_num=len(pieces) + 1,
+                start_line=chunk.start_line + start_idx,
+                end_line=chunk.start_line + end_idx - 1,
+                split_strategy="line",
+            ))
 
         if end_idx >= len(lines):
             break
         start_idx = max(end_idx - OVERLAP_LINES, start_idx + 1)
 
     return pieces
+
+
+def _truncate_embedding_text(text: str, max_tokens: int = EMBEDDING_HARD_MAX_TOKENS) -> str:
+    tokens = encoder.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+    return encoder.decode(tokens[:max_tokens])
+
+
+def embed_texts(
+    texts: list[str],
+    *,
+    model: str = EMBEDDING_MODEL,
+    allow_truncate: bool = False,
+) -> list[list[float]]:
+    """Embed raw text with deterministic preflight validation.
+
+    Code chunks should be split before this point, so oversize inputs fail with
+    local diagnostics instead of a remote provider error. Query/summary callers
+    may opt into truncation where dropping tail context is acceptable.
+    """
+    if allow_truncate:
+        prepared = [_truncate_embedding_text(text) for text in texts]
+    else:
+        prepared = texts
+        oversize = [
+            (idx, len(encoder.encode(text)))
+            for idx, text in enumerate(prepared)
+            if len(encoder.encode(text)) > EMBEDDING_HARD_MAX_TOKENS
+        ]
+        if oversize:
+            details = ", ".join(
+                f"input[{idx}]={count} tokens" for idx, count in oversize[:5]
+            )
+            raise ValueError(
+                "Embedding input exceeds model token budget after chunking: "
+                f"{details}. Hard max is {EMBEDDING_HARD_MAX_TOKENS} tokens."
+            )
+
+    embeddings: list[list[float]] = []
+    for i in range(0, len(prepared), EMBEDDING_BATCH_SIZE):
+        batch = prepared[i:i + EMBEDDING_BATCH_SIZE]
+        resp = _client().embeddings.create(input=batch, model=model)
+        embeddings.extend(datum.embedding for datum in resp.data)
+    return embeddings
 
 
 def get_node_name(node) -> str | None:
@@ -439,7 +613,9 @@ def extract_whole_file_chunk(source: bytes, file_path: str, chunk_type: str) -> 
 
 _JS_EXT_PARSERS = {".js": js_parser, ".jsx": js_parser, ".ts": ts_parser, ".tsx": tsx_parser}
 _WHOLE_FILE_TYPES = {
-    ".json": "config", ".yaml": "config", ".yml": "config",
+    ".json": "config", ".toml": "config", ".yaml": "config", ".yml": "config",
+    ".ini": "config", ".cfg": "config", ".conf": "config",
+    ".env": "config", ".example": "config", ".sample": "config", ".template": "config",
     ".css": "stylesheet",
     ".html": "markup", ".htm": "markup",
     ".sh": "shell",
@@ -458,14 +634,14 @@ def _dispatch_extract(source: bytes, file_path: str) -> list[CodeChunk]:
     return extract_whole_file_chunk(source, file_path, _WHOLE_FILE_TYPES.get(ext, "file"))
 
 
-def chunk_file_list(file_paths: list[str]) -> list[CodeChunk]:
+def chunk_file_list(file_paths: list[str], *, embed: bool = True) -> list[CodeChunk]:
     """
     Main entry point. Takes a pre-filtered list of source file paths,
     dispatches to the right extractor by extension, then splits any
     oversized chunks to fit the embedding model token limit.
 
     Supported extensions:
-      .py .js .jsx .ts .tsx .md .json .yaml .yml .css .html .sh
+      .py .js .jsx .ts .tsx .md .json .toml .yaml .yml .ini .cfg .conf .css .html .sh
     """
     all_chunks = []
     for path in file_paths:
@@ -475,14 +651,20 @@ def chunk_file_list(file_paths: list[str]) -> list[CodeChunk]:
         for chunk in raw_chunks:
             all_chunks.extend(split_oversized(chunk))
 
-    BATCH_SIZE = 100
-    for i in range(0, len(all_chunks), BATCH_SIZE):
-        batch = all_chunks[i:i + BATCH_SIZE]
-        resp = client.embeddings.create(
-            input=[c.embedding_text for c in batch],
-            model="text-embedding-3-large",
-        )
-        for chunk, datum in zip(batch, resp.data):
-            chunk.embedding = datum.embedding
+    if not embed:
+        return all_chunks
 
+    embed_chunks(all_chunks)
     return all_chunks
+
+
+def embed_chunks(chunks: list[CodeChunk]) -> int:
+    """Embed chunks that do not already have an embedding. Returns misses embedded."""
+    pending = [c for c in chunks if c.embedding is None]
+    if not pending:
+        return 0
+
+    embeddings = embed_texts([c.embedding_text for c in pending])
+    for chunk, embedding in zip(pending, embeddings):
+        chunk.embedding = embedding
+    return len(pending)
