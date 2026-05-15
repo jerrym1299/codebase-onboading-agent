@@ -13,11 +13,33 @@ CODE_EXTS = (
     ".xls", ".xlsx", ".ppt", ".pptx",
 )
 
+# Files without a recognized extension (or with no extension at all) that should
+# still be indexed. Critical for "how do I run this?" answers — env templates,
+# Dockerfiles, Procfiles, runtime-version files, etc. NEVER include bare `.env`
+# / `.env.local` / `.env.production` here: those routinely contain real secrets.
+ALWAYS_INCLUDE_NAMES = frozenset({
+    "Dockerfile", "Procfile", "Makefile", "makefile", "justfile",
+    ".nvmrc", ".python-version", ".ruby-version", ".tool-versions",
+    ".env.example", ".env.sample", ".env.template", ".env.dist",
+    "env.example", "env.sample", "env.template", "env.dist",
+})
+
+
+def _is_always_included(filename: str) -> bool:
+    if filename in ALWAYS_INCLUDE_NAMES:
+        return True
+    if filename.startswith("Dockerfile."):
+        return True
+    return False
+
 
 def _walk(repo_dir: str):
     for dirpath, dirnames, filenames in os.walk(repo_dir):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        filenames[:] = [f for f in filenames if f.endswith(CODE_EXTS)]
+        filenames[:] = [
+            f for f in filenames
+            if f.endswith(CODE_EXTS) or _is_always_included(f)
+        ]
         yield dirpath, dirnames, filenames
 
 

@@ -29,14 +29,14 @@ AST_PARSERS = {
 MAX_TOKENS = 7500
 OVERLAP_LINES = 5  # lines of overlap when splitting oversized chunks
 
-encoder = tiktoken.encoding_for_model("text-embedding-3-small")
+encoder = tiktoken.encoding_for_model("text-embedding-3-large") # switched to large model
 client = OpenAI()
 
 
 def embed_query(text: str) -> list[float]:
     """Embed a single query string with the same model used for chunks."""
     return client.embeddings.create(
-        input=[text], model="text-embedding-3-small"
+        input=[text], model="text-embedding-3-large"
     ).data[0].embedding
 
 
@@ -480,7 +480,7 @@ def chunk_file_list(file_paths: list[str]) -> list[CodeChunk]:
         batch = all_chunks[i:i + BATCH_SIZE]
         resp = client.embeddings.create(
             input=[c.embedding_text for c in batch],
-            model="text-embedding-3-small",
+            model="text-embedding-3-large",
         )
         for chunk, datum in zip(batch, resp.data):
             chunk.embedding = datum.embedding
