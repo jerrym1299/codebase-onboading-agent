@@ -4,21 +4,22 @@ using gpt-5.4 over the already-extracted code chunks, then embed them
 for semantic search.
 """
 
+import logging
 import os
 from collections import defaultdict
-
+from typing import Awaitable, Callable
+import asyncio
 import tiktoken
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from services.chunk_and_embed import CodeChunk
 from services.db import DirSummary
 
-client = OpenAI()
+client = AsyncOpenAI()
+logger = logging.getLogger(__name__)
 
-# gpt-5.4: 1M context, 128k max output. Reserve 100k for output and
-# ~100k headroom for system prompt + formatting + tokenizer drift.
 MAX_INPUT_TOKENS = 800_000
-MAX_OUTPUT_TOKENS = 100_000
+MAX_OUTPUT_TOKENS = 10_000
 
 # o200k_base is the encoding family used since gpt-4o; safe default
 # while gpt-5.4 may not yet be registered in tiktoken's model table.
@@ -91,44 +92,80 @@ SYSTEM_PROMPT = (
     "No fluff, no boilerplate, no restating the file list."
 )
 
+SEM = asyncio.Semaphore(16)
 
-def generate_dir_summaries(
-    chunks: list[CodeChunk],
-    repo_dir: str,
-) -> list[DirSummary]:
-    """Group chunks by directory, summarise each with gpt-5.4, embed the
-    summaries with text-embedding-3-large, and return DirSummary rows."""
-    groups = _group_by_directory(chunks)
-    summaries: list[DirSummary] = []
 
-    for dir_path, dir_chunks in groups.items():
-        rel_dir = os.path.relpath(dir_path, repo_dir) if dir_path != repo_dir else "."
-        context = _build_dir_context(dir_path, dir_chunks)
-
-        resp = client.chat.completions.create(
+async def summarise_one(
+    dir_path: str, dir_chunks: list[CodeChunk], repo_dir: str,
+) -> DirSummary:
+    context = _build_dir_context(dir_path, dir_chunks)
+    async with SEM:
+        resp = await client.chat.completions.create(
             model="gpt-5.4",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": context},
             ],
-            max_tokens=MAX_OUTPUT_TOKENS,
+            max_completion_tokens=MAX_OUTPUT_TOKENS,
         )
-        summary_text = resp.choices[0].message.content.strip()
+    summary_text = resp.choices[0].message.content.strip()
+    files_in_dir = sorted({os.path.basename(c.file_path) for c in dir_chunks})
+    rel_dir = os.path.relpath(dir_path, repo_dir) if dir_path != repo_dir else "."
+    return DirSummary(dir_path=rel_dir, summary=summary_text, file_list=files_in_dir)
 
-        files_in_dir = sorted({os.path.basename(c.file_path) for c in dir_chunks})
-        summaries.append(DirSummary(
-            dir_path=rel_dir,
-            summary=summary_text,
-            file_list=files_in_dir,
-        ))
+
+ProgressCallback = Callable[[int, int, str], Awaitable[None]]
+
+
+async def _summarise_with_label(
+    dir_path: str, dir_chunks: list[CodeChunk], repo_dir: str,
+) -> tuple[str, DirSummary | BaseException]:
+    try:
+        return dir_path, await summarise_one(dir_path, dir_chunks, repo_dir)
+    except BaseException as exc:  # noqa: BLE001
+        return dir_path, exc
+
+
+async def generate_dir_summaries(
+    chunks: list[CodeChunk],
+    repo_dir: str,
+    on_progress: ProgressCallback | None = None,
+) -> list[DirSummary]:
+    """Group chunks by directory, summarise each with gpt-5.4, embed the
+    summaries with text-embedding-3-large, and return DirSummary rows.
+
+    If on_progress is supplied, it is awaited after each per-directory
+    summary completes with (done, total, dir_path)."""
+    groups = _group_by_directory(chunks)
+    total = len(groups)
+
+    tasks = [
+        asyncio.create_task(_summarise_with_label(d, c, repo_dir))
+        for d, c in groups.items()
+    ]
+
+    summaries: list[DirSummary] = []
+    done = 0
+    for fut in asyncio.as_completed(tasks):
+        dir_path, result = await fut
+        done += 1
+        if isinstance(result, DirSummary):
+            summaries.append(result)
+        else:
+            logger.warning("dir summary failed for %s: %s", dir_path, result)
+        if on_progress is not None:
+            try:
+                await on_progress(done, total, dir_path)
+            except Exception:  # noqa: BLE001
+                logger.exception("on_progress callback raised; continuing")
 
     if summaries:
         texts = [f"Directory: {s.dir_path}\n{s.summary}" for s in summaries]
         BATCH = 100
         for i in range(0, len(texts), BATCH):
             batch = texts[i:i + BATCH]
-            resp = client.embeddings.create(
-                input=batch, model="text-embedding-3-large"
+            resp = await client.embeddings.create(
+                input=batch, model="text-embedding-3-large",
             )
             for s, datum in zip(summaries[i:i + BATCH], resp.data):
                 s.embedding = datum.embedding

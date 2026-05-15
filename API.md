@@ -1,6 +1,6 @@
 # Codebase Onboarding Agent — API Documentation
 
-Backend API for long-lived AI chat sessions over any GitHub repository. A separate frontend client consumes this API.
+Backend API for long-lived AI chat sessions over **one or more** GitHub repositories. The backend clones, indexes, analyses, extracts wire boundaries from each repo, then runs a deterministic cross-repo matcher and a streaming consolidator that emits a single app-level startup plan. A separate frontend client consumes this API.
 
 ---
 
@@ -18,11 +18,19 @@ Required env: `OPENAI_API_KEY`. Optional: `TEMPORAL_HOST`, `DATABASE_URL`, `AGEN
 ### Typical Client Flow
 
 ```
-1. POST /sessions { repo_url }           → get session_id
-2. Poll GET /sessions/:id                → wait for status: "ready"
-3. POST /sessions/:id/messages { content }→ SSE stream of agent events
-4. On reconnect: GET /sessions/:id/messages → full history for hydration
-5. Repeat step 3 for each user message
+1. POST /sessions { repo_urls: [...] }       → get session_id
+2. Poll GET /sessions/:id                    → wait for status: "ready"
+                                              (clone+index+analyze+extract per repo,
+                                               then matcher, then consolidator)
+3. GET /sessions/:id/startup-plan            → consolidated app-level markdown
+4. POST /sessions/:id/messages { content }   → SSE stream of agent events
+5. On reconnect: GET /sessions/:id/messages  → full history for hydration
+6. Repeat step 4 for each user message
+
+Optional:
+- POST /sessions/:id/startup-plan/recompute  → rerun whole pipeline
+- POST /sessions/:id/startup-plan/export     → markdown + base64 PDF
+- GET  /sessions/:id/repos/:repo_url/...     → per-repo diagnostics
 ```
 
 ---
@@ -31,21 +39,31 @@ Required env: `OPENAI_API_KEY`. Optional: `TEMPORAL_HOST`, `DATABASE_URL`, `AGEN
 
 ### `POST /sessions`
 
-Create a new chat session for a repository. Starts a Temporal workflow that clones and indexes the repo.
+Create a new chat session for one or more repositories. Starts a Temporal workflow that clones, indexes, analyses, and matches every repo in parallel, then runs the streaming consolidator.
 
 **Request**
+```json
+{ "repo_urls": ["https://github.com/org/repo-a", "https://github.com/org/repo-b"] }
+```
+
+Legacy single-repo payload still works (treated as a one-element list):
 ```json
 { "repo_url": "https://github.com/org/repo" }
 ```
 
+URLs are normalised (`rstrip("/")`, deduped, sorted). The session is keyed on `repo_set_hash = sha256("\n".join(sorted(repo_urls)))`, so two sessions over the same repo set share the consolidated `app_startup_plans` row.
+
 **Response**
 ```json
-{ "session_id": "uuid" }
+{
+  "session_id": "uuid",
+  "repo_urls": ["https://github.com/org/repo-a", "https://github.com/org/repo-b"]
+}
 ```
 
 **Errors**
 ```json
-{ "error": "Missing 'repo_url'." }
+{ "error": "Missing 'repo_urls' (or legacy 'repo_url')." }
 ```
 
 ---
@@ -144,19 +162,154 @@ Connection: keep-alive
 
 ---
 
+### `GET /sessions/{session_id}/startup-plan`
+
+Fetch the consolidated **app-level** startup plan covering every repo in the session. The consolidator emits this as a single markdown document with sections: `# Startup plan: ...`, `## Prerequisites`, `## Env vars`, `## Steps`, `## Dependency graph` (Mermaid), `## Caveats`.
+
+**Response**
+```json
+{
+  "repo_set_hash": "<sha256>",
+  "repo_urls": ["https://github.com/org/repo-a", "https://github.com/org/repo-b"],
+  "plan_markdown": "# Startup plan: …\n## Prerequisites\n…",
+  "graph": {
+    "nodes": [
+      { "kind": "repo", "id": "https://github.com/org/repo-a", "name": "repo-a" },
+      { "kind": "infra", "id": "postgres:DATABASE_URL", "infra_kind": "postgres", "target_env": "DATABASE_URL" }
+    ],
+    "edges": [
+      { "source": "https://github.com/org/repo-a", "target": "postgres:DATABASE_URL",
+        "edge_type": "shared_infra", "confidence": 0.9, "evidence": [...], "match_reason": "infra:postgres" }
+    ],
+    "topo_order": [["postgres:DATABASE_URL"], ["https://github.com/org/repo-a"]],
+    "cycle_breaks": []
+  },
+  "ambiguities": [{ "repo_url": "...", "field": "consumed[3]", "reason": "..." }],
+  "orchestration_findings": [{ "repo_url": "...", "file": "...", "parsed_services": [...], "parsed_dependencies": [...] }],
+  "analysis_status": "ok",
+  "model": "gpt-5.4",
+  "error": null,
+  "updated_at": "2026-05-12T07:26:14.75761+00:00"
+}
+```
+
+**Pending**: returns `404 { "status": "pending" }` until the consolidator finishes.
+
+**Errors**
+```json
+{ "error": "Session not found." }
+```
+
+---
+
+### `POST /sessions/{session_id}/startup-plan/recompute`
+
+Force a full re-analysis. Reruns the **whole** pipeline (per-repo clone/index/analyze/extract with `force=True`, then matcher, then consolidator). Returns immediately; watch `GET /sessions/:id` for `status` to flip back to `ready`.
+
+**Request** (optional)
+```json
+{ "reason": "added a new env var" }
+```
+
+**Response** `202 Accepted`
+```json
+{ "status": "recomputing", "session_id": "uuid" }
+```
+
+---
+
+### `POST /sessions/{session_id}/startup-plan/export`
+
+Thin wrapper: read the persisted `app_startup_plans.plan_markdown`, render to PDF via `services/pdf_output.py::write_markdown_pdf`. **No agent runs** — the consolidator already verified the markdown.
+
+**Response**
+```json
+{
+  "session_id": "uuid",
+  "repo_urls": ["https://github.com/org/repo-a", "..."],
+  "markdown": "# Startup plan: …",
+  "pdf_base64": "<base64-encoded PDF bytes>"
+}
+```
+
+**Pending / errors** same as `GET /sessions/:id/startup-plan`.
+
+---
+
+### `GET /sessions/{session_id}/repos/{repo_url}/startup-plan`
+
+Per-repo diagnostic: returns the persisted `startup_plans` row for one repo in the session. `:repo_url` must be URL-encoded (e.g. `https%3A%2F%2Fgithub.com%2Forg%2Frepo`).
+
+**Response**
+```json
+{
+  "repo_url": "https://github.com/org/repo",
+  "plan": { ... },
+  "analysis_status": "ok",
+  "overall_confidence": null,
+  "model": "gpt-5.4",
+  "truncations": [],
+  "error": null,
+  "updated_at": "..."
+}
+```
+
+**Errors**
+```json
+{ "error": "Repo not part of session.", "repo_urls": [...] }
+{ "status": "pending" }
+```
+
+---
+
+### `GET /sessions/{session_id}/repos/{repo_url}/boundaries`
+
+Per-repo diagnostic: returns the `repo_boundaries` row produced by `boundary_extractor_agent`. Same URL-encoding rule for `:repo_url`.
+
+**Response**
+```json
+{
+  "repo_url": "https://github.com/org/repo",
+  "report": {
+    "repo_url": "https://github.com/org/repo",
+    "exposed": [{ "kind": "http", "method": "GET", "path": "/api/users", "handler": "users.py:42" }],
+    "consumed": [
+      { "kind": "http", "target_env": "BACKEND_URL", "resolved": "http://localhost:8000", "resolved_from": ".env.example", "path": "/api" },
+      { "kind": "db", "engine": "postgres", "target_env": "DATABASE_URL", "resolved": null, "resolved_from": null }
+    ],
+    "dev_proxy": [],
+    "required_services": [{ "kind": "postgres", "via": "DATABASE_URL" }],
+    "ambiguities": []
+  },
+  "analysis_status": "ok",
+  "model": "gpt-5.4",
+  "error": null,
+  "updated_at": "..."
+}
+```
+
+---
+
 ## SSE Event Types
 
 Events follow the AI SDK v6 UI Message Stream protocol.
 
 | Event Type | Fields | When |
 |---|---|---|
-| `text-delta` | `textDelta: string` | Each token of agent text output |
+| `text-delta` | `textDelta: string` | Each token of agent text output (chat turns and consolidator) |
 | `tool-input-available` | `toolCallId`, `toolName`, `args` | Agent calls a tool |
 | `tool-output-available` | `toolCallId`, `output` | Tool returns a result |
 | `data-handoff` | `agent: string` | Agent hands off to a sub-agent |
 | `data-needs-input` | `pendingId`, `question`, `options` | Agent asks user a clarifying question (see Human-in-the-Loop) |
 | `text` | `text: string` | Final complete text of a message segment |
+| `data-repo-progress` | `repo_url`, `stage` | Per-repo lifecycle: `cloning|cloned|indexing|indexed|extracting_boundaries|boundaries_extracted` |
+| `data-startup-plan-updated` | `updatedAt` | Per-repo `startup_plans` row written or refreshed |
+| `data-graph-built` | `node_count`, `edge_count`, `ambiguity_count` | Cross-repo matcher finished; placeholder `app_startup_plans` row exists |
+| `data-consolidator-started` | `repo_set_hash` | Consolidator agent is about to stream — text-deltas + tool events follow until `data-app-plan-updated` |
+| `data-app-plan-updated` | `updatedAt`, `repo_set_hash` | Consolidated app-level markdown persisted |
 | `finish` | — | End of stream; close the SSE connection |
+
+> **Note:** the indexing/analysis events (`data-repo-progress`, `data-startup-plan-updated`, `data-graph-built`, `data-consolidator-*`, `data-app-plan-updated`) only flow to a client that's subscribed to the per-session pubsub when they fire. To watch indexing progress live without sending a chat message, use `GET /sessions/{session_id}/events` after `POST /sessions`; it terminates when the session reaches `ready`, `failed`, or `ended`.
 
 ---
 
