@@ -36,9 +36,10 @@ from services.db import (
     CODE_SEARCH_SQL, close_pool, create_repo_index_job, ensure_repo_connection,
     get_app_startup_plan_row, get_dir_summaries_for_repo, get_pool,
     get_repo_boundaries_row, get_repo_index_job, get_session_repo_urls,
-    get_startup_plan_row, init_schema, insert_session_repos, prepare_repo_index,
-    search_repo_text_lines, store_chunks, store_repo_manifest,
-    store_repo_text_lines,
+    get_startup_plan_row, init_schema, insert_session_repos,
+    list_sandbox_command_runs, list_sandbox_runs_for_session,
+    prepare_repo_index, search_repo_text_lines, store_chunks,
+    store_repo_manifest, store_repo_text_lines,
 )
 from services.cleanup import delete_app_plan_data, delete_repo_data, delete_session_data
 from services.embedding_cache import hydrate_embeddings
@@ -678,6 +679,28 @@ async def get_session_dir_summaries_endpoint(session_id: str):
         "session_id": session_id,
         "repo_urls": repo_urls,
         "repos": repos,
+    }
+
+
+@app.get("/sessions/{session_id}/sandbox-runs")
+async def get_session_sandbox_runs_endpoint(session_id: str):
+    """Diagnostic: sandbox executions created for verifier command runs."""
+    runs = await list_sandbox_runs_for_session(session_id)
+    return {
+        "session_id": session_id,
+        "count": len(runs),
+        "sandbox_runs": runs,
+    }
+
+
+@app.get("/sandbox-runs/{sandbox_run_id}/commands")
+async def get_sandbox_run_commands_endpoint(sandbox_run_id: str):
+    """Diagnostic: persisted commands for a sandbox execution."""
+    commands = await list_sandbox_command_runs(sandbox_run_id)
+    return {
+        "sandbox_run_id": sandbox_run_id,
+        "count": len(commands),
+        "commands": commands,
     }
 
 
