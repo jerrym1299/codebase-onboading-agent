@@ -11,6 +11,7 @@ import logging
 import os
 from dataclasses import dataclass
 from urllib.parse import quote_plus, urlparse
+from uuid import UUID
 
 import psycopg
 from pgvector.psycopg import register_vector_async
@@ -74,6 +75,12 @@ SESSION_MIGRATION_SQLS = (
     """,
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS app_plan_hash TEXT",
     "ALTER TABLE sessions DROP COLUMN IF EXISTS repo_url",
+    """ALTER TABLE app_startup_plans
+      ADD COLUMN IF NOT EXISTS verification_status TEXT
+      CHECK (verification_status IN ('not_started','running','passed','blocked','failed'))
+      DEFAULT 'not_started';""",
+    """ALTER TABLE app_startup_plans
+      ADD COLUMN IF NOT EXISTS verification JSONB NOT NULL DEFAULT '{}'::jsonb;""",
 )
 
 
@@ -471,6 +478,61 @@ CREATE INDEX IF NOT EXISTS pending_actions_session_idx
 CREATE INDEX IF NOT EXISTS pending_actions_session_open_idx
     ON pending_actions (session_id) WHERE status = 'open';
 
+CREATE TABLE IF NOT EXISTS sandbox_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID REFERENCES sessions(id) ON DELETE SET NULL,
+    provider TEXT NOT NULL DEFAULT 'local',
+    external_id TEXT,
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('created', 'running', 'complete', 'failed', 'cancelled')),
+    repo_set_hash TEXT,
+    preview_url TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS sandbox_runs_session_idx
+    ON sandbox_runs (session_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS sandbox_runs_provider_external_idx
+    ON sandbox_runs (provider, external_id)
+    WHERE external_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS sandbox_command_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    sandbox_run_id UUID NOT NULL REFERENCES sandbox_runs(id) ON DELETE CASCADE,
+    session_id UUID REFERENCES sessions(id) ON DELETE SET NULL,
+    run_kind TEXT NOT NULL DEFAULT 'command'
+        CHECK (run_kind IN ('command', 'background_process')),
+    command TEXT NOT NULL,
+    cwd TEXT,
+    process_handle TEXT,
+    pid INT,
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running', 'complete', 'failed', 'timed_out', 'cancelled')),
+    exit_code INT,
+    timed_out BOOLEAN NOT NULL DEFAULT FALSE,
+    duration_ms INT,
+    stdout_tail TEXT,
+    stderr_tail TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS sandbox_command_runs_sandbox_idx
+    ON sandbox_command_runs (sandbox_run_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS sandbox_command_runs_session_idx
+    ON sandbox_command_runs (session_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS sandbox_command_runs_handle_idx
+    ON sandbox_command_runs (process_handle)
+    WHERE process_handle IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS startup_plans (
     repo_url           TEXT PRIMARY KEY,
     plan               JSONB NOT NULL,
@@ -530,9 +592,9 @@ async def init_schema():
     pool = await get_pool()
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
+            await cur.execute(SCHEMA_SQL)
             for sql in SESSION_MIGRATION_SQLS:
                 await cur.execute(sql)
-            await cur.execute(SCHEMA_SQL)
 
     try:
         async with pool.connection() as conn:
@@ -809,6 +871,9 @@ async def claim_next_repo_index_job() -> dict | None:
             SET status = 'cloning',
                 attempt_count = attempt_count + 1,
                 started_at = COALESCE(started_at, NOW()),
+                completed_at = NULL,
+                error_code = NULL,
+                error_message = NULL,
                 updated_at = NOW()
             WHERE id = (SELECT id FROM next_job)
             RETURNING id
@@ -833,6 +898,9 @@ async def update_repo_index_job_status(
 
     if status in {"cloning", "manifesting", "indexing", "embedding", "summarizing"}:
         set_sql.append("started_at = COALESCE(started_at, NOW())")
+        set_sql.append("completed_at = NULL")
+        set_sql.append("error_code = NULL")
+        set_sql.append("error_message = NULL")
     if status in {"complete", "failed", "cancelled"}:
         set_sql.append("completed_at = NOW()")
     if status == "complete":
@@ -1629,6 +1697,304 @@ async def insert_session_repos(session_id: str, repo_urls: list[str]) -> None:
         )
 
 
+def _sandbox_run_dict(row) -> dict:
+    return {
+        "id": str(row[0]),
+        "session_id": str(row[1]) if row[1] is not None else None,
+        "provider": row[2],
+        "external_id": row[3],
+        "status": row[4],
+        "repo_set_hash": row[5],
+        "preview_url": row[6],
+        "metadata": row[7] or {},
+        "created_at": row[8].isoformat(),
+        "updated_at": row[9].isoformat(),
+        "completed_at": _iso_or_none(row[10]),
+    }
+
+
+def _sandbox_command_run_dict(row) -> dict:
+    return {
+        "id": str(row[0]),
+        "sandbox_run_id": str(row[1]),
+        "session_id": str(row[2]) if row[2] is not None else None,
+        "run_kind": row[3],
+        "command": row[4],
+        "cwd": row[5],
+        "process_handle": row[6],
+        "pid": row[7],
+        "status": row[8],
+        "exit_code": row[9],
+        "timed_out": row[10],
+        "duration_ms": row[11],
+        "stdout_tail": row[12],
+        "stderr_tail": row[13],
+        "metadata": row[14] or {},
+        "created_at": row[15].isoformat(),
+        "updated_at": row[16].isoformat(),
+        "completed_at": _iso_or_none(row[17]),
+    }
+
+
+SANDBOX_RUN_SELECT_COLUMNS = """
+    id, session_id, provider, external_id, status, repo_set_hash, preview_url,
+    metadata, created_at, updated_at, completed_at
+"""
+
+SANDBOX_COMMAND_SELECT_COLUMNS = """
+    id, sandbox_run_id, session_id, run_kind, command, cwd, process_handle, pid,
+    status, exit_code, timed_out, duration_ms, stdout_tail, stderr_tail,
+    metadata, created_at, updated_at, completed_at
+"""
+
+
+async def ensure_sandbox_run(
+    session_id: str,
+    *,
+    provider: str = "local",
+    repo_set_hash: str | None = None,
+    external_id: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Return the active sandbox run for a session/provider, creating one if needed."""
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            SELECT {SANDBOX_RUN_SELECT_COLUMNS}
+            FROM sandbox_runs
+            WHERE session_id = %s
+              AND provider = %s
+              AND status IN ('created', 'running')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (session_id, provider),
+        )
+        row = await cur.fetchone()
+        if row is not None:
+            return _sandbox_run_dict(row)
+
+        await cur.execute(
+            f"""
+            INSERT INTO sandbox_runs
+                (session_id, provider, external_id, status, repo_set_hash, metadata)
+            VALUES (%s, %s, %s, 'running', %s, %s::jsonb)
+            RETURNING {SANDBOX_RUN_SELECT_COLUMNS}
+            """,
+            (
+                session_id,
+                provider,
+                external_id,
+                repo_set_hash,
+                _json_value(metadata),
+            ),
+        )
+        row = await cur.fetchone()
+    return _sandbox_run_dict(row)
+
+
+async def create_sandbox_command_run(
+    *,
+    sandbox_run_id: str,
+    session_id: str,
+    command: str,
+    cwd: str,
+    run_kind: str,
+    process_handle: str | None = None,
+    pid: int | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            INSERT INTO sandbox_command_runs
+                (sandbox_run_id, session_id, run_kind, command, cwd,
+                 process_handle, pid, status, metadata)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'running', %s::jsonb)
+            RETURNING {SANDBOX_COMMAND_SELECT_COLUMNS}
+            """,
+            (
+                sandbox_run_id,
+                session_id,
+                run_kind,
+                command,
+                cwd or None,
+                process_handle,
+                pid,
+                _json_value(metadata),
+            ),
+        )
+        row = await cur.fetchone()
+    return _sandbox_command_run_dict(row)
+
+
+async def update_sandbox_run(
+    sandbox_run_id: str,
+    *,
+    status: str | None = None,
+    external_id: str | None = None,
+    preview_url: str | None = None,
+    metadata: dict | None = None,
+) -> dict | None:
+    assignments = ["updated_at = NOW()"]
+    params: list[object] = []
+
+    if status is not None:
+        assignments.append("status = %s")
+        params.append(status)
+        if status in {"complete", "failed", "cancelled"}:
+            assignments.append("completed_at = COALESCE(completed_at, NOW())")
+    if external_id is not None:
+        assignments.append("external_id = %s")
+        params.append(external_id)
+    if preview_url is not None:
+        assignments.append("preview_url = %s")
+        params.append(preview_url)
+    if metadata is not None:
+        assignments.append("metadata = metadata || %s::jsonb")
+        params.append(_json_value(metadata))
+
+    params.append(sandbox_run_id)
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            UPDATE sandbox_runs
+            SET {', '.join(assignments)}
+            WHERE id = %s
+            RETURNING {SANDBOX_RUN_SELECT_COLUMNS}
+            """,
+            params,
+        )
+        row = await cur.fetchone()
+    return _sandbox_run_dict(row) if row is not None else None
+
+
+async def update_sandbox_command_run(
+    command_run_id: str,
+    *,
+    status: str | None = None,
+    exit_code: int | None = None,
+    timed_out: bool | None = None,
+    duration_ms: int | None = None,
+    pid: int | None = None,
+    stdout_tail: str | None = None,
+    stderr_tail: str | None = None,
+    metadata: dict | None = None,
+) -> dict | None:
+    assignments = ["updated_at = NOW()"]
+    params: list[object] = []
+
+    if status is not None:
+        assignments.append("status = %s")
+        params.append(status)
+        if status in {"complete", "failed", "timed_out", "cancelled"}:
+            assignments.append("completed_at = COALESCE(completed_at, NOW())")
+    if exit_code is not None:
+        assignments.append("exit_code = %s")
+        params.append(exit_code)
+    if timed_out is not None:
+        assignments.append("timed_out = %s")
+        params.append(timed_out)
+    if duration_ms is not None:
+        assignments.append("duration_ms = %s")
+        params.append(duration_ms)
+    if pid is not None:
+        assignments.append("pid = %s")
+        params.append(pid)
+    if stdout_tail is not None:
+        assignments.append("stdout_tail = %s")
+        params.append(stdout_tail)
+    if stderr_tail is not None:
+        assignments.append("stderr_tail = %s")
+        params.append(stderr_tail)
+    if metadata is not None:
+        assignments.append("metadata = metadata || %s::jsonb")
+        params.append(_json_value(metadata))
+
+    params.append(command_run_id)
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            UPDATE sandbox_command_runs
+            SET {', '.join(assignments)}
+            WHERE id = %s
+            RETURNING {SANDBOX_COMMAND_SELECT_COLUMNS}
+            """,
+            params,
+        )
+        row = await cur.fetchone()
+    return _sandbox_command_run_dict(row) if row is not None else None
+
+
+async def get_sandbox_run(sandbox_run_id: str) -> dict | None:
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            SELECT {SANDBOX_RUN_SELECT_COLUMNS}
+            FROM sandbox_runs
+            WHERE id = %s
+            """,
+            (sandbox_run_id,),
+        )
+        row = await cur.fetchone()
+    return _sandbox_run_dict(row) if row is not None else None
+
+
+async def list_sandbox_runs_for_session(session_id: str) -> list[dict]:
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            SELECT {SANDBOX_RUN_SELECT_COLUMNS}
+            FROM sandbox_runs
+            WHERE session_id = %s
+            ORDER BY created_at DESC
+            """,
+            (session_id,),
+        )
+        rows = await cur.fetchall()
+    return [_sandbox_run_dict(row) for row in rows]
+
+
+async def get_sandbox_command_run_by_handle(session_id: str, handle: str) -> dict | None:
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            SELECT {SANDBOX_COMMAND_SELECT_COLUMNS}
+            FROM sandbox_command_runs
+            WHERE session_id = %s
+              AND process_handle = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (session_id, handle),
+        )
+        row = await cur.fetchone()
+    return _sandbox_command_run_dict(row) if row is not None else None
+
+
+async def list_sandbox_command_runs(sandbox_run_id: str) -> list[dict]:
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            SELECT {SANDBOX_COMMAND_SELECT_COLUMNS}
+            FROM sandbox_command_runs
+            WHERE sandbox_run_id = %s
+            ORDER BY created_at ASC
+            """,
+            (sandbox_run_id,),
+        )
+        rows = await cur.fetchall()
+    return [_sandbox_command_run_dict(row) for row in rows]
+
+
 REPO_BOUNDARIES_SELECT_SQL = """
     SELECT report, analysis_status, model, error, created_at, updated_at
     FROM repo_boundaries
@@ -1677,6 +2043,273 @@ async def get_dir_summaries_for_repo(repo_url: str) -> list[dict]:
     ]
 
 
+async def get_repo_index(repo_index_id: str) -> dict | None:
+    try:
+        UUID(str(repo_index_id))
+    except ValueError:
+        return None
+
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT i.id, i.tenant_id, i.repo_connection_id, i.repo_url,
+                   i.commit_sha, i.branch, i.manifest_sha256,
+                   i.root_merkle_sha256, i.file_count, i.chunk_count,
+                   i.line_count, i.embedding_model, i.status, i.metadata,
+                   i.created_at, i.updated_at, i.completed_at,
+                   c.provider, c.default_branch, c.installation_id, c.metadata
+            FROM repo_indexes i
+            JOIN repo_connections c ON c.id = i.repo_connection_id
+            WHERE i.id = %s
+            """,
+            (repo_index_id,),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "id": str(row[0]),
+        "tenant_id": str(row[1]),
+        "repo_connection_id": str(row[2]),
+        "repo_url": row[3],
+        "commit_sha": row[4],
+        "branch": row[5],
+        "manifest_sha256": row[6],
+        "root_merkle_sha256": row[7],
+        "file_count": row[8],
+        "chunk_count": row[9],
+        "line_count": row[10],
+        "embedding_model": row[11],
+        "status": row[12],
+        "metadata": row[13] or {},
+        "created_at": row[14].isoformat(),
+        "updated_at": row[15].isoformat(),
+        "completed_at": _iso_or_none(row[16]),
+        "provider": row[17],
+        "default_branch": row[18],
+        "installation_id": row[19],
+        "repo_connection_metadata": row[20] or {},
+    }
+
+
+async def get_repo_recipe_candidate_evidence(
+    repo_index_id: str,
+    *,
+    file_limit: int = 350,
+    line_limit: int = 3500,
+    dir_summary_limit: int = 75,
+    chunk_limit: int = 35,
+) -> dict | None:
+    """Collect indexed evidence used to draft a runnable Daytona recipe candidate.
+
+    This deliberately uses the persisted index instead of a local checkout so
+    the cloud API can generate a candidate immediately after an async index job
+    completes.
+    """
+    repo_index = await get_repo_index(repo_index_id)
+    if repo_index is None:
+        return None
+
+    repo_url = repo_index["repo_url"]
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT file_path, file_sha256, size_bytes, language, extension,
+                   is_generated, is_vendor, updated_at
+            FROM repo_files
+            WHERE repo_url = %s
+            ORDER BY file_path
+            LIMIT %s
+            """,
+            (repo_url, file_limit),
+        )
+        file_rows = await cur.fetchall()
+
+        files = [
+            {
+                "file_path": row[0],
+                "file_sha256": row[1],
+                "size_bytes": row[2],
+                "language": row[3],
+                "extension": row[4],
+                "is_generated": row[5],
+                "is_vendor": row[6],
+                "updated_at": row[7].isoformat(),
+            }
+            for row in file_rows
+        ]
+        interesting_paths = _recipe_candidate_interesting_paths([f["file_path"] for f in files])
+
+        file_lines: list[dict] = []
+        if interesting_paths:
+            await cur.execute(
+                """
+                SELECT file_path, line_number, line_text, language
+                FROM repo_text_lines
+                WHERE repo_url = %s
+                  AND file_path = ANY(%s::text[])
+                ORDER BY file_path, line_number
+                LIMIT %s
+                """,
+                (repo_url, interesting_paths, line_limit),
+            )
+            file_lines = [
+                {
+                    "file_path": row[0],
+                    "line_number": row[1],
+                    "line_text": row[2],
+                    "language": row[3],
+                }
+                for row in await cur.fetchall()
+            ]
+
+        await cur.execute(
+            """
+            SELECT dir_path, summary, file_list, created_at
+            FROM dir_summaries
+            WHERE repo_url = %s
+            ORDER BY dir_path
+            LIMIT %s
+            """,
+            (repo_url, dir_summary_limit),
+        )
+        dir_summaries = [
+            {
+                "dir_path": row[0],
+                "summary": row[1],
+                "file_list": list(row[2] or []),
+                "created_at": row[3].isoformat(),
+            }
+            for row in await cur.fetchall()
+        ]
+
+        chunk_paths = interesting_paths[:60]
+        if chunk_paths:
+            await cur.execute(
+                """
+                SELECT file_path, chunk_type, name, start_line, end_line, content
+                FROM code_chunks
+                WHERE repo_url = %s
+                  AND file_path = ANY(%s::text[])
+                ORDER BY file_path, start_line
+                LIMIT %s
+                """,
+                (repo_url, chunk_paths, chunk_limit),
+            )
+        else:
+            await cur.execute(
+                """
+                SELECT file_path, chunk_type, name, start_line, end_line, content
+                FROM code_chunks
+                WHERE repo_url = %s
+                ORDER BY file_path, start_line
+                LIMIT %s
+                """,
+                (repo_url, chunk_limit),
+            )
+        code_chunks = [
+            {
+                "file_path": row[0],
+                "chunk_type": row[1],
+                "name": row[2],
+                "start_line": row[3],
+                "end_line": row[4],
+                "content": row[5][:4000],
+            }
+            for row in await cur.fetchall()
+        ]
+
+    return {
+        "repo_index": repo_index,
+        "files": files,
+        "interesting_paths": interesting_paths,
+        "file_lines": file_lines,
+        "dir_summaries": dir_summaries,
+        "code_chunks": code_chunks,
+    }
+
+
+def _recipe_candidate_interesting_paths(paths: list[str]) -> list[str]:
+    name_matches = {
+        "package.json",
+        "pnpm-lock.yaml",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "yarn.lock",
+        "pnpm-workspace.yaml",
+        "pnpm-workspace.yml",
+        "turbo.json",
+        "nx.json",
+        "lerna.json",
+        "vite.config.ts",
+        "vite.config.js",
+        "next.config.js",
+        "next.config.mjs",
+        "next.config.ts",
+        "Dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+        "Procfile",
+        "Makefile",
+        "justfile",
+        "pyproject.toml",
+        "requirements.txt",
+        "uv.lock",
+        "poetry.lock",
+        "Pipfile",
+        ".env.example",
+        ".env.sample",
+        ".env.template",
+        ".env.dist",
+        "env.example",
+        "env.sample",
+        "env.template",
+        "env.dist",
+        ".nvmrc",
+        ".python-version",
+        ".tool-versions",
+        "README.md",
+        "README.MD",
+        "README",
+        "README.txt",
+        "prisma/schema.prisma",
+    }
+    suffix_matches = (
+        "/package.json",
+        "/vite.config.ts",
+        "/vite.config.js",
+        "/next.config.js",
+        "/next.config.mjs",
+        "/next.config.ts",
+        "/Dockerfile",
+        "/docker-compose.yml",
+        "/docker-compose.yaml",
+        "/compose.yml",
+        "/compose.yaml",
+        "/pyproject.toml",
+        "/requirements.txt",
+        "/.env.example",
+        "/.env.sample",
+        "/.env.template",
+        "/.env.dist",
+        "/env.example",
+        "/env.sample",
+        "/env.template",
+        "/env.dist",
+        "/prisma/schema.prisma",
+    )
+    selected: list[str] = []
+    for path in paths:
+        name = path.rsplit("/", 1)[-1]
+        if path in name_matches or name in name_matches or path.endswith(suffix_matches):
+            selected.append(path)
+    return selected[:120]
+
+
 async def upsert_repo_boundaries(
     repo_url: str,
     report: dict,
@@ -1706,7 +2339,7 @@ async def upsert_repo_boundaries(
 APP_STARTUP_PLAN_SELECT_SQL = """
     SELECT repo_set_hash, repo_urls, plan_markdown, graph, ambiguities,
            orchestration_findings, analysis_status, model, error,
-           created_at, updated_at
+           created_at, updated_at, verification_status, verification
     FROM app_startup_plans
     WHERE repo_set_hash = %s
 """
@@ -1731,6 +2364,8 @@ async def get_app_startup_plan_row(repo_set_hash: str) -> dict | None:
         "error": row[8],
         "created_at": row[9].isoformat(),
         "updated_at": row[10].isoformat(),
+        "verification_status": row[11],
+        "verification": row[12],
     }
 
 
@@ -1744,12 +2379,18 @@ async def upsert_app_startup_plan(
     analysis_status: str,
     model: str,
     error: str | None,
+    verification_status: str = "not_started",
+    verification: dict | None = None,
 ) -> None:
+    if verification is None:
+        verification = {}
     sql = """
         INSERT INTO app_startup_plans
             (repo_set_hash, repo_urls, plan_markdown, graph, ambiguities,
-             orchestration_findings, analysis_status, model, error, updated_at)
-        VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, %s, NOW())
+             orchestration_findings, analysis_status, model, error,
+             verification_status, verification, updated_at)
+        VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, %s,
+                %s, %s::jsonb, NOW())
         ON CONFLICT (repo_set_hash) DO UPDATE SET
             repo_urls              = EXCLUDED.repo_urls,
             plan_markdown          = EXCLUDED.plan_markdown,
@@ -1759,6 +2400,8 @@ async def upsert_app_startup_plan(
             analysis_status        = EXCLUDED.analysis_status,
             model                  = EXCLUDED.model,
             error                  = EXCLUDED.error,
+            verification_status    = EXCLUDED.verification_status,
+            verification           = EXCLUDED.verification,
             updated_at             = NOW()
     """
     pool = await get_pool()
@@ -1775,5 +2418,24 @@ async def upsert_app_startup_plan(
                 analysis_status,
                 model,
                 error,
+                verification_status,
+                json.dumps(verification),
             ),
+        )
+
+
+async def update_app_startup_plan_verification(
+    repo_set_hash: str,
+    verification_status: str,
+    verification: dict,
+) -> None:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            """UPDATE app_startup_plans
+               SET verification_status = %s,
+                   verification = %s::jsonb,
+                   updated_at = NOW()
+               WHERE repo_set_hash = %s""",
+            (verification_status, json.dumps(verification), repo_set_hash),
         )

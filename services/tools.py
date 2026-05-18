@@ -1,14 +1,10 @@
-import asyncio
 import contextvars
 import json
 import os
 import re
 import shutil
 import subprocess
-import time
 import uuid
-from collections import deque
-from dataclasses import dataclass
 from pathlib import Path
 
 from agents import function_tool
@@ -21,6 +17,11 @@ from services.db import (
     get_repo_boundaries_row, get_startup_plan_row, search_repo_text_lines,
 )
 from services.startup_analysis import PLAN_JSON_SCHEMA
+from services.sandbox_runner import (
+    OUTPUT_MAX_LINES_CAP,
+    get_sandbox_runner,
+    tail_lines,
+)
 
 from services.event_bus import publish
 
@@ -33,6 +34,7 @@ REQUIRED_APP_PLAN_HEADINGS = (
     "## Steps",
     "## Dependency graph",
     "## Caveats",
+    "## Verification",
 )
 
 current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar("current_session_id")
@@ -402,9 +404,9 @@ async def update_startup_plan(plan_markdown: str, change_summary: str = "") -> s
          values, service ports, ordering, etc.). For each one, call `ask_user`
          to confirm or get a value.
       3. Construct the FULL updated markdown (replaces plan_markdown wholesale).
-         The markdown is REJECTED unless it contains all six section headings
+         The markdown is REJECTED unless it contains all seven section headings
          exactly: `# Startup plan`, `## Prerequisites`, `## Env vars`,
-         `## Steps`, `## Dependency graph`, `## Caveats`.
+         `## Steps`, `## Dependency graph`, `## Caveats`, `## Verification`.
       4. Call this tool with the new markdown.
 
     `change_summary` is a one-line description of what changed, used only for
@@ -422,7 +424,7 @@ async def update_startup_plan(plan_markdown: str, change_summary: str = "") -> s
     if missing:
         return (
             "ERROR: plan_markdown is missing required section heading(s): "
-            f"{', '.join(missing)}. The app plan must contain all six headings: "
+            f"{', '.join(missing)}. The app plan must contain all seven headings: "
             f"{', '.join(REQUIRED_APP_PLAN_HEADINGS)}."
         )
 
@@ -451,6 +453,10 @@ async def update_startup_plan(plan_markdown: str, change_summary: str = "") -> s
     })
 
     return f"App startup plan updated ({len(plan_markdown)} chars) for repo_set_hash={repo_set_hash}."
+
+
+# Verifier-facing alias — same tool, name reflects its role from inside the verifier loop.
+update_app_startup_plan = update_startup_plan
 
 
 UPDATE_REPO_PLAN_SQL = """
@@ -598,20 +604,10 @@ async def update_repo_startup_plan(
     return f"Startup plan updated for {repo_url}."
 
 
-_OUTPUT_MAX_LINES_CAP = 5000
-
-
-def _tail_lines(text: str, max_lines: int) -> str:
-    lines = text.splitlines()
-    if len(lines) <= max_lines:
-        return text
-    kept = lines[-max_lines:]
-    dropped = len(lines) - max_lines
-    return f"[...truncated {dropped} earlier lines; showing last {max_lines}]\n" + "\n".join(kept)
-
-
 def _format_shell_result(
     *,
+    sandbox_run_id: str | None = None,
+    command_run_id: str | None = None,
     command: str,
     cwd: str,
     exit_code: int | None,
@@ -620,13 +616,22 @@ def _format_shell_result(
     stdout: str,
     stderr: str,
     max_output_lines: int,
+    denied: bool = False,
 ) -> str:
+    persisted = ""
+    if sandbox_run_id and command_run_id:
+        persisted = (
+            f"(sandbox_run_id={sandbox_run_id}, "
+            f"command_run_id={command_run_id})\n"
+        )
+    denied_part = f", denied={denied}" if denied else ""
     return (
         f"$ {command}\n"
+        f"{persisted}"
         f"(cwd={cwd or '<default>'}, exit_code={exit_code}, "
-        f"duration_ms={duration_ms}, timed_out={timed_out})\n"
-        f"--- stdout ---\n{_tail_lines(stdout, max_output_lines)}\n"
-        f"--- stderr ---\n{_tail_lines(stderr, max_output_lines)}"
+        f"duration_ms={duration_ms}, timed_out={timed_out}{denied_part})\n"
+        f"--- stdout ---\n{tail_lines(stdout, max_output_lines)}\n"
+        f"--- stderr ---\n{tail_lines(stderr, max_output_lines)}"
     )
 
 
@@ -637,12 +642,15 @@ async def run_shell(
     timeout_seconds: int = 30,
     max_output_lines: int = 200,
 ) -> str:
-    """Run a shell command inside the agent's container and return the result.
+    """Run a shell command through the configured sandbox runner.
 
     Use for one-shot blocking commands needed to verify a startup plan —
     `pnpm install`, `pip install -r requirements.txt`, `curl localhost:3000`,
     `node --version`, etc. Commands run via `bash -c <command>` so pipes,
     redirects, env vars, and command chains all work.
+
+    In local mode, commands run inside the agent service container. Daytona mode
+    will route the same tool call into an isolated sandbox once wired.
 
     `cwd` should usually be the local repo path from the developer prompt
     (e.g. /repos/<repo_name>). Leave empty to use the container's default cwd.
@@ -656,105 +664,44 @@ async def run_shell(
     log; keep it small for quick probes.
 
     Returns a formatted block with: command, cwd, exit code, duration,
-    timed-out flag, tail of stdout, tail of stderr.
+    timed-out flag, persisted run IDs, tail of stdout, tail of stderr.
     """
+    try:
+        session_id = current_session_id.get()
+    except LookupError:
+        return "[run_shell unavailable: no active session context]"
+
     timeout_seconds = max(1, min(int(timeout_seconds), 600))
-    max_output_lines = max(1, min(int(max_output_lines), _OUTPUT_MAX_LINES_CAP))
+    max_output_lines = max(1, min(int(max_output_lines), OUTPUT_MAX_LINES_CAP))
     if not command or not command.strip():
         return "ERROR: command is empty."
 
-    start = time.monotonic()
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "bash", "-c", command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd or None,
+        result = await get_sandbox_runner().run_command(
+            session_id=session_id,
+            command=command,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            max_output_lines=max_output_lines,
         )
-    except (OSError, FileNotFoundError) as e:
-        return f"ERROR: failed to start command: {e}"
-
-    timed_out = False
-    try:
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout_seconds
-        )
-    except asyncio.TimeoutError:
-        timed_out = True
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        try:
-            stdout_b, stderr_b = await proc.communicate()
-        except Exception:
-            stdout_b, stderr_b = b"", b""
-
-    duration_ms = int((time.monotonic() - start) * 1000)
-    stdout = (stdout_b or b"").decode("utf-8", errors="replace")
-    stderr = (stderr_b or b"").decode("utf-8", errors="replace")
+    except NotImplementedError as exc:
+        return f"ERROR: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"ERROR: sandbox runner failed: {exc}"
 
     return _format_shell_result(
+        sandbox_run_id=result.sandbox_run_id,
+        command_run_id=result.command_run_id,
         command=command,
         cwd=cwd,
-        exit_code=proc.returncode,
-        duration_ms=duration_ms,
-        timed_out=timed_out,
-        stdout=stdout,
-        stderr=stderr,
+        exit_code=result.exit_code,
+        duration_ms=result.duration_ms,
+        timed_out=result.timed_out,
+        stdout=result.stdout,
+        stderr=result.stderr,
         max_output_lines=max_output_lines,
+        denied=result.denied,
     )
-
-
-# The background-process registry — a session-scoped lookup table for
-# long-running shell commands the agent has spawned (typically dev servers).
-#
-# There are two distinct "buffers" involved per background process:
-#   1. The OS pipe between child and us. Fixed size (~64KB). If we never
-#      drain it, the child's next write blocks and the dev server freezes.
-#   2. Our own ring buffer (a `deque` with maxlen), where each drained line
-#      is stored so `read_background_process_output` can return the last N lines.
-#      `deque(maxlen=N)` silently drops the oldest entry when full, so
-#      memory stays bounded for a process that runs for hours.
-
-_BG_LOG_MAX_LINES = 5000
-
-
-@dataclass
-class _BackgroundProcess:
-    handle: str
-    session_id: str
-    command: str
-    cwd: str
-    name: str
-    pid: int
-    proc: "asyncio.subprocess.Process"
-    output: "deque[str]"
-    started_at: float
-    reader_task: asyncio.Task | None = None
-    ended_at: float | None = None
-    exit_code: int | None = None
-
-
-_background: dict[str, _BackgroundProcess] = {}
-
-
-async def _drain_background_output(bg: _BackgroundProcess) -> None:
-    """Background task that empties the child's OS pipe one line at a time
-    and appends each line to our ring buffer. Must run for the lifetime of
-    the child — without it, the OS pipe fills and the child blocks on its
-    next print/log. One drainer task per background process."""
-    assert bg.proc.stdout is not None
-    try:
-        while True:
-            line = await bg.proc.stdout.readline()
-            if not line:
-                break
-            bg.output.append(line.decode("utf-8", errors="replace").rstrip("\n"))
-    finally:
-        rc = await bg.proc.wait()
-        bg.exit_code = rc
-        bg.ended_at = time.monotonic()
 
 
 @function_tool
@@ -769,8 +716,9 @@ async def start_background_process(
     (`pnpm dev`, `next dev`, `uvicorn ... --reload`, etc.). For one-shot
     blocking commands use `run_shell` instead.
 
-    The process inherits this container's env and network namespace. Its
-    combined stdout+stderr is captured in-memory (ring buffer of ~5000 lines).
+    The process is started by the configured sandbox runner. In local mode, it
+    inherits this container's env and network namespace. Its combined
+    stdout+stderr is captured in-memory and persisted as a command run.
     Use `read_background_process_output(handle, tail_lines)` to read what it printed.
 
     The process is scoped to the current session — handles from other
@@ -778,44 +726,33 @@ async def start_background_process(
 
     Returns a handle string plus the pid and command for confirmation.
     """
+    if not command or not command.strip():
+        return "ERROR: command is empty."
+
     try:
         session_id = current_session_id.get()
     except LookupError:
         return "[start_background_process unavailable: no active session context]"
 
-    if not command or not command.strip():
-        return "ERROR: command is empty."
-
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "bash", "-c", command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=cwd or None,
+        result = await get_sandbox_runner().start_background_process(
+            session_id=session_id,
+            command=command,
+            cwd=cwd,
+            name=name,
         )
-    except (OSError, FileNotFoundError) as e:
-        return f"ERROR: failed to start command: {e}"
-
-    handle = str(uuid.uuid4())
-    bg = _BackgroundProcess(
-        handle=handle,
-        session_id=session_id,
-        command=command,
-        cwd=cwd,
-        name=name or command[:40],
-        pid=proc.pid,
-        proc=proc,
-        output=deque(maxlen=_BG_LOG_MAX_LINES),
-        started_at=time.monotonic(),
-    )
-    bg.reader_task = asyncio.create_task(_drain_background_output(bg))
-    _background[handle] = bg
+    except NotImplementedError as exc:
+        return f"ERROR: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"ERROR: failed to start background process: {exc}"
 
     return (
         f"Started background process.\n"
-        f"handle: {handle}\n"
-        f"pid: {proc.pid}\n"
-        f"command: {command}\n"
+        f"sandbox_run_id: {result.sandbox_run_id}\n"
+        f"command_run_id: {result.command_run_id}\n"
+        f"handle: {result.handle}\n"
+        f"pid: {result.pid}\n"
+        f"command: {result.command}\n"
         f"cwd: {cwd or '<default>'}\n"
         f"Use read_background_process_output(handle) to see what it prints."
     )
@@ -838,29 +775,28 @@ async def read_background_process_output(handle: str, tail_lines: int = 200) -> 
     except LookupError:
         return "[read_background_process_output unavailable: no active session context]"
 
-    bg = _background.get(handle)
-    if bg is None:
-        return f"ERROR: no background process with handle={handle!r}."
-    if bg.session_id != session_id:
-        return f"ERROR: handle {handle!r} does not belong to this session."
+    try:
+        result = await get_sandbox_runner().read_background_process_output(
+            session_id=session_id,
+            handle=handle,
+            tail_lines_count=tail_lines,
+        )
+    except NotImplementedError as exc:
+        return f"ERROR: {exc}"
+    except (ValueError, PermissionError) as exc:
+        return f"ERROR: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"ERROR: sandbox runner failed: {exc}"
 
-    tail_lines = max(1, min(int(tail_lines), _BG_LOG_MAX_LINES))
-    lines = list(bg.output)[-tail_lines:]
-
-    if bg.exit_code is not None:
-        status = f"exited (code={bg.exit_code})"
-    elif bg.proc.returncode is None:
-        status = f"running (pid={bg.pid})"
-    else:
-        status = f"exited (code={bg.proc.returncode})"
-
-    body = "\n".join(lines) if lines else "<no output yet>"
+    body = "\n".join(result.lines) if result.lines else "<no output yet>"
     return (
         f"handle: {handle}\n"
-        f"command: {bg.command}\n"
-        f"cwd: {bg.cwd or '<default>'}\n"
-        f"status: {status}\n"
-        f"--- output (last {len(lines)} lines) ---\n{body}"
+        f"sandbox_run_id: {result.sandbox_run_id}\n"
+        f"command_run_id: {result.command_run_id}\n"
+        f"command: {result.command}\n"
+        f"cwd: {result.cwd or '<default>'}\n"
+        f"status: {result.status}\n"
+        f"--- output (last {len(result.lines)} lines) ---\n{body}"
     )
 
 
@@ -884,54 +820,28 @@ async def stop_background_process(handle: str, grace_seconds: int = 5) -> str:
     except LookupError:
         return "[stop_background_process unavailable: no active session context]"
 
-    bg = _background.get(handle)
-    if bg is None:
-        return f"ERROR: no background process with handle={handle!r}."
-    if bg.session_id != session_id:
-        return f"ERROR: handle {handle!r} does not belong to this session."
-
     grace_seconds = max(0, min(int(grace_seconds), 60))
-
-    if bg.proc.returncode is not None:
-        tail = list(bg.output)[-20:]
-        return (
-            f"handle: {handle}\n"
-            f"status: already exited (code={bg.proc.returncode})\n"
-            f"--- last {len(tail)} lines ---\n" + ("\n".join(tail) or "<no output>")
+    try:
+        result = await get_sandbox_runner().stop_background_process(
+            session_id=session_id,
+            handle=handle,
+            grace_seconds=grace_seconds,
         )
+    except NotImplementedError as exc:
+        return f"ERROR: {exc}"
+    except (ValueError, PermissionError) as exc:
+        return f"ERROR: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"ERROR: sandbox runner failed: {exc}"
 
-    signal_used = "SIGTERM"
-    try:
-        bg.proc.terminate()
-    except ProcessLookupError:
-        pass
-
-    try:
-        await asyncio.wait_for(bg.proc.wait(), timeout=grace_seconds)
-    except asyncio.TimeoutError:
-        signal_used = "SIGTERM then SIGKILL"
-        try:
-            bg.proc.kill()
-        except ProcessLookupError:
-            pass
-        try:
-            await asyncio.wait_for(bg.proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            pass
-
-    if bg.reader_task is not None:
-        try:
-            await asyncio.wait_for(bg.reader_task, timeout=2)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            pass
-
-    tail = list(bg.output)[-20:]
     return (
         f"handle: {handle}\n"
-        f"command: {bg.command}\n"
-        f"stopped via: {signal_used}\n"
-        f"exit_code: {bg.proc.returncode}\n"
-        f"--- last {len(tail)} lines ---\n" + ("\n".join(tail) or "<no output>")
+        f"sandbox_run_id: {result.sandbox_run_id}\n"
+        f"command_run_id: {result.command_run_id}\n"
+        f"command: {result.command}\n"
+        f"stopped via: {result.signal_used}\n"
+        f"exit_code: {result.exit_code}\n"
+        f"--- last {len(result.lines)} lines ---\n" + ("\n".join(result.lines) or "<no output>")
     )
 
 @function_tool

@@ -3,7 +3,7 @@ FROM python:3.12-slim
 # System tools: git for clones; curl + ca-certificates for HTTPS and the
 # verifier agent's HTTP probes; gnupg for NodeSource repo signing.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git curl ca-certificates gnupg \
+ && apt-get install -y --no-install-recommends git curl ca-certificates gnupg docker.io docker-cli \
  && rm -rf /var/lib/apt/lists/*
 
 # Node.js 22 LTS + pnpm/yarn via corepack — used by the verifier agent to

@@ -18,6 +18,8 @@ with workflow.unsafe.imports_passed_through():
         ConsolidateParams,
         PipelineFailedParams,
         ResolvePendingActionParams,
+        VerifyStartupParams,
+        KillSandboxParams,
         clone_repo_activity,
         index_repo_activity,
         update_session_status_activity,
@@ -30,6 +32,8 @@ with workflow.unsafe.imports_passed_through():
         cancel_pending_actions_activity,
         resolve_pending_action_activity,
         resolve_pending_actions_activity,
+        verify_startup_activity,
+        kill_sandbox_activity,
     )
 
 
@@ -47,6 +51,9 @@ class CodebaseChatWorkflow:
         self._pending: dict[str, dict] = {}
         self._recompute_requested = False
         self._recompute_reason = ""
+        self._retry_verification_requested = False
+        self._retry_verification_reason = ""
+        self._kill_sandbox_requested = False
 
     async def _run_pipeline(self, session_id: str, force: bool) -> None:
         """Per-repo (clone/index/analyze/extract) in parallel, then matcher,
@@ -129,6 +136,18 @@ class CodebaseChatWorkflow:
             retry_policy=RetryPolicy(maximum_attempts=1),
         )
 
+        await workflow.execute_activity(
+            verify_startup_activity,
+            VerifyStartupParams(
+                session_id=session_id,
+                repo_set_hash=self._repo_set_hash,
+                repo_urls=self._repo_urls,
+                force=force,
+            ),
+            start_to_close_timeout=timedelta(seconds=1500),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+
     async def _emit_pipeline_failed(
         self, session_id: str, phase: str, exc: BaseException
     ) -> None:
@@ -202,10 +221,50 @@ class CodebaseChatWorkflow:
                 lambda: bool(self._user_messages)
                         or bool(self._clarifications)
                         or self._recompute_requested
+                        or self._retry_verification_requested
+                        or self._kill_sandbox_requested
                         or self._ended
             )
             if self._ended:
                 break
+
+            if self._kill_sandbox_requested:
+                self._kill_sandbox_requested = False
+                await workflow.execute_activity(
+                    kill_sandbox_activity,
+                    KillSandboxParams(session_id=params.session_id),
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=RetryPolicy(maximum_attempts=2),
+                )
+                continue
+
+            if self._retry_verification_requested:
+                self._retry_verification_requested = False
+                self._retry_verification_reason = ""
+                self._status = "indexing"
+                await workflow.execute_activity(
+                    update_session_status_activity,
+                    SessionStatusParams(session_id=params.session_id, status="indexing"),
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+                await workflow.execute_activity(
+                    verify_startup_activity,
+                    VerifyStartupParams(
+                        session_id=params.session_id,
+                        repo_set_hash=self._repo_set_hash,
+                        repo_urls=self._repo_urls,
+                        force=True,
+                    ),
+                    start_to_close_timeout=timedelta(seconds=1500),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+                self._status = "ready"
+                await workflow.execute_activity(
+                    update_session_status_activity,
+                    SessionStatusParams(session_id=params.session_id, status="ready"),
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+                continue
 
             if self._recompute_requested:
                 self._recompute_requested = False
@@ -280,6 +339,12 @@ class CodebaseChatWorkflow:
                 await self._run_agent_turn(params.session_id, content)
 
         await workflow.execute_activity(
+            kill_sandbox_activity,
+            KillSandboxParams(session_id=params.session_id),
+            start_to_close_timeout=timedelta(seconds=60),
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+        await workflow.execute_activity(
             cancel_pending_actions_activity,
             params.session_id,
             start_to_close_timeout=timedelta(seconds=15),
@@ -311,6 +376,15 @@ class CodebaseChatWorkflow:
     def recompute_startup_plan(self, reason: str = "") -> None:
         self._recompute_requested = True
         self._recompute_reason = reason
+
+    @workflow.signal
+    def retry_verification(self, reason: str = "") -> None:
+        self._retry_verification_requested = True
+        self._retry_verification_reason = reason
+
+    @workflow.signal
+    def kill_sandbox(self) -> None:
+        self._kill_sandbox_requested = True
 
     @workflow.query
     def get_status(self) -> str:

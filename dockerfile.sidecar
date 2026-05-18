@@ -1,0 +1,38 @@
+FROM debian:bookworm-slim
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl gnupg git build-essential \
+      python3 python3-pip python3-venv pipx \
+      jq procps net-tools iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+
+# Docker CE + compose v2 from Docker's official apt repo (debian-bookworm only
+# ships docker.io which lacks `docker compose`).
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg \
+       | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && chmod a+r /etc/apt/keyrings/docker.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" \
+       > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+         docker-ce-cli docker-compose-plugin docker-buildx-plugin \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && corepack enable \
+    && corepack prepare pnpm@9.15.0 --activate \
+    && rm -rf /var/lib/apt/lists/*
+
+# uv (fast Python installer/resolver) + poetry via pipx — modern Python repos.
+# Install pipx packages into /usr/local so every user inside the sidecar sees them.
+ENV PIPX_HOME=/usr/local/pipx \
+    PIPX_BIN_DIR=/usr/local/bin
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && pipx install poetry
+
+RUN mkdir -p /repos /tmp/bg
+WORKDIR /repos
+CMD ["sleep", "infinity"]

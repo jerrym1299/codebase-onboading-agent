@@ -115,10 +115,73 @@ Hydrate the stored transcript:
 curl -s http://localhost:8001/sessions/<session_id>/messages
 ```
 
+## Startup verification
+
+After the consolidator produces the cross-repo startup plan, a Temporal
+activity (`verify_startup_activity`) spins up a per-session Docker sidecar,
+clones every repo into it, and runs the existing Verifier agent in a bounded
+single agent run (default 400-turn cap, 1200s wall-clock budget). If the plan is wrong the verifier
+calls `update_app_startup_plan(plan_markdown, change_summary)` with the full
+corrected markdown (now validated against 7 headings — adds `## Verification`).
+On a terminal result the sidecar is **kept alive** and registered against the
+session, so chat-time verifier turns reuse the same environment (already
+installed deps, running peer services).
+
+### One-time setup
+
+```sh
+docker build -t hobbes-verify-sidecar:latest -f dockerfile.sidecar .
+```
+
+The FastAPI image mounts `/var/run/docker.sock` (DooD) to launch the sidecar.
+
+### Env vars
+
+| Name | Default | Purpose |
+|---|---|---|
+| `VERIFY_SANDBOX_IMAGE` | `hobbes-verify-sidecar:latest` | Image used for the sidecar. |
+| `VERIFY_MAX_TURNS` | `400` | Max agent turns per verification run (single-run model). |
+| `VERIFY_BUDGET_SECONDS` | `1200` | Total wall-clock budget per verification. |
+
+### Endpoints
+
+- `GET  /sessions/:id/startup-verification` — current report (`404 {"status":"pending"}` while not started).
+- `POST /sessions/:id/startup-verification/retry` — re-run verification (forces a fresh sidecar).
+- `DELETE /sessions/:id/sandbox` — kill the per-session sidecar.
+
+### Sandbox lifecycle
+
+Created during automatic verification → kept alive for the rest of the
+session so chat-time verifier turns reuse the same environment → killed on
+`end_session` or `DELETE /sandbox`.
+
+### Markdown schema
+
+The consolidator's markdown now requires seven headings (in order):
+`# Startup plan`, `## Prerequisites`, `## Env vars`, `## Steps`,
+`## Dependency graph`, `## Caveats`, `## Verification`.
+
+### Known limitations
+
+- Plans that need multi-container networking may surface as `blocked`.
+- No human-in-the-loop during automatic verification (the verifier surfaces
+  ambiguities as `BLOCKED` findings instead).
+- Per-repo verification is not implemented yet (only app-level).
+- FastAPI `--reload` orphans the sidecar; cleanup happens on next `end_session`.
+
+
 ## Development Notes
 
 - Repo clones are stored under `/repos/<repo_name>` inside the running
   environment.
+- Verifier shell tools use `SANDBOX_RUNNER_PROVIDER`. The default `local`
+  provider runs commands in the FastAPI container. Set
+  `SANDBOX_RUNNER_PROVIDER=daytona` with `DAYTONA_API_KEY` to provision a
+  Daytona sandbox, clone session repos under `/workspace/<repo_name>`, and map
+  Verifier cwd values like `/repos/<repo_name>` to the matching workspace path.
+  Optional Daytona knobs include `DAYTONA_SANDBOX_BASE_IMAGE`,
+  `DAYTONA_SANDBOX_CPU`, `DAYTONA_SANDBOX_MEMORY`,
+  `DAYTONA_SANDBOX_AUTO_STOP_MINUTES`, and `DAYTONA_SANDBOX_PREVIEW_PORT`.
 - The OpenAI Agents SDK session store defaults to `agent_sessions.db`.
 - Indexing stores a content-addressed manifest, exact line-search inventory,
   cached embeddings for unchanged chunks, and tenant/repo/index/job metadata.

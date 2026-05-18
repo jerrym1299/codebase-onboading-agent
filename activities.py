@@ -13,7 +13,7 @@ from agents.items import (
 )
 from agents.exceptions import MaxTurnsExceeded
 
-from agent_defs import boundary_extractor_agent, router_agent, consolidator_agent
+from agent_defs import boundary_extractor_agent, router_agent, consolidator_agent, verifier_agent
 from services.boundary_extractor import BoundaryReport, build_developer_prompt
 from services.clone_repo import ensure_repo_dir
 from services.dependency_graph import build_graph
@@ -23,7 +23,15 @@ from services.tools import current_session_id
 from services.db import (
     get_app_startup_plan_row, get_pool, get_repo_boundaries_row, get_session_repo_urls,
     get_startup_plan_row, upsert_app_startup_plan, upsert_repo_boundaries,
-    upsert_startup_plan,
+    upsert_startup_plan, update_app_startup_plan_verification,
+)
+from services.sandbox_runner import (
+    DockerSidecarSandbox, current_sandbox,
+    register_sandbox, get_sandbox, unregister_sandbox,
+)
+from services.verification import (
+    ReportBuilder, VerificationStatus, VerificationResult,
+    render_verification_markdown,
 )
 
 from services.startup_analysis import (
@@ -100,6 +108,14 @@ class PipelineFailedParams:
     session_id: str
     phase: str
     message: str
+
+
+@dataclass
+class VerifyStartupParams:
+    session_id: str
+    repo_set_hash: str
+    repo_urls: list[str]
+    force: bool = False
 
 
 @dataclass
@@ -483,6 +499,305 @@ async def consolidate_plan_activity(params: ConsolidateParams) -> dict:
 
     return {"status": status, "markdown_len": len(markdown)}
 
+
+def _iso_now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _build_verify_prompt(row: dict, params: "VerifyStartupParams",
+                         budget_remaining: int) -> str:
+    return (
+        "# Automatic startup verification\n\n"
+        "You are the Verifier for an application that spans one or more repos. Your job: empirically run the documented startup steps in the sidecar and prove whether the application actually comes up.\n\n"
+        f"Total wall-clock budget remaining: ~{budget_remaining}s. Use it deliberately — install deps, run steps, probe endpoints, fix the plan when wrong, and emit `## Result` (PASS / BLOCKED / FAIL) once you have enough evidence. You do not need to keep going until the budget is gone; finish when the result is decisive.\n\n"
+        f"session_id: {params.session_id}\n"
+        f"repo_set_hash: {params.repo_set_hash}\n"
+        f"repos cloned in sidecar at /repos/<repo_name>:\n"
+        + "\n".join(f"  - {u}" for u in params.repo_urls) + "\n\n"
+        "Current consolidated app startup plan:\n\n"
+        "```markdown\n"
+        f"{row.get('plan_markdown','')}\n"
+        "```\n"
+    )
+
+
+def _parse_shell_string_output(text: str) -> dict:
+    """Parse the formatted string returned by run_shell back into structured fields.
+    The tool returns: '$ <cmd>\\n(cwd=..., exit_code=N, duration_ms=M, timed_out=B[, denied=B])\\n--- stdout ---\\n...\\n--- stderr ---\\n...'"""
+    import re
+    out: dict = {}
+    m = re.search(r"exit_code=(-?\d+)", text)
+    if m:
+        out["exit_code"] = int(m.group(1))
+    m = re.search(r"duration_ms=(\d+)", text)
+    if m:
+        out["duration_ms"] = int(m.group(1))
+    if "denied=True" in text:
+        out["denied"] = True
+    so = re.search(r"--- stdout ---\n(.*?)\n--- stderr ---", text, re.DOTALL)
+    if so:
+        out["stdout_tail"] = so.group(1)
+    se = re.search(r"--- stderr ---\n(.*)\Z", text, re.DOTALL)
+    if se:
+        out["stderr_tail"] = se.group(1)
+    return out
+
+
+def _ingest_event(ev, builder) -> None:
+    # Best-effort: map streamed tool-call/tool-output events into the verification report.
+    try:
+        from agents.items import ToolCallItem, ToolCallOutputItem
+    except Exception:
+        return
+    try:
+        if isinstance(ev, RunItemStreamEvent):
+            item = ev.item
+            if isinstance(item, ToolCallItem) and ev.name == "tool_called":
+                raw = item.raw_item
+                name = getattr(raw, "name", "")
+                args_raw = getattr(raw, "arguments", "") or "{}"
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+                except Exception:
+                    args = {}
+                if name == "run_shell":
+                    builder.add_command(
+                        command=args.get("command", ""),
+                        cwd=args.get("cwd"),
+                        exit_code=0,
+                        duration_ms=0,
+                        stdout_tail="",
+                        stderr_tail="",
+                    )
+                elif name == "start_background_process":
+                    builder.add_command(
+                        command=f"[background] {args.get('command', '')}",
+                        cwd=args.get("cwd"),
+                        exit_code=0,
+                        duration_ms=0,
+                        stdout_tail="",
+                        stderr_tail="",
+                    )
+                elif name == "stop_background_process":
+                    builder.add_command(
+                        command=f"[stop-background] handle={args.get('handle','')}",
+                        cwd=None,
+                        exit_code=0,
+                        duration_ms=0,
+                        stdout_tail="",
+                        stderr_tail="",
+                    )
+                elif name in ("update_app_startup_plan", "update_startup_plan"):
+                    builder.add_plan_update(
+                        iteration=len(builder.report["attempts"]) + 1,
+                        change_summary=args.get("change_summary", ""),
+                    )
+            elif isinstance(item, ToolCallOutputItem) and ev.name == "tool_output":
+                out_raw = item.output
+                if not builder.report["commands"]:
+                    return
+                cmd = builder.report["commands"][-1]
+                if isinstance(out_raw, dict) and "exit_code" in out_raw:
+                    cmd["exit_code"] = out_raw.get("exit_code", 0)
+                    cmd["duration_ms"] = out_raw.get("duration_ms", 0)
+                    cmd["stdout_tail"] = (out_raw.get("stdout_tail") or "")[-2000:]
+                    cmd["stderr_tail"] = (out_raw.get("stderr_tail") or "")[-2000:]
+                    cmd["denied"] = bool(out_raw.get("denied"))
+                elif isinstance(out_raw, str):
+                    parsed = _parse_shell_string_output(out_raw)
+                    if "exit_code" in parsed:
+                        cmd["exit_code"] = parsed["exit_code"]
+                    if "duration_ms" in parsed:
+                        cmd["duration_ms"] = parsed["duration_ms"]
+                    if "stdout_tail" in parsed:
+                        cmd["stdout_tail"] = parsed["stdout_tail"][-2000:]
+                    if "stderr_tail" in parsed:
+                        cmd["stderr_tail"] = parsed["stderr_tail"][-2000:]
+                    if "denied" in parsed:
+                        cmd["denied"] = parsed["denied"]
+    except Exception:
+        # ingestion is best-effort — never crash the verify loop because of an event we don't understand
+        pass
+
+
+@activity.defn
+async def verify_startup_activity(params: VerifyStartupParams) -> dict:
+    """Run automatic startup verification in a per-session Docker sidecar.
+
+    Spins up the sidecar, clones repos into it, runs verifier_agent ONCE
+    (single run, large max_turns, bounded by a wall-clock deadline), and
+    persists a structured report. The agent rewrites `## Verification` and
+    other plan sections incrementally via `update_app_startup_plan` as it
+    works. On a terminal result the sidecar is REGISTERED (kept alive) for
+    chat-time verifier turns; on a crash before terminal it is torn down."""
+    import time
+
+    budget_seconds = int(os.environ.get("VERIFY_BUDGET_SECONDS", "1200"))
+    max_turns = int(os.environ.get("VERIFY_MAX_TURNS", "400"))
+
+    row = await get_app_startup_plan_row(params.repo_set_hash)
+    if row is None:
+        return {"status": "skipped", "reason": "no consolidated plan"}
+
+    if not params.force and row.get("verification_status") in (
+        VerificationStatus.PASSED.value, VerificationStatus.BLOCKED.value,
+        VerificationStatus.FAILED.value,
+    ):
+        return {"status": "skipped", "reason": "already verified"}
+
+    builder = ReportBuilder()
+    builder.set_status(VerificationStatus.RUNNING)
+    await update_app_startup_plan_verification(
+        params.repo_set_hash, VerificationStatus.RUNNING.value, builder.report)
+    await publish(params.session_id, {
+        "type": "data-verification-started", "repo_set_hash": params.repo_set_hash})
+
+    existing = get_sandbox(params.session_id)
+    if existing is not None and params.force:
+        try:
+            await existing.cleanup()
+        finally:
+            unregister_sandbox(params.session_id)
+
+    sandbox = DockerSidecarSandbox(params.session_id, params.repo_urls)
+    sandbox_token = None
+    session_token = current_session_id.set(params.session_id)
+    deadline = time.monotonic() + budget_seconds
+    final_status = VerificationStatus.FAILED
+    sandbox_started = False
+    reached_terminal = False
+
+    try:
+        await sandbox.start()
+        sandbox_started = True
+        sandbox_token = current_sandbox.set(sandbox)
+
+        run_start = _iso_now()
+        developer_prompt = _build_verify_prompt(
+            row, params, budget_remaining=int(deadline - time.monotonic()),
+        )
+        streamed = Runner.run_streamed(verifier_agent, developer_prompt, max_turns=max_turns)
+        hit_max_turns = False
+        hit_budget = False
+        try:
+            async for ev in streamed.stream_events():
+                _ingest_event(ev, builder)
+                await update_app_startup_plan_verification(
+                    params.repo_set_hash, VerificationStatus.RUNNING.value, builder.report)
+                if time.monotonic() >= deadline:
+                    hit_budget = True
+                    try:
+                        streamed.cancel()
+                    except Exception:
+                        pass
+                    break
+        except MaxTurnsExceeded:
+            hit_max_turns = True
+
+        typed_result: VerificationResult | None = None
+        raw_final = streamed.final_output if streamed.final_output is not None else None
+        if isinstance(raw_final, VerificationResult):
+            typed_result = raw_final
+
+        if hit_budget:
+            result = "FAIL"
+            summary = (
+                "Wall-clock budget exhausted before the verifier emitted a final result. "
+                f"Partial output: {str(raw_final)[:800]}"
+            )
+        elif hit_max_turns:
+            result = "FAIL"
+            summary = (
+                f"MaxTurnsExceeded (cap={max_turns}). "
+                f"Partial output: {str(raw_final)[:800]}"
+            )
+        elif typed_result is not None:
+            result = typed_result.result
+            # Streaming-ingested commands are the authoritative shell log — the
+            # agent no longer enumerates them in its typed output. Render the
+            # assessment fields alongside the captured commands.
+            summary = render_verification_markdown(
+                typed_result, commands=builder.report["commands"]
+            )
+            builder.report["plan_updates"] = [
+                {"iteration": 1, "change_summary": pu.change_summary}
+                for pu in typed_result.plan_updates
+            ]
+            builder.report["blockers"] = [
+                {"kind": b.kind, "detail": b.detail} for b in typed_result.blockers
+            ]
+            if typed_result.final_summary:
+                builder.set_final(typed_result.final_summary)
+        else:
+            result = "FAIL"
+            summary = f"verifier did not return a VerificationResult. Got: {type(raw_final).__name__}"
+
+        run_end = _iso_now()
+        # report keeps an "attempts" list for FE compatibility; single-run = one entry
+        builder.add_attempt(1, run_start, run_end, result, summary=summary)
+
+        if result == "PASS":
+            final_status = VerificationStatus.PASSED
+        elif result == "BLOCKED":
+            final_status = VerificationStatus.BLOCKED
+        else:
+            final_status = VerificationStatus.FAILED
+        reached_terminal = True
+    except Exception as exc:
+        builder.set_final(f"verifier raised: {type(exc).__name__}: {exc}")
+        final_status = VerificationStatus.FAILED
+        reached_terminal = False
+    finally:
+        if sandbox_token is not None:
+            current_sandbox.reset(sandbox_token)
+        current_session_id.reset(session_token)
+
+        if reached_terminal and sandbox_started:
+            register_sandbox(params.session_id, sandbox)
+            builder.set_cleanup({"kept_alive": True, "container": sandbox.container_name})
+        else:
+            if sandbox_started:
+                cleanup = await sandbox.cleanup()
+            else:
+                cleanup = {"kept_alive": False, "container": sandbox.container_name,
+                           "sidecar_removed": False, "reason": "never started"}
+            builder.set_cleanup(cleanup)
+
+        builder.set_status(final_status)
+        if not builder.report["final_summary"]:
+            builder.set_final(f"verification {final_status.value}")
+        await update_app_startup_plan_verification(
+            params.repo_set_hash, final_status.value, builder.report)
+        await publish(params.session_id, {
+            "type": "data-verification-finished",
+            "repo_set_hash": params.repo_set_hash,
+            "status": final_status.value,
+        })
+
+    return {"status": final_status.value, "sandbox_kept_alive": reached_terminal and sandbox_started}
+
+
+@dataclass
+class KillSandboxParams:
+    session_id: str
+
+
+@activity.defn
+async def kill_sandbox_activity(params: KillSandboxParams) -> dict:
+    sandbox = get_sandbox(params.session_id)
+    if sandbox is None:
+        return {"killed": False, "reason": "no sandbox"}
+    result = await sandbox.cleanup()
+    unregister_sandbox(params.session_id)
+    await publish(params.session_id, {
+        "type": "data-sandbox-killed",
+        "session_id": params.session_id,
+        "result": result,
+    })
+    return {"killed": True, **result}
+
+
 @activity.defn
 async def publish_pipeline_failed_activity(params: PipelineFailedParams) -> None:
     """Workflow-side hook: publish a terminal pipeline-failed SSE event after
@@ -570,16 +885,28 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
     current_session_id.set(params.session_id)
     session = SQLiteSession(params.session_id, SESSION_DB_PATH)
 
+    sandbox = get_sandbox(params.session_id)
+    sandbox_token = current_sandbox.set(sandbox) if sandbox is not None else None
+
     def prepend_repo_context(history, new_input):
         repo_lines = "\n".join(
             f"- {url.rstrip('/').split('/')[-1].removesuffix('.git')}: "
             f"local={repo_dirs[url]}, indexed_url={url}"
             for url in repo_urls
         )
+        sandbox_line = ""
+        if sandbox is not None:
+            sandbox_line = (
+                f"A verification sandbox container `{sandbox.container_name}` is "
+                f"running for this session. Shell commands from the Verifier agent "
+                f"will execute inside it. Repos are at /repos/<repo_name> within the "
+                f"sandbox.\n"
+            )
         context = {
             "role": "developer",
             "content": (
                 f"Repos in this session:\n{repo_lines}\n"
+                f"{sandbox_line}"
                 "When you call search_indexed/search_dir_summaries, pass the indexed_url "
                 "that matches the question.\n"
                 "When you call read_file/list_files, use the local path of the relevant repo.\n"
@@ -602,10 +929,19 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
             max_turns=20,
         )
 
+        # Track the currently-active agent so we can suppress raw text-deltas
+        # from agents with structured output (the deltas would be JSON
+        # fragments of the typed object, which is unreadable for users).
+        current_agent_name = router_agent.name
+        # Capture verifier shell commands as they stream so we can include
+        # them in the final rendered markdown — the typed VerificationResult
+        # no longer enumerates them itself.
+        verifier_builder = ReportBuilder()
+
         async for event in result.stream_events():
             if isinstance(event, RawResponsesStreamEvent):
                 delta = getattr(event.data, "delta", None)
-                if isinstance(delta, str) and delta:
+                if isinstance(delta, str) and delta and current_agent_name != "Verifier":
                     await publish(params.session_id, {
                         "type": "text-delta",
                         "textDelta": delta,
@@ -613,6 +949,12 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
 
             elif isinstance(event, RunItemStreamEvent):
                 item = event.item
+
+                # Feed the verifier's shell events into a builder so we can
+                # render the final markdown with the full command log. Safe
+                # for non-verifier turns: _ingest_event ignores unrelated calls.
+                if current_agent_name == "Verifier":
+                    _ingest_event(event, verifier_builder)
 
                 if isinstance(item, ToolCallItem) and event.name == "tool_called":
                     raw = item.raw_item
@@ -646,12 +988,21 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
                     await _append_part(pool, msg_id, part)
 
             elif isinstance(event, AgentUpdatedStreamEvent):
+                current_agent_name = event.new_agent.name
                 await publish(params.session_id, {
                     "type": "data-handoff",
                     "agent": event.new_agent.name,
                 })
 
-        text = str(result.final_output)
+        raw_final = result.final_output
+        if isinstance(raw_final, VerificationResult):
+            # Verifier ran last — render the typed assessment plus the
+            # streaming-captured shell commands as markdown for the user.
+            text = render_verification_markdown(
+                raw_final, commands=verifier_builder.report["commands"]
+            )
+        else:
+            text = str(raw_final)
         final_part = {"type": "text", "text": text}
         await _append_part(pool, msg_id, final_part)
         await publish(params.session_id, final_part)
@@ -661,6 +1012,9 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
         fallback = {"type": "text", "text": text}
         await _append_part(pool, msg_id, fallback)
         await publish(params.session_id, fallback)
+    finally:
+        if sandbox_token is not None:
+            current_sandbox.reset(sandbox_token)
 
     await publish(params.session_id, {"type": "finish"})
 

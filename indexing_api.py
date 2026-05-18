@@ -21,6 +21,7 @@ from services.db import (
     get_repo_index_job,
     init_schema,
 )
+from services.recipe_proposal import RecipeCandidateError, generate_recipe_candidate
 
 
 API_KEY_HEADER = "X-Hobbes-Code-Indexing-Key"
@@ -129,3 +130,22 @@ async def get_repo_index_job_endpoint(
     if job is None:
         return JSONResponse(status_code=404, content={"error": "Job not found."})
     return job
+
+
+@app.post("/repo-indexes/{repo_index_id}/recipe-candidate")
+async def create_repo_recipe_candidate_endpoint(
+    repo_index_id: str,
+    payload: dict | None = None,
+    _auth: None = Depends(require_api_key),
+):
+    metadata = (payload or {}).get("metadata")
+    try:
+        candidate = await generate_recipe_candidate(
+            repo_index_id,
+            metadata=metadata if isinstance(metadata, dict) else None,
+        )
+    except LookupError:
+        return JSONResponse(status_code=404, content={"error": "Repo index not found."})
+    except RecipeCandidateError as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
+    return candidate

@@ -1,4 +1,5 @@
 fastapi==0.135.3
+daytona>=0.166.0
 fpdf2
 httpx
 jsonschema

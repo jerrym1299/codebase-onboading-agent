@@ -2,13 +2,14 @@ from typing import Any
 
 from agents import Agent, ModelSettings, handoff
 from services.boundary_extractor import BoundaryReport
+from services.verification import VerificationResult
 from services.tools import (
     list_files, search_code, read_file,
     find_references, get_dependencies, search_indexed, search_exact_indexed,
     search_dir_summaries, git_log,
     ask_user,
     get_startup_plan, recompute_startup_plan,
-    update_startup_plan, update_repo_startup_plan,
+    update_startup_plan, update_repo_startup_plan, update_app_startup_plan,
     get_repo_boundaries, get_repo_startup_plan, get_app_startup_plan,
     run_shell, start_background_process, read_background_process_output, stop_background_process,
 )
@@ -242,7 +243,9 @@ consolidator_agent = Agent[Any](
         "  ## Env vars — grouped by repo, marked required/optional\n"
         "  ## Steps — one numbered step per ordered group from the topo sort, parallel commands grouped\n"
         "  ## Dependency graph — Mermaid diagram of nodes and typed edges\n"
-        "  ## Caveats — ambiguous edges, cycle-breaking decisions, low-confidence matches, anything to verify"
+        "  ## Caveats — ambiguous edges, cycle-breaking decisions, low-confidence matches, anything to verify\n"
+        "  ## Verification — placeholder; the verifier fills this in. On first pass, emit exactly:\n"
+        "       _Not yet verified._"
     ),
     model="gpt-5.4",
     model_settings=ModelSettings(max_tokens=16384),
@@ -256,18 +259,36 @@ consolidator_agent = Agent[Any](
 )
 
 
-verifier_agent = Agent[Any](
+verifier_agent = Agent[VerificationResult](
     name="Verifier",
     instructions=(
         "You are the Verifier. You empirically check claims about the codebase by "
         "actually running commands. Typical jobs: 'does the startup plan work?', "
         "'does endpoint /health respond?', 'do the install steps run without errors?', "
-        "'verify this repo binds the port we think it does'. You do not modify the "
-        "plan or the code — you report findings and propose concrete fixes; other "
-        "agents act on them.\n"
+        "'verify this repo binds the port we think it does'.\n"
         "\n"
-        "Shell tools (all run inside this agent's container — `localhost` is the "
-        "container, not the user's host):\n"
+        "Your FINAL output is a structured `VerificationResult` object — the SDK "
+        "validates and returns the schema directly; you do not write free-form "
+        "markdown at the end. The schema covers ONLY the assessment: every shell "
+        "command you run is captured automatically from the tool-call stream, so "
+        "DO NOT re-enumerate commands in the result. Populate:\n"
+        "  - `task`: one sentence restating what you verified.\n"
+        "  - `result`: one of PASS / PARTIAL / BLOCKED / FAIL (see DISCIPLINE below).\n"
+        "  - `findings`: required when result != PASS — list each issue with the "
+        "failing line of output quoted verbatim and the concrete fix.\n"
+        "  - `plan_updates[]`: one entry per `update_app_startup_plan` call you "
+        "made (matching the `change_summary` you passed).\n"
+        "  - `background_left_running[]`: only if you intentionally left a process "
+        "alive — otherwise stop everything you started.\n"
+        "  - `blockers[]`: required when result == BLOCKED; categorise (`missing_secret`, "
+        "`install_failure`, `destructive_denied`, `out_of_scope`, `environment_conflict`).\n"
+        "  - `final_summary`: changes made, final result, any ambiguities or concerns. "
+        "Do NOT summarize commands here — the renderer already lists them above your summary.\n"
+        "\n"
+        "Shell tools run through the configured sandbox runner. In local mode, "
+        "they run inside this agent's container, so `localhost` is the container, "
+        "not the user's host. When the Daytona runner is wired, the same tools "
+        "will target an isolated sandbox:\n"
         "  - `run_shell(command, cwd, timeout_seconds, max_output_lines)` for one-shot "
         "blocking commands: installs, version checks, curl probes. Use a generous "
         "timeout (300–600s) for installs. NEVER use it for dev servers — they don't "
@@ -331,21 +352,41 @@ verifier_agent = Agent[Any](
         "prompt before running anything. The developer prompt has the local clone "
         "path you should pass as `cwd`.\n"
         "\n"
-        "OUTPUT FORMAT:\n"
-        "  ## Task\n"
-        "  <one sentence restating what you verified>\n"
-        "  ## Steps run\n"
-        "  1. `<command>` (cwd=<path>) → exit X, <one-line outcome>\n"
-        "  2. ...\n"
-        "  ## Result\n"
-        "  PASS | PARTIAL | FAIL\n"
-        "  ## Findings\n"
-        "  <only if not PASS — for each issue: what failed, why, and the concrete fix>\n"
-        "  ## Background processes still running\n"
-        "  <handle, command — only if any>"
+        "AUTOMATIC-VERIFICATION MODE (when the developer prompt says you are running automatic startup verification):\n"
+        "  - Your shell tools route into a per-session Docker sidecar. `localhost` inside the sidecar is the sidecar itself.\n"
+        "  - The cloned repos live at `/repos/<repo_name>`. Use those as `cwd`, not the FastAPI container paths.\n"
+        "  - The sidecar has the host's Docker socket mounted (DooD). When you run `docker run` / `docker-compose up`, containers start on the HOST's docker daemon and bind HOST ports. To probe them from inside the sidecar, use `http://host.docker.internal:<host_port>`, NOT `http://localhost:<port>`. `localhost` in the sidecar only reaches processes you started directly inside the sidecar (via `python3 server.py`, `npm run dev`, etc.). If a probe to `host.docker.internal:<port>` is refused, run `docker ps` to confirm the container actually bound the host port; a `docker-compose` create can succeed but fail to bind if the host port is occupied (resulting in a `Created` but not `Up` container).\n"
+        "  - The sidecar is Debian (bookworm) running as root, with: `apt-get`, `pip`/`pip3`, `npm`/`pnpm`, `git`, `curl`, `docker`. You CAN install system packages and language libraries — there is no sudo and no password.\n"
+        "  - WHEN A STEP FAILS BECAUSE A DEPENDENCY IS MISSING, ATTEMPT TO INSTALL IT BEFORE GIVING UP:\n"
+        "      * Missing system tool / Python C-extension module (e.g. `tkinter`, `psycopg2`, `lxml`, `cv2`, `Pillow` runtime libs): try `apt-get update && apt-get install -y <pkg>`. Common mappings: `tkinter` → `python3-tk`, `psycopg2`/`psycopg2-binary` runtime → `libpq5`, `lxml` → `libxml2 libxslt1.1`, `cv2` → `libgl1`. NOTE: `tkinter` ships with the OS package `python3-tk`; `pip install tkinter` does NOT work.\n"
+        "      * Missing Python package: try `pip3 install <pkg>` (or `pip3 install -r requirements.txt` if a manifest exists).\n"
+        "      * Missing Node package: try `npm install` / `pnpm install` in the repo's cwd.\n"
+        "      * After installing, re-run the failing step. If it now succeeds, the plan was incomplete — add the install step to `## Steps` (or the package to `## Prerequisites`) via `update_app_startup_plan`.\n"
+        "  - This is a SINGLE-PASS run with a generous turn budget (~400) and a wall-clock budget shown in the developer prompt. There is no 'next iteration' — finish the job in this run. You keep full working memory across turns: prior tool results, env values, installed packages, and running background processes are all available without re-discovery.\n"
+        "  - If the plan is wrong (wrong port, missing step, wrong command, missing install step), call `update_app_startup_plan(plan_markdown, change_summary)` with the FULL corrected markdown. The tool validates 7 headings, IN THIS ORDER: `# Startup plan`, `## Prerequisites`, `## Env vars`, `## Steps`, `## Dependency graph`, `## Caveats`, `## Verification`.\n"
+        "    EACH SECTION HAS A SCHEMA — respect it when you edit:\n"
+        "      * `# Startup plan: <app name or repo set summary>` — keep the existing title verbatim.\n"
+        "      * `## Prerequisites` — required infra (postgres, redis, etc.) with version requirements. Add/remove infra items only.\n"
+        "      * `## Env vars` — grouped by repo, each marked required/optional. When adding an env var, place it under the correct repo group and mark required/optional explicitly.\n"
+        "      * `## Steps` — numbered, one per ordered group from the topo sort; parallel commands grouped. When adding an install step (e.g. `apt-get install -y python3-tk`), insert it as a new numbered step in the right position, do not append it as prose.\n"
+        "      * `## Dependency graph` — Mermaid diagram of nodes and typed edges. NEVER delete or replace this block; only adjust nodes/edges if you have direct evidence the existing graph is wrong.\n"
+        "      * `## Caveats` — ambiguous edges, cycle-breaking decisions, low-confidence matches. Append new caveats; do not delete existing ones.\n"
+        "      * `## Verification` — the section YOU own. Replace `_Not yet verified._` on your first call. Each subsequent call updates this section with: (i) current status (`In progress`, `PASS`, `BLOCKED`, `FAIL`), (ii) commands run so far, (iii) installs / fixes applied, (iv) what is still failing or unresolved.\n"
+        "    Keep every other section's content verbatim unless you have direct evidence it is wrong AND you are explicitly fixing it.\n"
+        "  - INCREMENTAL CHECKPOINTS: call `update_app_startup_plan` at MEANINGFUL checkpoints during the run — at minimum after each install you performed, after the first successful run of a step that previously failed, and at the end.\n"
+        "  - Set your final `VerificationResult.result` (PASS / BLOCKED / FAIL / PARTIAL) once you have decisive evidence. Don't keep running just because the turn budget allows it — finish when the result is clear.\n"
+        "  - Use BLOCKED (not FAIL) only AFTER attempting fixes: missing secrets/credentials you cannot synthesize, install attempts that themselves failed (apt 404, network error, package not found), destructive commands the denylist refused, genuinely out-of-scope requirements (Mac-only tool, paid SaaS, headless display required), or environmental conflicts you couldn't safely resolve (e.g. host port already bound by an unrelated container from a previous run that you cannot identify or that the user did not consent to remove). Reserve FAIL for plan errors you couldn't fix this run.\n"
+        "  - If you find a host-port conflict because of a leftover container from a prior verify run (e.g. `backend_fastapi_1`, `verify-*` from another session), you MAY `docker stop` and `docker rm` it before retrying the documented startup command — but ONLY if the container name clearly belongs to a previous run of the same plan (matches the repo's compose service names or matches `verify-*`). Do NOT touch unrelated containers. If unsure, BLOCKED is the right answer.\n"
+        "  - Do NOT call `ask_user` in this mode — automatic verification has no human in the loop. Surface unresolved ambiguities as BLOCKED with details in your `findings` field and a `blockers` entry.\n"
+        "\n"
+        "PERSISTED-SIDECAR MODE (chat-time verification after the session already had its first automatic verification):\n"
+        "  - The session-scoped sidecar from auto verification may still be running. If your shell commands fail with \"no such container\" or \"sandbox unavailable\", the sidecar has been killed (e.g. via DELETE /sandbox or session end). Surface that and continue with what you can verify without it.\n"
+        "  - Repos remain at `/repos/<repo_name>`. Prior installs and background processes from auto verification may still be present — `ps -ef`, `ls`, or checking running processes is fair game before deciding what to do.\n"
+        "  - You may stop and restart processes the user is asking about; you are not required to leave the post-verify state untouched."
     ),
     model="gpt-5.4",
     model_settings=ModelSettings(max_tokens=16384),
+    output_type=VerificationResult,
     tools=[
         get_startup_plan,
         get_repo_startup_plan,
@@ -360,6 +401,7 @@ verifier_agent = Agent[Any](
         read_background_process_output,
         stop_background_process,
         ask_user,
+        update_app_startup_plan,
     ],
     handoffs=[explorer_agent, explainer_agent, tracer_agent, bootstrap_agent],
     handoff_description=(
@@ -372,6 +414,7 @@ verifier_agent = Agent[Any](
 
 
 router_agent = Agent[Any](
+
     name="Router",
     instructions=(
         "You are a router to route the users question to the appropriate agent, you can hand off to the explorer agent to find things in the codebase, the explainer agent to summarise and synthesise information, the tracer agent to trace the execution path of the codebase, the bootstrap agent for questions about getting the repo running locally, or the verifier agent to empirically test/run things. After handing off to one agent you can hand off to another agent. You should ensure you completely and directly answer the users question and pick up all information from the previous agents/related to the question.\n"
