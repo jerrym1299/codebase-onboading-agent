@@ -828,16 +828,28 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
     current_session_id.set(params.session_id)
     session = SQLiteSession(params.session_id, SESSION_DB_PATH)
 
+    sandbox = get_sandbox(params.session_id)
+    sandbox_token = current_sandbox.set(sandbox) if sandbox is not None else None
+
     def prepend_repo_context(history, new_input):
         repo_lines = "\n".join(
             f"- {url.rstrip('/').split('/')[-1].removesuffix('.git')}: "
             f"local={repo_dirs[url]}, indexed_url={url}"
             for url in repo_urls
         )
+        sandbox_line = ""
+        if sandbox is not None:
+            sandbox_line = (
+                f"A verification sandbox container `{sandbox.container_name}` is "
+                f"running for this session. Shell commands from the Verifier agent "
+                f"will execute inside it. Repos are at /repos/<repo_name> within the "
+                f"sandbox.\n"
+            )
         context = {
             "role": "developer",
             "content": (
                 f"Repos in this session:\n{repo_lines}\n"
+                f"{sandbox_line}"
                 "When you call search_indexed/search_dir_summaries, pass the indexed_url "
                 "that matches the question.\n"
                 "When you call read_file/list_files, use the local path of the relevant repo.\n"
@@ -919,6 +931,9 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
         fallback = {"type": "text", "text": text}
         await _append_part(pool, msg_id, fallback)
         await publish(params.session_id, fallback)
+    finally:
+        if sandbox_token is not None:
+            current_sandbox.reset(sandbox_token)
 
     await publish(params.session_id, {"type": "finish"})
 
