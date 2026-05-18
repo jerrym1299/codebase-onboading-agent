@@ -34,6 +34,7 @@ REQUIRED_APP_PLAN_HEADINGS = (
     "## Steps",
     "## Dependency graph",
     "## Caveats",
+    "## Verification",
 )
 
 current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar("current_session_id")
@@ -373,9 +374,9 @@ async def update_startup_plan(plan_markdown: str, change_summary: str = "") -> s
          values, service ports, ordering, etc.). For each one, call `ask_user`
          to confirm or get a value.
       3. Construct the FULL updated markdown (replaces plan_markdown wholesale).
-         The markdown is REJECTED unless it contains all six section headings
+         The markdown is REJECTED unless it contains all seven section headings
          exactly: `# Startup plan`, `## Prerequisites`, `## Env vars`,
-         `## Steps`, `## Dependency graph`, `## Caveats`.
+         `## Steps`, `## Dependency graph`, `## Caveats`, `## Verification`.
       4. Call this tool with the new markdown.
 
     `change_summary` is a one-line description of what changed, used only for
@@ -393,7 +394,7 @@ async def update_startup_plan(plan_markdown: str, change_summary: str = "") -> s
     if missing:
         return (
             "ERROR: plan_markdown is missing required section heading(s): "
-            f"{', '.join(missing)}. The app plan must contain all six headings: "
+            f"{', '.join(missing)}. The app plan must contain all seven headings: "
             f"{', '.join(REQUIRED_APP_PLAN_HEADINGS)}."
         )
 
@@ -422,6 +423,10 @@ async def update_startup_plan(plan_markdown: str, change_summary: str = "") -> s
     })
 
     return f"App startup plan updated ({len(plan_markdown)} chars) for repo_set_hash={repo_set_hash}."
+
+
+# Verifier-facing alias — same tool, name reflects its role from inside the verifier loop.
+update_app_startup_plan = update_startup_plan
 
 
 UPDATE_REPO_PLAN_SQL = """
