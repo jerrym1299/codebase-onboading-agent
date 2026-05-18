@@ -580,6 +580,28 @@ def _build_verify_prompt(row: dict, params: "VerifyStartupParams",
     )
 
 
+def _parse_shell_string_output(text: str) -> dict:
+    """Parse the formatted string returned by run_shell back into structured fields.
+    The tool returns: '$ <cmd>\\n(cwd=..., exit_code=N, duration_ms=M, timed_out=B[, denied=B])\\n--- stdout ---\\n...\\n--- stderr ---\\n...'"""
+    import re
+    out: dict = {}
+    m = re.search(r"exit_code=(-?\d+)", text)
+    if m:
+        out["exit_code"] = int(m.group(1))
+    m = re.search(r"duration_ms=(\d+)", text)
+    if m:
+        out["duration_ms"] = int(m.group(1))
+    if "denied=True" in text:
+        out["denied"] = True
+    so = re.search(r"--- stdout ---\n(.*?)\n--- stderr ---", text, re.DOTALL)
+    if so:
+        out["stdout_tail"] = so.group(1)
+    se = re.search(r"--- stderr ---\n(.*)\Z", text, re.DOTALL)
+    if se:
+        out["stderr_tail"] = se.group(1)
+    return out
+
+
 def _ingest_event(ev, builder) -> None:
     # Best-effort: map streamed tool-call/tool-output events into the verification report.
     try:
@@ -606,6 +628,24 @@ def _ingest_event(ev, builder) -> None:
                         stdout_tail="",
                         stderr_tail="",
                     )
+                elif name == "start_background_process":
+                    builder.add_command(
+                        command=f"[background] {args.get('command', '')}",
+                        cwd=args.get("cwd"),
+                        exit_code=0,
+                        duration_ms=0,
+                        stdout_tail="",
+                        stderr_tail="",
+                    )
+                elif name == "stop_background_process":
+                    builder.add_command(
+                        command=f"[stop-background] handle={args.get('handle','')}",
+                        cwd=None,
+                        exit_code=0,
+                        duration_ms=0,
+                        stdout_tail="",
+                        stderr_tail="",
+                    )
                 elif name in ("update_app_startup_plan", "update_startup_plan"):
                     builder.add_plan_update(
                         iteration=len(builder.report["attempts"]) + 1,
@@ -613,14 +653,27 @@ def _ingest_event(ev, builder) -> None:
                     )
             elif isinstance(item, ToolCallOutputItem) and ev.name == "tool_output":
                 out_raw = item.output
-                # `output` may be a string (formatted shell result) — we only update on dicts
-                if isinstance(out_raw, dict) and "exit_code" in out_raw and builder.report["commands"]:
-                    cmd = builder.report["commands"][-1]
+                if not builder.report["commands"]:
+                    return
+                cmd = builder.report["commands"][-1]
+                if isinstance(out_raw, dict) and "exit_code" in out_raw:
                     cmd["exit_code"] = out_raw.get("exit_code", 0)
                     cmd["duration_ms"] = out_raw.get("duration_ms", 0)
                     cmd["stdout_tail"] = (out_raw.get("stdout_tail") or "")[-2000:]
                     cmd["stderr_tail"] = (out_raw.get("stderr_tail") or "")[-2000:]
                     cmd["denied"] = bool(out_raw.get("denied"))
+                elif isinstance(out_raw, str):
+                    parsed = _parse_shell_string_output(out_raw)
+                    if "exit_code" in parsed:
+                        cmd["exit_code"] = parsed["exit_code"]
+                    if "duration_ms" in parsed:
+                        cmd["duration_ms"] = parsed["duration_ms"]
+                    if "stdout_tail" in parsed:
+                        cmd["stdout_tail"] = parsed["stdout_tail"][-2000:]
+                    if "stderr_tail" in parsed:
+                        cmd["stderr_tail"] = parsed["stderr_tail"][-2000:]
+                    if "denied" in parsed:
+                        cmd["denied"] = parsed["denied"]
     except Exception:
         # ingestion is best-effort — never crash the verify loop because of an event we don't understand
         pass
