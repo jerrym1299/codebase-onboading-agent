@@ -635,7 +635,7 @@ async def verify_startup_activity(params: VerifyStartupParams) -> dict:
     terminal, the sidecar is torn down."""
     import time
 
-    max_iters = int(os.environ.get("VERIFY_MAX_ITERATIONS", "2"))
+    max_iters = int(os.environ.get("VERIFY_MAX_ITERATIONS", "5"))
     budget_seconds = int(os.environ.get("VERIFY_BUDGET_SECONDS", "1200"))
 
     row = await get_app_startup_plan_row(params.repo_set_hash)

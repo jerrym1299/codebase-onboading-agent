@@ -70,7 +70,7 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - VERIFY_SANDBOX_IMAGE=hobbes-verify-sidecar:latest
-      - VERIFY_MAX_ITERATIONS=2
+      - VERIFY_MAX_ITERATIONS=5
       - VERIFY_BUDGET_SECONDS=1200
     volumes:
       - .:/app
