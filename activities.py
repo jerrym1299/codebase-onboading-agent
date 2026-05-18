@@ -564,10 +564,11 @@ def _iso_now() -> str:
 
 
 def _build_verify_prompt(row: dict, params: "VerifyStartupParams",
-                         iteration: int, max_iters: int, remaining: int) -> str:
+                         budget_remaining: int) -> str:
     return (
         "# Automatic startup verification\n\n"
-        f"You are iteration {iteration} of {max_iters}. Time remaining: {remaining}s.\n"
+        "You are the Verifier for an application that spans one or more repos. Your job: empirically run the documented startup steps in the sidecar and prove whether the application actually comes up.\n\n"
+        f"Total wall-clock budget remaining: ~{budget_remaining}s. Use it deliberately — install deps, run steps, probe endpoints, fix the plan when wrong, and emit `## Result` (PASS / BLOCKED / FAIL) once you have enough evidence. You do not need to keep going until the budget is gone; finish when the result is decisive.\n\n"
         f"session_id: {params.session_id}\n"
         f"repo_set_hash: {params.repo_set_hash}\n"
         f"repos cloned in sidecar at /repos/<repo_name>:\n"
@@ -629,14 +630,16 @@ def _ingest_event(ev, builder) -> None:
 async def verify_startup_activity(params: VerifyStartupParams) -> dict:
     """Run automatic startup verification in a per-session Docker sidecar.
 
-    Spins up the sidecar, clones repos into it, runs verifier_agent in a
-    bounded loop, persists structured report. On terminal status the sidecar
-    is REGISTERED (kept alive) for chat-time verifier turns. On crash before
-    terminal, the sidecar is torn down."""
+    Spins up the sidecar, clones repos into it, runs verifier_agent ONCE
+    (single run, large max_turns, bounded by a wall-clock deadline), and
+    persists a structured report. The agent rewrites `## Verification` and
+    other plan sections incrementally via `update_app_startup_plan` as it
+    works. On a terminal result the sidecar is REGISTERED (kept alive) for
+    chat-time verifier turns; on a crash before terminal it is torn down."""
     import time
 
-    max_iters = int(os.environ.get("VERIFY_MAX_ITERATIONS", "5"))
     budget_seconds = int(os.environ.get("VERIFY_BUDGET_SECONDS", "1200"))
+    max_turns = int(os.environ.get("VERIFY_MAX_TURNS", "400"))
 
     row = await get_app_startup_plan_row(params.repo_set_hash)
     if row is None:
@@ -675,49 +678,54 @@ async def verify_startup_activity(params: VerifyStartupParams) -> dict:
         sandbox_started = True
         sandbox_token = current_sandbox.set(sandbox)
 
-        for iteration in range(1, max_iters + 1):
-            if time.monotonic() >= deadline:
-                builder.set_final("budget exhausted before iteration could start")
-                final_status = VerificationStatus.FAILED
-                reached_terminal = True
-                break
-            iter_start = _iso_now()
-            developer_prompt = _build_verify_prompt(
-                row, params, iteration, max_iters,
-                remaining=int(deadline - time.monotonic()),
+        run_start = _iso_now()
+        developer_prompt = _build_verify_prompt(
+            row, params, budget_remaining=int(deadline - time.monotonic()),
+        )
+        streamed = Runner.run_streamed(verifier_agent, developer_prompt, max_turns=max_turns)
+        hit_max_turns = False
+        hit_budget = False
+        try:
+            async for ev in streamed.stream_events():
+                _ingest_event(ev, builder)
+                await update_app_startup_plan_verification(
+                    params.repo_set_hash, VerificationStatus.RUNNING.value, builder.report)
+                if time.monotonic() >= deadline:
+                    hit_budget = True
+                    try:
+                        streamed.cancel()
+                    except Exception:
+                        pass
+                    break
+        except MaxTurnsExceeded:
+            hit_max_turns = True
+        agent_text = str(streamed.final_output) if streamed.final_output else ""
+        if hit_budget:
+            result = "FAIL"
+            summary = (
+                "Wall-clock budget exhausted before the verifier emitted a final result. "
+                f"Partial output: {agent_text[:800]}"
             )
-            streamed = Runner.run_streamed(verifier_agent, developer_prompt, max_turns=80)
-            hit_max_turns = False
-            try:
-                async for ev in streamed.stream_events():
-                    _ingest_event(ev, builder)
-                    await update_app_startup_plan_verification(
-                        params.repo_set_hash, VerificationStatus.RUNNING.value, builder.report)
-            except MaxTurnsExceeded:
-                hit_max_turns = True
-            agent_text = str(streamed.final_output) if streamed.final_output else ""
-            if hit_max_turns:
-                result = "FAIL"
-                summary = (
-                    "MaxTurnsExceeded — verifier ran out of turns mid-iteration. "
-                    f"Partial output: {agent_text[:800]}"
-                )
-            else:
-                result = parse_verifier_result(agent_text)
-                summary = agent_text[:1000]
-            iter_end = _iso_now()
-            builder.add_attempt(iteration, iter_start, iter_end, result, summary=summary)
-            row = await get_app_startup_plan_row(params.repo_set_hash)
+        elif hit_max_turns:
+            result = "FAIL"
+            summary = (
+                f"MaxTurnsExceeded (cap={max_turns}). "
+                f"Partial output: {agent_text[:800]}"
+            )
+        else:
+            result = parse_verifier_result(agent_text)
+            summary = agent_text[:2000]
+        run_end = _iso_now()
+        # report keeps an "attempts" list for FE compatibility; single-run = one entry
+        builder.add_attempt(1, run_start, run_end, result, summary=summary)
 
-            status = result_to_status(result, iterations_remaining=max_iters - iteration)
-            if status in (VerificationStatus.PASSED, VerificationStatus.BLOCKED):
-                final_status = status
-                reached_terminal = True
-                break
-            if iteration == max_iters:
-                final_status = VerificationStatus.FAILED
-                reached_terminal = True
-                break
+        if result == "PASS":
+            final_status = VerificationStatus.PASSED
+        elif result == "BLOCKED":
+            final_status = VerificationStatus.BLOCKED
+        else:
+            final_status = VerificationStatus.FAILED
+        reached_terminal = True
     except Exception as exc:
         builder.set_final(f"verifier raised: {type(exc).__name__}: {exc}")
         final_status = VerificationStatus.FAILED

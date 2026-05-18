@@ -119,7 +119,7 @@ curl -s http://localhost:8001/sessions/<session_id>/messages
 After the consolidator produces the cross-repo startup plan, a Temporal
 activity (`verify_startup_activity`) spins up a per-session Docker sidecar,
 clones every repo into it, and runs the existing Verifier agent in a bounded
-loop (default 5 iterations, 1200s budget). If the plan is wrong the verifier
+single agent run (default 400-turn cap, 1200s wall-clock budget). If the plan is wrong the verifier
 calls `update_app_startup_plan(plan_markdown, change_summary)` with the full
 corrected markdown (now validated against 7 headings — adds `## Verification`).
 On a terminal result the sidecar is **kept alive** and registered against the
@@ -139,7 +139,7 @@ The FastAPI image mounts `/var/run/docker.sock` (DooD) to launch the sidecar.
 | Name | Default | Purpose |
 |---|---|---|
 | `VERIFY_SANDBOX_IMAGE` | `hobbes-verify-sidecar:latest` | Image used for the sidecar. |
-| `VERIFY_MAX_ITERATIONS` | `5` | Max verifier passes per run. |
+| `VERIFY_MAX_TURNS` | `400` | Max agent turns per verification run (single-run model). |
 | `VERIFY_BUDGET_SECONDS` | `1200` | Total wall-clock budget per verification. |
 
 ### Endpoints
