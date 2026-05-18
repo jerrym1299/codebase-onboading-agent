@@ -49,6 +49,7 @@ from services.embedding_cache import hydrate_embeddings
 from services.exact_search import build_text_lines
 from services.event_bus import subscribe, unsubscribe
 from services.pdf_output import write_markdown_pdf
+from services.recipe_proposal import RecipeCandidateError, generate_recipe_candidate
 from services.repo_manifest import build_repo_manifest
 from services.walk_repo import collect_file_paths, walk_repo
 from workflows import CodebaseChatWorkflow
@@ -163,6 +164,21 @@ async def get_repo_index_job_endpoint(job_id: str):
     if job is None:
         return JSONResponse(status_code=404, content={"error": "Job not found."})
     return job
+
+
+@app.post("/repo-indexes/{repo_index_id}/recipe-candidate")
+async def create_repo_recipe_candidate_endpoint(repo_index_id: str, payload: dict | None = None):
+    metadata = (payload or {}).get("metadata")
+    try:
+        candidate = await generate_recipe_candidate(
+            repo_index_id,
+            metadata=metadata if isinstance(metadata, dict) else None,
+        )
+    except LookupError:
+        return JSONResponse(status_code=404, content={"error": "Repo index not found."})
+    except RecipeCandidateError as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
+    return candidate
 
 
 @app.get("/walkrepo")

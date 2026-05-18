@@ -11,6 +11,7 @@ import logging
 import os
 from dataclasses import dataclass
 from urllib.parse import quote_plus, urlparse
+from uuid import UUID
 
 import psycopg
 from pgvector.psycopg import register_vector_async
@@ -870,6 +871,9 @@ async def claim_next_repo_index_job() -> dict | None:
             SET status = 'cloning',
                 attempt_count = attempt_count + 1,
                 started_at = COALESCE(started_at, NOW()),
+                completed_at = NULL,
+                error_code = NULL,
+                error_message = NULL,
                 updated_at = NOW()
             WHERE id = (SELECT id FROM next_job)
             RETURNING id
@@ -894,6 +898,9 @@ async def update_repo_index_job_status(
 
     if status in {"cloning", "manifesting", "indexing", "embedding", "summarizing"}:
         set_sql.append("started_at = COALESCE(started_at, NOW())")
+        set_sql.append("completed_at = NULL")
+        set_sql.append("error_code = NULL")
+        set_sql.append("error_message = NULL")
     if status in {"complete", "failed", "cancelled"}:
         set_sql.append("completed_at = NOW()")
     if status == "complete":
@@ -2034,6 +2041,273 @@ async def get_dir_summaries_for_repo(repo_url: str) -> list[dict]:
         }
         for r in rows
     ]
+
+
+async def get_repo_index(repo_index_id: str) -> dict | None:
+    try:
+        UUID(str(repo_index_id))
+    except ValueError:
+        return None
+
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT i.id, i.tenant_id, i.repo_connection_id, i.repo_url,
+                   i.commit_sha, i.branch, i.manifest_sha256,
+                   i.root_merkle_sha256, i.file_count, i.chunk_count,
+                   i.line_count, i.embedding_model, i.status, i.metadata,
+                   i.created_at, i.updated_at, i.completed_at,
+                   c.provider, c.default_branch, c.installation_id, c.metadata
+            FROM repo_indexes i
+            JOIN repo_connections c ON c.id = i.repo_connection_id
+            WHERE i.id = %s
+            """,
+            (repo_index_id,),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "id": str(row[0]),
+        "tenant_id": str(row[1]),
+        "repo_connection_id": str(row[2]),
+        "repo_url": row[3],
+        "commit_sha": row[4],
+        "branch": row[5],
+        "manifest_sha256": row[6],
+        "root_merkle_sha256": row[7],
+        "file_count": row[8],
+        "chunk_count": row[9],
+        "line_count": row[10],
+        "embedding_model": row[11],
+        "status": row[12],
+        "metadata": row[13] or {},
+        "created_at": row[14].isoformat(),
+        "updated_at": row[15].isoformat(),
+        "completed_at": _iso_or_none(row[16]),
+        "provider": row[17],
+        "default_branch": row[18],
+        "installation_id": row[19],
+        "repo_connection_metadata": row[20] or {},
+    }
+
+
+async def get_repo_recipe_candidate_evidence(
+    repo_index_id: str,
+    *,
+    file_limit: int = 350,
+    line_limit: int = 3500,
+    dir_summary_limit: int = 75,
+    chunk_limit: int = 35,
+) -> dict | None:
+    """Collect indexed evidence used to draft a runnable Daytona recipe candidate.
+
+    This deliberately uses the persisted index instead of a local checkout so
+    the cloud API can generate a candidate immediately after an async index job
+    completes.
+    """
+    repo_index = await get_repo_index(repo_index_id)
+    if repo_index is None:
+        return None
+
+    repo_url = repo_index["repo_url"]
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT file_path, file_sha256, size_bytes, language, extension,
+                   is_generated, is_vendor, updated_at
+            FROM repo_files
+            WHERE repo_url = %s
+            ORDER BY file_path
+            LIMIT %s
+            """,
+            (repo_url, file_limit),
+        )
+        file_rows = await cur.fetchall()
+
+        files = [
+            {
+                "file_path": row[0],
+                "file_sha256": row[1],
+                "size_bytes": row[2],
+                "language": row[3],
+                "extension": row[4],
+                "is_generated": row[5],
+                "is_vendor": row[6],
+                "updated_at": row[7].isoformat(),
+            }
+            for row in file_rows
+        ]
+        interesting_paths = _recipe_candidate_interesting_paths([f["file_path"] for f in files])
+
+        file_lines: list[dict] = []
+        if interesting_paths:
+            await cur.execute(
+                """
+                SELECT file_path, line_number, line_text, language
+                FROM repo_text_lines
+                WHERE repo_url = %s
+                  AND file_path = ANY(%s::text[])
+                ORDER BY file_path, line_number
+                LIMIT %s
+                """,
+                (repo_url, interesting_paths, line_limit),
+            )
+            file_lines = [
+                {
+                    "file_path": row[0],
+                    "line_number": row[1],
+                    "line_text": row[2],
+                    "language": row[3],
+                }
+                for row in await cur.fetchall()
+            ]
+
+        await cur.execute(
+            """
+            SELECT dir_path, summary, file_list, created_at
+            FROM dir_summaries
+            WHERE repo_url = %s
+            ORDER BY dir_path
+            LIMIT %s
+            """,
+            (repo_url, dir_summary_limit),
+        )
+        dir_summaries = [
+            {
+                "dir_path": row[0],
+                "summary": row[1],
+                "file_list": list(row[2] or []),
+                "created_at": row[3].isoformat(),
+            }
+            for row in await cur.fetchall()
+        ]
+
+        chunk_paths = interesting_paths[:60]
+        if chunk_paths:
+            await cur.execute(
+                """
+                SELECT file_path, chunk_type, name, start_line, end_line, content
+                FROM code_chunks
+                WHERE repo_url = %s
+                  AND file_path = ANY(%s::text[])
+                ORDER BY file_path, start_line
+                LIMIT %s
+                """,
+                (repo_url, chunk_paths, chunk_limit),
+            )
+        else:
+            await cur.execute(
+                """
+                SELECT file_path, chunk_type, name, start_line, end_line, content
+                FROM code_chunks
+                WHERE repo_url = %s
+                ORDER BY file_path, start_line
+                LIMIT %s
+                """,
+                (repo_url, chunk_limit),
+            )
+        code_chunks = [
+            {
+                "file_path": row[0],
+                "chunk_type": row[1],
+                "name": row[2],
+                "start_line": row[3],
+                "end_line": row[4],
+                "content": row[5][:4000],
+            }
+            for row in await cur.fetchall()
+        ]
+
+    return {
+        "repo_index": repo_index,
+        "files": files,
+        "interesting_paths": interesting_paths,
+        "file_lines": file_lines,
+        "dir_summaries": dir_summaries,
+        "code_chunks": code_chunks,
+    }
+
+
+def _recipe_candidate_interesting_paths(paths: list[str]) -> list[str]:
+    name_matches = {
+        "package.json",
+        "pnpm-lock.yaml",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "yarn.lock",
+        "pnpm-workspace.yaml",
+        "pnpm-workspace.yml",
+        "turbo.json",
+        "nx.json",
+        "lerna.json",
+        "vite.config.ts",
+        "vite.config.js",
+        "next.config.js",
+        "next.config.mjs",
+        "next.config.ts",
+        "Dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+        "Procfile",
+        "Makefile",
+        "justfile",
+        "pyproject.toml",
+        "requirements.txt",
+        "uv.lock",
+        "poetry.lock",
+        "Pipfile",
+        ".env.example",
+        ".env.sample",
+        ".env.template",
+        ".env.dist",
+        "env.example",
+        "env.sample",
+        "env.template",
+        "env.dist",
+        ".nvmrc",
+        ".python-version",
+        ".tool-versions",
+        "README.md",
+        "README.MD",
+        "README",
+        "README.txt",
+        "prisma/schema.prisma",
+    }
+    suffix_matches = (
+        "/package.json",
+        "/vite.config.ts",
+        "/vite.config.js",
+        "/next.config.js",
+        "/next.config.mjs",
+        "/next.config.ts",
+        "/Dockerfile",
+        "/docker-compose.yml",
+        "/docker-compose.yaml",
+        "/compose.yml",
+        "/compose.yaml",
+        "/pyproject.toml",
+        "/requirements.txt",
+        "/.env.example",
+        "/.env.sample",
+        "/.env.template",
+        "/.env.dist",
+        "/env.example",
+        "/env.sample",
+        "/env.template",
+        "/env.dist",
+        "/prisma/schema.prisma",
+    )
+    selected: list[str] = []
+    for path in paths:
+        name = path.rsplit("/", 1)[-1]
+        if path in name_matches or name in name_matches or path.endswith(suffix_matches):
+            selected.append(path)
+    return selected[:120]
 
 
 async def upsert_repo_boundaries(
