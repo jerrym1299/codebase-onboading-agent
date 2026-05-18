@@ -437,6 +437,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE IF EXISTS sessions
+    ADD COLUMN IF NOT EXISTS app_plan_hash TEXT;
+
 CREATE INDEX IF NOT EXISTS sessions_app_plan_hash_idx
     ON sessions (app_plan_hash);
 
