@@ -741,6 +741,26 @@ async def verify_startup_activity(params: VerifyStartupParams) -> dict:
     return {"status": final_status.value, "sandbox_kept_alive": reached_terminal and sandbox_started}
 
 
+@dataclass
+class KillSandboxParams:
+    session_id: str
+
+
+@activity.defn
+async def kill_sandbox_activity(params: KillSandboxParams) -> dict:
+    sandbox = get_sandbox(params.session_id)
+    if sandbox is None:
+        return {"killed": False, "reason": "no sandbox"}
+    result = await sandbox.cleanup()
+    unregister_sandbox(params.session_id)
+    await publish(params.session_id, {
+        "type": "data-sandbox-killed",
+        "session_id": params.session_id,
+        "result": result,
+    })
+    return {"killed": True, **result}
+
+
 @activity.defn
 async def publish_pipeline_failed_activity(params: PipelineFailedParams) -> None:
     """Workflow-side hook: publish a terminal pipeline-failed SSE event after
