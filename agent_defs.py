@@ -7,7 +7,7 @@ from services.tools import (
     find_references, get_dependencies, search_indexed, search_dir_summaries, git_log,
     ask_user,
     get_startup_plan, recompute_startup_plan,
-    update_startup_plan, update_repo_startup_plan,
+    update_startup_plan, update_repo_startup_plan, update_app_startup_plan,
     get_repo_boundaries, get_repo_startup_plan, get_app_startup_plan,
     run_shell, start_background_process, read_background_process_output, stop_background_process,
 )
@@ -226,7 +226,9 @@ consolidator_agent = Agent[Any](
         "  ## Env vars — grouped by repo, marked required/optional\n"
         "  ## Steps — one numbered step per ordered group from the topo sort, parallel commands grouped\n"
         "  ## Dependency graph — Mermaid diagram of nodes and typed edges\n"
-        "  ## Caveats — ambiguous edges, cycle-breaking decisions, low-confidence matches, anything to verify"
+        "  ## Caveats — ambiguous edges, cycle-breaking decisions, low-confidence matches, anything to verify\n"
+        "  ## Verification — placeholder; the verifier fills this in. On first pass, emit exactly:\n"
+        "       _Not yet verified._"
     ),
     model="gpt-5.4",
     model_settings=ModelSettings(max_tokens=16384),
@@ -326,7 +328,19 @@ verifier_agent = Agent[Any](
         "  ## Findings\n"
         "  <only if not PASS — for each issue: what failed, why, and the concrete fix>\n"
         "  ## Background processes still running\n"
-        "  <handle, command — only if any>"
+        "  <handle, command — only if any>\n"
+        "\n"
+        "AUTOMATIC-VERIFICATION MODE (when the developer prompt says you are running automatic startup verification):\n"
+        "  - Your shell tools route into a per-session Docker sidecar. `localhost` inside the sidecar is the sidecar itself.\n"
+        "  - The cloned repos live at `/repos/<repo_name>`. Use those as `cwd`, not the FastAPI container paths.\n"
+        "  - If the plan is wrong (wrong port, missing step, wrong command), call `update_app_startup_plan(plan_markdown, change_summary)` with the FULL corrected markdown. The tool validates 7 headings: `# Startup plan`, `## Prerequisites`, `## Env vars`, `## Steps`, `## Dependency graph`, `## Caveats`, `## Verification`. Preserve every section verbatim; only mutate what you mean to change.\n"
+        "  - Use BLOCKED (not FAIL) for: missing required env vars/secrets you cannot synthesize, missing third-party auth/credentials, destructive commands the denylist refused, or out-of-scope requirements (e.g. plan needs a Mac-only tool). Reserve FAIL for genuine startup-plan errors that could be fixed by another iteration.\n"
+        "  - Do NOT call `ask_user` in this mode — automatic verification has no human in the loop. Surface ambiguities as BLOCKED with details in your Findings section.\n"
+        "\n"
+        "PERSISTED-SIDECAR MODE (chat-time verification after the session already had its first automatic verification):\n"
+        "  - The session-scoped sidecar from auto verification may still be running. If your shell commands fail with \"no such container\" or \"sandbox unavailable\", the sidecar has been killed (e.g. via DELETE /sandbox or session end). Surface that and continue with what you can verify without it.\n"
+        "  - Repos remain at `/repos/<repo_name>`. Prior installs and background processes from auto verification may still be present — `ps -ef`, `ls`, or checking running processes is fair game before deciding what to do.\n"
+        "  - You may stop and restart processes the user is asking about; you are not required to leave the post-verify state untouched."
     ),
     model="gpt-5.4",
     model_settings=ModelSettings(max_tokens=16384),
@@ -344,6 +358,7 @@ verifier_agent = Agent[Any](
         read_background_process_output,
         stop_background_process,
         ask_user,
+        update_app_startup_plan,
     ],
     handoffs=[explorer_agent, explainer_agent, tracer_agent, bootstrap_agent],
     handoff_description=(
