@@ -119,6 +119,14 @@ curl -s http://localhost:8001/sessions/<session_id>/messages
 
 - Repo clones are stored under `/repos/<repo_name>` inside the running
   environment.
+- Verifier shell tools use `SANDBOX_RUNNER_PROVIDER`. The default `local`
+  provider runs commands in the FastAPI container. Set
+  `SANDBOX_RUNNER_PROVIDER=daytona` with `DAYTONA_API_KEY` to provision a
+  Daytona sandbox, clone session repos under `/workspace/<repo_name>`, and map
+  Verifier cwd values like `/repos/<repo_name>` to the matching workspace path.
+  Optional Daytona knobs include `DAYTONA_SANDBOX_BASE_IMAGE`,
+  `DAYTONA_SANDBOX_CPU`, `DAYTONA_SANDBOX_MEMORY`,
+  `DAYTONA_SANDBOX_AUTO_STOP_MINUTES`, and `DAYTONA_SANDBOX_PREVIEW_PORT`.
 - The OpenAI Agents SDK session store defaults to `agent_sessions.db`.
 - Indexing stores a content-addressed manifest, exact line-search inventory,
   cached embeddings for unchanged chunks, and tenant/repo/index/job metadata.

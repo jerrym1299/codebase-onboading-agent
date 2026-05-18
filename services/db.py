@@ -1817,6 +1817,48 @@ async def create_sandbox_command_run(
     return _sandbox_command_run_dict(row)
 
 
+async def update_sandbox_run(
+    sandbox_run_id: str,
+    *,
+    status: str | None = None,
+    external_id: str | None = None,
+    preview_url: str | None = None,
+    metadata: dict | None = None,
+) -> dict | None:
+    assignments = ["updated_at = NOW()"]
+    params: list[object] = []
+
+    if status is not None:
+        assignments.append("status = %s")
+        params.append(status)
+        if status in {"complete", "failed", "cancelled"}:
+            assignments.append("completed_at = COALESCE(completed_at, NOW())")
+    if external_id is not None:
+        assignments.append("external_id = %s")
+        params.append(external_id)
+    if preview_url is not None:
+        assignments.append("preview_url = %s")
+        params.append(preview_url)
+    if metadata is not None:
+        assignments.append("metadata = metadata || %s::jsonb")
+        params.append(_json_value(metadata))
+
+    params.append(sandbox_run_id)
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            UPDATE sandbox_runs
+            SET {', '.join(assignments)}
+            WHERE id = %s
+            RETURNING {SANDBOX_RUN_SELECT_COLUMNS}
+            """,
+            params,
+        )
+        row = await cur.fetchone()
+    return _sandbox_run_dict(row) if row is not None else None
+
+
 async def update_sandbox_command_run(
     command_run_id: str,
     *,
@@ -1824,6 +1866,7 @@ async def update_sandbox_command_run(
     exit_code: int | None = None,
     timed_out: bool | None = None,
     duration_ms: int | None = None,
+    pid: int | None = None,
     stdout_tail: str | None = None,
     stderr_tail: str | None = None,
     metadata: dict | None = None,
@@ -1845,6 +1888,9 @@ async def update_sandbox_command_run(
     if duration_ms is not None:
         assignments.append("duration_ms = %s")
         params.append(duration_ms)
+    if pid is not None:
+        assignments.append("pid = %s")
+        params.append(pid)
     if stdout_tail is not None:
         assignments.append("stdout_tail = %s")
         params.append(stdout_tail)
@@ -1871,6 +1917,21 @@ async def update_sandbox_command_run(
     return _sandbox_command_run_dict(row) if row is not None else None
 
 
+async def get_sandbox_run(sandbox_run_id: str) -> dict | None:
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            SELECT {SANDBOX_RUN_SELECT_COLUMNS}
+            FROM sandbox_runs
+            WHERE id = %s
+            """,
+            (sandbox_run_id,),
+        )
+        row = await cur.fetchone()
+    return _sandbox_run_dict(row) if row is not None else None
+
+
 async def list_sandbox_runs_for_session(session_id: str) -> list[dict]:
     pool = await get_pool()
     async with pool.connection() as conn, conn.cursor() as cur:
@@ -1885,6 +1946,24 @@ async def list_sandbox_runs_for_session(session_id: str) -> list[dict]:
         )
         rows = await cur.fetchall()
     return [_sandbox_run_dict(row) for row in rows]
+
+
+async def get_sandbox_command_run_by_handle(session_id: str, handle: str) -> dict | None:
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            SELECT {SANDBOX_COMMAND_SELECT_COLUMNS}
+            FROM sandbox_command_runs
+            WHERE session_id = %s
+              AND process_handle = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (session_id, handle),
+        )
+        row = await cur.fetchone()
+    return _sandbox_command_run_dict(row) if row is not None else None
 
 
 async def list_sandbox_command_runs(sandbox_run_id: str) -> list[dict]:
