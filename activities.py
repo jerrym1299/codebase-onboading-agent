@@ -686,16 +686,27 @@ async def verify_startup_activity(params: VerifyStartupParams) -> dict:
                 row, params, iteration, max_iters,
                 remaining=int(deadline - time.monotonic()),
             )
-            streamed = Runner.run_streamed(verifier_agent, developer_prompt)
-            async for ev in streamed.stream_events():
-                _ingest_event(ev, builder)
-                await update_app_startup_plan_verification(
-                    params.repo_set_hash, VerificationStatus.RUNNING.value, builder.report)
+            streamed = Runner.run_streamed(verifier_agent, developer_prompt, max_turns=80)
+            hit_max_turns = False
+            try:
+                async for ev in streamed.stream_events():
+                    _ingest_event(ev, builder)
+                    await update_app_startup_plan_verification(
+                        params.repo_set_hash, VerificationStatus.RUNNING.value, builder.report)
+            except MaxTurnsExceeded:
+                hit_max_turns = True
             agent_text = str(streamed.final_output) if streamed.final_output else ""
-            result = parse_verifier_result(agent_text)
+            if hit_max_turns:
+                result = "FAIL"
+                summary = (
+                    "MaxTurnsExceeded — verifier ran out of turns mid-iteration. "
+                    f"Partial output: {agent_text[:800]}"
+                )
+            else:
+                result = parse_verifier_result(agent_text)
+                summary = agent_text[:1000]
             iter_end = _iso_now()
-            builder.add_attempt(iteration, iter_start, iter_end, result,
-                                summary=agent_text[:1000])
+            builder.add_attempt(iteration, iter_start, iter_end, result, summary=summary)
             row = await get_app_startup_plan_row(params.repo_set_hash)
 
             status = result_to_status(result, iterations_remaining=max_iters - iteration)
