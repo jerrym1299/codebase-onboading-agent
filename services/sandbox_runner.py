@@ -150,3 +150,95 @@ class DockerSidecarSandbox:
             ["docker", "rm", "-f", self.container_name], timeout=30,
         )
         return {"processes_stopped": stopped, "sidecar_removed": rc == 0}
+
+    async def run_shell(self, command: str, cwd: str | None,
+                        timeout_seconds: int, max_output_lines: int) -> ShellResult:
+        import time
+        if is_destructive(command):
+            return ShellResult(-1, "", "denied: destructive command", 0, denied=True)
+        args = ["docker", "exec"]
+        if cwd:
+            args += ["-w", cwd]
+        args += [self.container_name, "bash", "-lc", command]
+        start = time.monotonic()
+        rc, out, err = await self._run_host(args, timeout=min(timeout_seconds, 600))
+        dur = int((time.monotonic() - start) * 1000)
+        return ShellResult(
+            exit_code=rc,
+            stdout_tail="\n".join(out.splitlines()[-max_output_lines:]),
+            stderr_tail="\n".join(err.splitlines()[-max_output_lines:]),
+            duration_ms=dur,
+        )
+
+    async def start_background(self, command: str, cwd: str | None,
+                               name: str | None) -> BackgroundHandle:
+        if is_destructive(command):
+            raise RuntimeError("denied: destructive command")
+        handle = uuid.uuid4().hex[:12]
+        log_path = f"{SIDECAR_BG_DIR}/{handle}.log"
+        pid_path = f"{SIDECAR_BG_DIR}/{handle}.pid"
+        cwd_clause = f"cd {cwd} && " if cwd else ""
+        # write PID after nohup so we can poll liveness via kill -0 from outside the sidecar
+        launch = (
+            f"{cwd_clause}nohup bash -lc {_shquote(command)} "
+            f"> {log_path} 2>&1 & echo $! > {pid_path}"
+        )
+        rc, _, err = await self._run_host(
+            ["docker", "exec", self.container_name, "bash", "-lc", launch],
+            timeout=30,
+        )
+        if rc != 0:
+            raise RuntimeError(f"background launch failed: {err.strip()}")
+        rc2, pid_out, _ = await self._run_host(
+            ["docker", "exec", self.container_name, "cat", pid_path],
+            timeout=5,
+        )
+        pid = int(pid_out.strip() or "0") if rc2 == 0 else 0
+        h = BackgroundHandle(handle=handle, name=name, command=command, cwd=cwd, pid=pid)
+        self._background[handle] = h
+        return h
+
+    async def read_background(self, handle: str, tail_lines: int) -> dict:
+        h = self._background.get(handle)
+        if h is None:
+            return {"error": "unknown handle", "running": False}
+        rc, out, _ = await self._run_host(
+            ["docker", "exec", self.container_name,
+             "tail", "-n", str(tail_lines), f"{SIDECAR_BG_DIR}/{handle}.log"],
+            timeout=10,
+        )
+        alive_rc, _, _ = await self._run_host(
+            ["docker", "exec", self.container_name, "kill", "-0", str(h.pid)],
+            timeout=5,
+        )
+        return {
+            "handle": handle,
+            "pid": h.pid,
+            "running": alive_rc == 0,
+            "output_tail": out if rc == 0 else "",
+        }
+
+    async def stop_background(self, handle: str, grace_seconds: int) -> dict:
+        h = self._background.get(handle)
+        if h is None:
+            return {"error": "unknown handle"}
+        await self._run_host(
+            ["docker", "exec", self.container_name, "kill", str(h.pid)],
+            timeout=5,
+        )
+        await asyncio.sleep(max(grace_seconds, 1))
+        alive_rc, _, _ = await self._run_host(
+            ["docker", "exec", self.container_name, "kill", "-0", str(h.pid)],
+            timeout=5,
+        )
+        if alive_rc == 0:
+            await self._run_host(
+                ["docker", "exec", self.container_name, "kill", "-9", str(h.pid)],
+                timeout=5,
+            )
+        self._background.pop(handle, None)
+        return {"handle": handle, "stopped": True}
+
+
+def _shquote(s: str) -> str:
+    return "'" + s.replace("'", "'\"'\"'") + "'"
