@@ -31,8 +31,8 @@ from services.sandbox_runner import (
     register_sandbox, get_sandbox, unregister_sandbox,
 )
 from services.verification import (
-    ReportBuilder, VerificationStatus,
-    parse_verifier_result, result_to_status,
+    ReportBuilder, VerificationStatus, VerificationResult,
+    render_verification_markdown,
 )
 
 from services.startup_analysis import (
@@ -752,22 +752,55 @@ async def verify_startup_activity(params: VerifyStartupParams) -> dict:
                     break
         except MaxTurnsExceeded:
             hit_max_turns = True
-        agent_text = str(streamed.final_output) if streamed.final_output else ""
+
+        typed_result: VerificationResult | None = None
+        raw_final = streamed.final_output if streamed.final_output is not None else None
+        if isinstance(raw_final, VerificationResult):
+            typed_result = raw_final
+
         if hit_budget:
             result = "FAIL"
             summary = (
                 "Wall-clock budget exhausted before the verifier emitted a final result. "
-                f"Partial output: {agent_text[:800]}"
+                f"Partial output: {str(raw_final)[:800]}"
             )
         elif hit_max_turns:
             result = "FAIL"
             summary = (
                 f"MaxTurnsExceeded (cap={max_turns}). "
-                f"Partial output: {agent_text[:800]}"
+                f"Partial output: {str(raw_final)[:800]}"
             )
+        elif typed_result is not None:
+            result = typed_result.result
+            summary = render_verification_markdown(typed_result)
+            # Typed result is authoritative at end-of-run. Replace the
+            # streaming-ingest's best-effort entries with the canonical lists
+            # the verifier itself produced.
+            builder.report["commands"] = [
+                {
+                    "command": step.command,
+                    "cwd": step.cwd,
+                    "exit_code": step.exit_code,
+                    "duration_ms": 0,
+                    "stdout_tail": step.outcome[:2000],
+                    "stderr_tail": "",
+                    "denied": False,
+                }
+                for step in typed_result.steps_run
+            ]
+            builder.report["plan_updates"] = [
+                {"iteration": 1, "change_summary": pu.change_summary}
+                for pu in typed_result.plan_updates
+            ]
+            builder.report["blockers"] = [
+                {"kind": b.kind, "detail": b.detail} for b in typed_result.blockers
+            ]
+            if typed_result.final_summary:
+                builder.set_final(typed_result.final_summary)
         else:
-            result = parse_verifier_result(agent_text)
-            summary = agent_text[:2000]
+            result = "FAIL"
+            summary = f"verifier did not return a VerificationResult. Got: {type(raw_final).__name__}"
+
         run_end = _iso_now()
         # report keeps an "attempts" list for FE compatibility; single-run = one entry
         builder.add_attempt(1, run_start, run_end, result, summary=summary)
@@ -964,10 +997,15 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
             max_turns=20,
         )
 
+        # Track the currently-active agent so we can suppress raw text-deltas
+        # from agents with structured output (the deltas would be JSON
+        # fragments of the typed object, which is unreadable for users).
+        current_agent_name = router_agent.name
+
         async for event in result.stream_events():
             if isinstance(event, RawResponsesStreamEvent):
                 delta = getattr(event.data, "delta", None)
-                if isinstance(delta, str) and delta:
+                if isinstance(delta, str) and delta and current_agent_name != "Verifier":
                     await publish(params.session_id, {
                         "type": "text-delta",
                         "textDelta": delta,
@@ -1008,12 +1046,18 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
                     await _append_part(pool, msg_id, part)
 
             elif isinstance(event, AgentUpdatedStreamEvent):
+                current_agent_name = event.new_agent.name
                 await publish(params.session_id, {
                     "type": "data-handoff",
                     "agent": event.new_agent.name,
                 })
 
-        text = str(result.final_output)
+        raw_final = result.final_output
+        if isinstance(raw_final, VerificationResult):
+            # Verifier ran last — render the typed result as markdown for the user.
+            text = render_verification_markdown(raw_final)
+        else:
+            text = str(raw_final)
         final_part = {"type": "text", "text": text}
         await _append_part(pool, msg_id, final_part)
         await publish(params.session_id, final_part)
