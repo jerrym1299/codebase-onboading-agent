@@ -5,6 +5,7 @@ import json
 import os
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from urllib.parse import urlparse
 
 from agents import Runner
 from agents.exceptions import MaxTurnsExceeded
@@ -24,10 +25,12 @@ from activities import (
     consolidate_plan_activity,
     extract_boundaries_activity,
     index_repo_activity,
+    kill_sandbox_activity,
     publish_pipeline_failed_activity,
     resolve_pending_action_activity,
     resolve_pending_actions_activity,
     update_session_status_activity,
+    verify_startup_activity,
 )
 
 from services.chunk_and_embed import AST_PARSERS, chunk_file_list, dump_ast, embed_query
@@ -83,6 +86,8 @@ async def lifespan(app):
             extract_boundaries_activity,
             build_graph_activity,
             consolidate_plan_activity,
+            verify_startup_activity,
+            kill_sandbox_activity,
             update_session_status_activity,
             agent_turn_activity,
             publish_pipeline_failed_activity,
@@ -402,6 +407,17 @@ async def search_exact_endpoint(
 def _compute_repo_set_hash(repo_urls: list[str]) -> str:
     return hashlib.sha256("\n".join(sorted(repo_urls)).encode("utf-8")).hexdigest()
 
+
+def _repo_display_name(repo_url: str) -> str:
+    cleaned = repo_url.rstrip("/")
+    if "://" not in cleaned and ":" in cleaned:
+        path = cleaned.split(":", 1)[1]
+    else:
+        path = urlparse(cleaned).path or cleaned
+    name = path.rstrip("/").split("/")[-1].removesuffix(".git")
+    return name or cleaned
+
+
 @app.post("/sessions")
 async def create_session_endpoint(payload: dict):
     payload = payload or {}
@@ -439,6 +455,53 @@ async def create_session_endpoint(payload: dict):
         task_queue="onboarding-queue",
     )
     return {"session_id": session_id, "repo_urls": repo_urls}
+
+
+@app.get("/sessions/recent")
+async def get_recent_sessions_endpoint(limit: int = 20):
+    limit = max(1, min(limit, 100))
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT
+                s.id,
+                s.status,
+                s.app_plan_hash,
+                s.created_at,
+                s.last_seen_at,
+                COALESCE(
+                    array_agg(sr.repo_url ORDER BY sr.repo_url)
+                        FILTER (WHERE sr.repo_url IS NOT NULL),
+                    '{}'
+                ) AS repo_urls
+            FROM sessions s
+            LEFT JOIN session_repos sr ON sr.session_id = s.id
+            GROUP BY s.id
+            ORDER BY s.last_seen_at DESC, s.created_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = await cur.fetchall()
+
+    sessions = []
+    for row in rows:
+        repo_urls = list(row[5] or [])
+        sessions.append({
+            "session_id": str(row[0]),
+            "status": row[1],
+            "repo_set_hash": row[2],
+            "repos": [
+                {"name": _repo_display_name(repo_url), "url": repo_url}
+                for repo_url in repo_urls
+            ],
+            "repo_names": [_repo_display_name(repo_url) for repo_url in repo_urls],
+            "created_at": row[3].isoformat(),
+            "last_seen_at": row[4].isoformat(),
+        })
+
+    return {"sessions": sessions}
 
 
 @app.get("/sessions/{session_id}")
@@ -738,6 +801,48 @@ async def post_session_startup_recompute_endpoint(session_id: str, payload: dict
     handle = app.state.temporal_client.get_workflow_handle(f"chat-{session_id}")
     await handle.signal("recompute_startup_plan", reason)
     return JSONResponse(status_code=202, content={"status": "recomputing", "session_id": session_id})
+
+
+@app.get("/sessions/{session_id}/startup-verification")
+async def get_session_startup_verification_endpoint(session_id: str):
+    """Verification report for the session's consolidated startup plan."""
+    repo_urls = await get_session_repo_urls(session_id)
+    if not repo_urls:
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
+    plan_hash = await _session_app_plan_hash(session_id)
+    if not plan_hash:
+        return JSONResponse(status_code=404, content={"status": "pending"})
+    plan_row = await get_app_startup_plan_row(plan_hash)
+    if plan_row is None or plan_row.get("verification_status") == "not_started":
+        return JSONResponse(status_code=404, content={"status": "pending"})
+    return {
+        "session_id": session_id,
+        "repo_set_hash": plan_row["repo_set_hash"],
+        "verification_status": plan_row["verification_status"],
+        "verification": plan_row["verification"],
+        "updated_at": plan_row["updated_at"],
+    }
+
+
+@app.post("/sessions/{session_id}/startup-verification/retry")
+async def post_session_startup_verification_retry_endpoint(session_id: str, payload: dict | None = None):
+    reason = ((payload or {}).get("reason") or "").strip()
+    repo_urls = await get_session_repo_urls(session_id)
+    if not repo_urls:
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
+    handle = app.state.temporal_client.get_workflow_handle(f"chat-{session_id}")
+    await handle.signal("retry_verification", reason)
+    return JSONResponse(status_code=202, content={"status": "retrying", "session_id": session_id})
+
+
+@app.delete("/sessions/{session_id}/sandbox")
+async def delete_session_sandbox_endpoint(session_id: str):
+    repo_urls = await get_session_repo_urls(session_id)
+    if not repo_urls:
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
+    handle = app.state.temporal_client.get_workflow_handle(f"chat-{session_id}")
+    await handle.signal("kill_sandbox")
+    return JSONResponse(status_code=202, content={"status": "killing", "session_id": session_id})
 
 
 @app.post("/sessions/{session_id}/startup-plan/export")

@@ -12,11 +12,13 @@ import asyncio
 import base64
 import logging
 import os
+import re
 import shlex
 import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import deque
+from contextvars import ContextVar
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -37,8 +39,19 @@ OUTPUT_MAX_LINES_CAP = 5000
 BG_LOG_MAX_LINES = 5000
 WORKSPACE_DIR = "/workspace"
 LOCAL_REPOS_DIR = "/repos"
+SIDECAR_BG_DIR = "/tmp/bg"
 
 logger = logging.getLogger(__name__)
+
+DESTRUCTIVE_PATTERNS = [
+    re.compile(r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+/"),
+    re.compile(r"\brm\s+-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*\s+/"),
+    re.compile(r":\(\)\s*\{.*\};:"),
+    re.compile(r"\bmkfs\.[a-z0-9]+\b"),
+    re.compile(r"\bdd\s+if=.*of=/dev/(sd|nvme|mmcblk)"),
+    re.compile(r">\s*/dev/sd[a-z]"),
+    re.compile(r"\bshutdown\b|\breboot\b|\bhalt\b|\bpoweroff\b"),
+]
 
 
 def tail_lines(text: str, max_lines: int) -> str:
@@ -48,6 +61,10 @@ def tail_lines(text: str, max_lines: int) -> str:
     kept = lines[-max_lines:]
     dropped = len(lines) - max_lines
     return f"[...truncated {dropped} earlier lines; showing last {max_lines}]\n" + "\n".join(kept)
+
+
+def is_destructive(command: str) -> bool:
+    return any(pattern.search(command) for pattern in DESTRUCTIVE_PATTERNS)
 
 
 @dataclass(frozen=True)
@@ -61,6 +78,16 @@ class CommandResult:
     timed_out: bool
     stdout: str
     stderr: str
+    denied: bool = False
+
+
+@dataclass(frozen=True)
+class ShellResult:
+    exit_code: int
+    stdout_tail: str
+    stderr_tail: str
+    duration_ms: int
+    denied: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,6 +121,15 @@ class BackgroundStopResult:
     signal_used: str
     exit_code: int | None
     lines: list[str]
+
+
+@dataclass(frozen=True)
+class BackgroundHandle:
+    handle: str
+    name: str | None
+    command: str
+    cwd: str | None
+    pid: int
 
 
 class SandboxRunner(ABC):
@@ -141,6 +177,25 @@ class SandboxRunner(ABC):
         grace_seconds: int = 5,
     ) -> BackgroundStopResult:
         raise NotImplementedError
+
+
+current_sandbox: ContextVar[SandboxRunner | None] = ContextVar(
+    "current_sandbox", default=None
+)
+
+_REGISTRY: dict[str, SandboxRunner] = {}
+
+
+def register_sandbox(session_id: str, sandbox: SandboxRunner) -> None:
+    _REGISTRY[session_id] = sandbox
+
+
+def get_sandbox(session_id: str) -> SandboxRunner | None:
+    return _REGISTRY.get(session_id)
+
+
+def unregister_sandbox(session_id: str) -> SandboxRunner | None:
+    return _REGISTRY.pop(session_id, None)
 
 
 @dataclass
@@ -1029,11 +1084,424 @@ esac
         )
 
 
+class DockerSidecarSandbox(SandboxRunner):
+    """Docker-backed verification sandbox kept alive for a session.
+
+    This adapts the startup-verification sidecar into the same runner interface
+    used by local and Daytona execution. The verifier still gets a stable
+    `/repos/<repo_name>` workspace, while the tool layer only talks to
+    `SandboxRunner`.
+    """
+
+    provider = "sidecar"
+
+    def __init__(self, session_id: str, repo_urls: list[str], image: str | None = None):
+        self.session_id = session_id
+        self.repo_urls = repo_urls
+        self.image = image or os.environ.get("VERIFY_SANDBOX_IMAGE", "hobbes-verify-sidecar:latest")
+        self.container_name = f"verify-{session_id}"
+        self._background: dict[str, BackgroundHandle] = {}
+        self._background_command_run_ids: dict[str, str] = {}
+        self._sandbox_run_id: str | None = None
+        self._started = False
+
+    async def _ensure_run(self) -> dict:
+        sandbox_run = await ensure_sandbox_run(
+            self.session_id,
+            provider=self.provider,
+            external_id=self.container_name,
+            metadata={
+                "execution_scope": "docker_sidecar",
+                "container_name": self.container_name,
+                "image": self.image,
+                "repo_root": LOCAL_REPOS_DIR,
+                "repositories": [
+                    {
+                        "repo_url": _safe_repo_url(repo_url),
+                        "local_path": f"{LOCAL_REPOS_DIR}/{_repo_name(repo_url)}",
+                    }
+                    for repo_url in self.repo_urls
+                ],
+            },
+        )
+        self._sandbox_run_id = sandbox_run["id"]
+        return sandbox_run
+
+    async def _run_host(self, args: list[str], timeout: int = 60) -> tuple[int, str, str]:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return 124, "", f"host command timed out after {timeout}s"
+        return (
+            proc.returncode or 0,
+            stdout.decode("utf-8", "replace"),
+            stderr.decode("utf-8", "replace"),
+        )
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        token = os.environ.get("GITHUB_TOKEN", "")
+
+        # Idempotent: remove any leftover container from a previous attempt.
+        await self._run_host(["docker", "rm", "-f", self.container_name], timeout=30)
+        rc, out, err = await self._run_host([
+            "docker", "run", "-d",
+            "--name", self.container_name,
+            "-v", "/var/run/docker.sock:/var/run/docker.sock",
+            "--add-host=host.docker.internal:host-gateway",
+            "-e", f"GITHUB_TOKEN={token}",
+            self.image, "sleep", "infinity",
+        ], timeout=120)
+        if rc != 0:
+            await self._mark_run_failed(err.strip() or out.strip())
+            raise RuntimeError(f"sidecar start failed: {err.strip() or out.strip()}")
+
+        await self._run_host(
+            ["docker", "exec", self.container_name, "mkdir", "-p", LOCAL_REPOS_DIR, SIDECAR_BG_DIR],
+            timeout=30,
+        )
+        for repo_url in self.repo_urls:
+            repo_name = _repo_name(repo_url)
+            clone_url = repo_url
+            if token and repo_url.startswith("https://github.com/"):
+                clone_url = repo_url.replace("https://", f"https://{token}@", 1)
+            rc, _, err = await self._run_host([
+                "docker", "exec", self.container_name,
+                "git", "clone", "--depth", "1", clone_url,
+                f"{LOCAL_REPOS_DIR}/{repo_name}",
+            ], timeout=300)
+            if rc != 0:
+                detail = err.replace(token, "***") if token else err
+                await self._mark_run_failed(detail.strip())
+                raise RuntimeError(f"clone failed for {_safe_repo_url(repo_url)}: {detail.strip()}")
+        self._started = True
+
+    async def _mark_run_failed(self, message: str) -> None:
+        if self._sandbox_run_id is not None:
+            await update_sandbox_run(
+                self._sandbox_run_id,
+                status="failed",
+                metadata={"sidecar_error": message[:1000]},
+            )
+
+    async def cleanup(self) -> dict:
+        stopped = 0
+        for handle in list(self._background.keys()):
+            try:
+                await self.stop_background(handle, grace_seconds=2)
+                stopped += 1
+            except Exception:
+                pass
+        rc, _, _ = await self._run_host(["docker", "rm", "-f", self.container_name], timeout=30)
+        if self._sandbox_run_id is not None:
+            await update_sandbox_run(
+                self._sandbox_run_id,
+                status="cancelled",
+                metadata={"sidecar_removed": rc == 0, "processes_stopped": stopped},
+            )
+        self._started = False
+        return {"processes_stopped": stopped, "sidecar_removed": rc == 0}
+
+    @staticmethod
+    def _sidecar_cwd(cwd: str | None) -> str | None:
+        if not cwd:
+            return None
+        if cwd == WORKSPACE_DIR:
+            return LOCAL_REPOS_DIR
+        if cwd.startswith(f"{WORKSPACE_DIR}/"):
+            return f"{LOCAL_REPOS_DIR}{cwd[len(WORKSPACE_DIR):]}"
+        return cwd
+
+    async def run_shell(
+        self,
+        command: str,
+        cwd: str | None,
+        timeout_seconds: int,
+        max_output_lines: int,
+    ) -> ShellResult:
+        if is_destructive(command):
+            return ShellResult(-1, "", "denied: destructive command", 0, denied=True)
+        await self.start()
+        import time as _time
+
+        args = ["docker", "exec"]
+        sidecar_cwd = self._sidecar_cwd(cwd)
+        if sidecar_cwd:
+            args += ["-w", sidecar_cwd]
+        args += [self.container_name, "bash", "-lc", command]
+        start = _time.monotonic()
+        timeout = max(1, min(int(timeout_seconds), 600))
+        rc, out, err = await self._run_host(args, timeout=timeout)
+        duration_ms = int((_time.monotonic() - start) * 1000)
+        return ShellResult(
+            exit_code=rc,
+            stdout_tail=tail_lines(out, max_output_lines),
+            stderr_tail=tail_lines(err, max_output_lines),
+            duration_ms=duration_ms,
+        )
+
+    async def run_command(
+        self,
+        *,
+        session_id: str,
+        command: str,
+        cwd: str = "",
+        timeout_seconds: int = 30,
+        max_output_lines: int = 200,
+    ) -> CommandResult:
+        if session_id != self.session_id:
+            raise PermissionError("sidecar sandbox belongs to a different session")
+        sandbox_run = await self._ensure_run()
+        command_run = await create_sandbox_command_run(
+            sandbox_run_id=sandbox_run["id"],
+            session_id=session_id,
+            command=command,
+            cwd=cwd,
+            run_kind="command",
+            metadata={"runner_provider": self.provider, "container_name": self.container_name},
+        )
+
+        result = await self.run_shell(command, cwd or None, timeout_seconds, max_output_lines)
+        timed_out = result.exit_code == 124 and "timed out" in result.stderr_tail.lower()
+        if timed_out:
+            status = "timed_out"
+        elif result.denied:
+            status = "failed"
+        elif result.exit_code == 0:
+            status = "complete"
+        else:
+            status = "failed"
+
+        await update_sandbox_command_run(
+            command_run["id"],
+            status=status,
+            exit_code=result.exit_code,
+            timed_out=timed_out,
+            duration_ms=result.duration_ms,
+            stdout_tail=result.stdout_tail,
+            stderr_tail=result.stderr_tail,
+            metadata={"denied": result.denied} if result.denied else None,
+        )
+        return CommandResult(
+            sandbox_run_id=sandbox_run["id"],
+            command_run_id=command_run["id"],
+            command=command,
+            cwd=cwd,
+            exit_code=result.exit_code,
+            duration_ms=result.duration_ms,
+            timed_out=timed_out,
+            stdout=result.stdout_tail,
+            stderr=result.stderr_tail,
+            denied=result.denied,
+        )
+
+    async def start_background(
+        self,
+        command: str,
+        cwd: str | None,
+        name: str | None,
+    ) -> BackgroundHandle:
+        if is_destructive(command):
+            raise RuntimeError("denied: destructive command")
+        await self.start()
+        handle = uuid.uuid4().hex[:12]
+        log_path = f"{SIDECAR_BG_DIR}/{handle}.log"
+        pid_path = f"{SIDECAR_BG_DIR}/{handle}.pid"
+        sidecar_cwd = self._sidecar_cwd(cwd)
+        cwd_clause = f"cd {shlex.quote(sidecar_cwd)} && " if sidecar_cwd else ""
+        launch = (
+            f"{cwd_clause}nohup bash -lc {shlex.quote(command)} "
+            f"> {shlex.quote(log_path)} 2>&1 & echo $! > {shlex.quote(pid_path)}"
+        )
+        rc, _, err = await self._run_host(
+            ["docker", "exec", self.container_name, "bash", "-lc", launch],
+            timeout=30,
+        )
+        if rc != 0:
+            raise RuntimeError(f"background launch failed: {err.strip()}")
+        rc2, pid_out, _ = await self._run_host(
+            ["docker", "exec", self.container_name, "cat", pid_path],
+            timeout=5,
+        )
+        pid = int(pid_out.strip() or "0") if rc2 == 0 else 0
+        background = BackgroundHandle(handle=handle, name=name, command=command, cwd=cwd, pid=pid)
+        self._background[handle] = background
+        return background
+
+    async def start_background_process(
+        self,
+        *,
+        session_id: str,
+        command: str,
+        cwd: str = "",
+        name: str = "",
+    ) -> BackgroundStartResult:
+        if session_id != self.session_id:
+            raise PermissionError("sidecar sandbox belongs to a different session")
+        sandbox_run = await self._ensure_run()
+        background = await self.start_background(command, cwd or None, name or None)
+        command_run = await create_sandbox_command_run(
+            sandbox_run_id=sandbox_run["id"],
+            session_id=session_id,
+            command=command,
+            cwd=cwd,
+            run_kind="background_process",
+            process_handle=background.handle,
+            pid=background.pid,
+            metadata={"runner_provider": self.provider, "container_name": self.container_name},
+        )
+        self._background_command_run_ids[background.handle] = command_run["id"]
+        return BackgroundStartResult(
+            sandbox_run_id=sandbox_run["id"],
+            command_run_id=command_run["id"],
+            handle=background.handle,
+            pid=background.pid,
+            command=background.command,
+            cwd=cwd,
+            name=background.name or command[:40],
+        )
+
+    async def read_background(self, handle: str, tail_lines: int) -> dict:
+        background = self._background.get(handle)
+        if background is None:
+            return {"error": "unknown handle", "running": False}
+        tail_lines = max(1, min(int(tail_lines), BG_LOG_MAX_LINES))
+        rc, out, _ = await self._run_host(
+            ["docker", "exec", self.container_name,
+             "tail", "-n", str(tail_lines), f"{SIDECAR_BG_DIR}/{handle}.log"],
+            timeout=10,
+        )
+        alive_rc, _, _ = await self._run_host(
+            ["docker", "exec", self.container_name, "kill", "-0", str(background.pid)],
+            timeout=5,
+        )
+        return {
+            "handle": handle,
+            "pid": background.pid,
+            "running": alive_rc == 0,
+            "output_tail": out if rc == 0 else "",
+        }
+
+    async def read_background_process_output(
+        self,
+        *,
+        session_id: str,
+        handle: str,
+        tail_lines_count: int = 200,
+    ) -> BackgroundOutputResult:
+        if session_id != self.session_id:
+            raise PermissionError("sidecar sandbox belongs to a different session")
+        background = self._background.get(handle)
+        if background is None:
+            raise ValueError(f"no background process with handle={handle!r}")
+        info = await self.read_background(handle, tail_lines_count)
+        command_run_id = self._background_command_run_ids.get(handle)
+        if command_run_id is None:
+            raise ValueError(f"no command run recorded for handle={handle!r}")
+        lines = (info.get("output_tail") or "").splitlines()
+        status = f"running (pid={background.pid})" if info.get("running") else "exited"
+        await update_sandbox_command_run(
+            command_run_id,
+            status="failed" if not info.get("running") else None,
+            stdout_tail="\n".join(lines),
+        )
+        return BackgroundOutputResult(
+            sandbox_run_id=self._sandbox_run_id or "",
+            command_run_id=command_run_id,
+            handle=handle,
+            command=background.command,
+            cwd=background.cwd or "",
+            status=status,
+            lines=lines,
+        )
+
+    async def stop_background(self, handle: str, grace_seconds: int) -> dict:
+        background = self._background.get(handle)
+        if background is None:
+            return {"error": "unknown handle"}
+        grace_seconds = max(0, min(int(grace_seconds), 60))
+        await self._run_host(
+            ["docker", "exec", self.container_name, "kill", str(background.pid)],
+            timeout=5,
+        )
+        await asyncio.sleep(max(grace_seconds, 1))
+        alive_rc, _, _ = await self._run_host(
+            ["docker", "exec", self.container_name, "kill", "-0", str(background.pid)],
+            timeout=5,
+        )
+        signal_used = "SIGTERM"
+        if alive_rc == 0:
+            signal_used = "SIGTERM then SIGKILL"
+            await self._run_host(
+                ["docker", "exec", self.container_name, "kill", "-9", str(background.pid)],
+                timeout=5,
+            )
+        rc, out, _ = await self._run_host(
+            ["docker", "exec", self.container_name,
+             "tail", "-n", "20", f"{SIDECAR_BG_DIR}/{handle}.log"],
+            timeout=10,
+        )
+        self._background.pop(handle, None)
+        return {
+            "handle": handle,
+            "stopped": True,
+            "signal_used": signal_used,
+            "output_tail": out if rc == 0 else "",
+        }
+
+    async def stop_background_process(
+        self,
+        *,
+        session_id: str,
+        handle: str,
+        grace_seconds: int = 5,
+    ) -> BackgroundStopResult:
+        if session_id != self.session_id:
+            raise PermissionError("sidecar sandbox belongs to a different session")
+        background = self._background.get(handle)
+        if background is None:
+            raise ValueError(f"no background process with handle={handle!r}")
+        command_run_id = self._background_command_run_ids.get(handle)
+        if command_run_id is None:
+            raise ValueError(f"no command run recorded for handle={handle!r}")
+        result = await self.stop_background(handle, grace_seconds)
+        lines = (result.get("output_tail") or "").splitlines()
+        await update_sandbox_command_run(
+            command_run_id,
+            status="cancelled",
+            exit_code=None,
+            stdout_tail="\n".join(lines),
+            stderr_tail="",
+            metadata={"stop_signal": result.get("signal_used", "SIGTERM")},
+        )
+        return BackgroundStopResult(
+            sandbox_run_id=self._sandbox_run_id or "",
+            command_run_id=command_run_id,
+            handle=handle,
+            command=background.command,
+            signal_used=result.get("signal_used", "SIGTERM"),
+            exit_code=None,
+            lines=lines,
+        )
+
+
 _local_runner = LocalSandboxRunner()
 _daytona_runner = DaytonaSandboxRunner()
 
 
 def get_sandbox_runner() -> SandboxRunner:
+    scoped = current_sandbox.get(None)
+    if scoped is not None:
+        return scoped
+
     provider = os.environ.get("SANDBOX_RUNNER_PROVIDER", "local").strip().lower()
     if provider == "local":
         return _local_runner

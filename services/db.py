@@ -74,6 +74,12 @@ SESSION_MIGRATION_SQLS = (
     """,
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS app_plan_hash TEXT",
     "ALTER TABLE sessions DROP COLUMN IF EXISTS repo_url",
+    """ALTER TABLE app_startup_plans
+      ADD COLUMN IF NOT EXISTS verification_status TEXT
+      CHECK (verification_status IN ('not_started','running','passed','blocked','failed'))
+      DEFAULT 'not_started';""",
+    """ALTER TABLE app_startup_plans
+      ADD COLUMN IF NOT EXISTS verification JSONB NOT NULL DEFAULT '{}'::jsonb;""",
 )
 
 
@@ -585,9 +591,9 @@ async def init_schema():
     pool = await get_pool()
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
+            await cur.execute(SCHEMA_SQL)
             for sql in SESSION_MIGRATION_SQLS:
                 await cur.execute(sql)
-            await cur.execute(SCHEMA_SQL)
 
     try:
         async with pool.connection() as conn:
@@ -2059,7 +2065,7 @@ async def upsert_repo_boundaries(
 APP_STARTUP_PLAN_SELECT_SQL = """
     SELECT repo_set_hash, repo_urls, plan_markdown, graph, ambiguities,
            orchestration_findings, analysis_status, model, error,
-           created_at, updated_at
+           created_at, updated_at, verification_status, verification
     FROM app_startup_plans
     WHERE repo_set_hash = %s
 """
@@ -2084,6 +2090,8 @@ async def get_app_startup_plan_row(repo_set_hash: str) -> dict | None:
         "error": row[8],
         "created_at": row[9].isoformat(),
         "updated_at": row[10].isoformat(),
+        "verification_status": row[11],
+        "verification": row[12],
     }
 
 
@@ -2097,12 +2105,18 @@ async def upsert_app_startup_plan(
     analysis_status: str,
     model: str,
     error: str | None,
+    verification_status: str = "not_started",
+    verification: dict | None = None,
 ) -> None:
+    if verification is None:
+        verification = {}
     sql = """
         INSERT INTO app_startup_plans
             (repo_set_hash, repo_urls, plan_markdown, graph, ambiguities,
-             orchestration_findings, analysis_status, model, error, updated_at)
-        VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, %s, NOW())
+             orchestration_findings, analysis_status, model, error,
+             verification_status, verification, updated_at)
+        VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, %s,
+                %s, %s::jsonb, NOW())
         ON CONFLICT (repo_set_hash) DO UPDATE SET
             repo_urls              = EXCLUDED.repo_urls,
             plan_markdown          = EXCLUDED.plan_markdown,
@@ -2112,6 +2126,8 @@ async def upsert_app_startup_plan(
             analysis_status        = EXCLUDED.analysis_status,
             model                  = EXCLUDED.model,
             error                  = EXCLUDED.error,
+            verification_status    = EXCLUDED.verification_status,
+            verification           = EXCLUDED.verification,
             updated_at             = NOW()
     """
     pool = await get_pool()
@@ -2128,5 +2144,24 @@ async def upsert_app_startup_plan(
                 analysis_status,
                 model,
                 error,
+                verification_status,
+                json.dumps(verification),
             ),
+        )
+
+
+async def update_app_startup_plan_verification(
+    repo_set_hash: str,
+    verification_status: str,
+    verification: dict,
+) -> None:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            """UPDATE app_startup_plans
+               SET verification_status = %s,
+                   verification = %s::jsonb,
+                   updated_at = NOW()
+               WHERE repo_set_hash = %s""",
+            (verification_status, json.dumps(verification), repo_set_hash),
         )
