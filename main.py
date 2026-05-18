@@ -23,10 +23,12 @@ from activities import (
     consolidate_plan_activity,
     extract_boundaries_activity,
     index_repo_activity,
+    kill_sandbox_activity,
     publish_pipeline_failed_activity,
     resolve_pending_action_activity,
     resolve_pending_actions_activity,
     update_session_status_activity,
+    verify_startup_activity,
 )
 
 from services.chunk_and_embed import AST_PARSERS, chunk_file_list, dump_ast, embed_query
@@ -75,6 +77,8 @@ async def lifespan(app):
             extract_boundaries_activity,
             build_graph_activity,
             consolidate_plan_activity,
+            verify_startup_activity,
+            kill_sandbox_activity,
             update_session_status_activity,
             agent_turn_activity,
             publish_pipeline_failed_activity,
@@ -528,6 +532,48 @@ async def post_session_startup_recompute_endpoint(session_id: str, payload: dict
     handle = app.state.temporal_client.get_workflow_handle(f"chat-{session_id}")
     await handle.signal("recompute_startup_plan", reason)
     return JSONResponse(status_code=202, content={"status": "recomputing", "session_id": session_id})
+
+
+@app.get("/sessions/{session_id}/startup-verification")
+async def get_session_startup_verification_endpoint(session_id: str):
+    """Verification report for the session's consolidated startup plan."""
+    repo_urls = await get_session_repo_urls(session_id)
+    if not repo_urls:
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
+    plan_hash = await _session_app_plan_hash(session_id)
+    if not plan_hash:
+        return JSONResponse(status_code=404, content={"status": "pending"})
+    plan_row = await get_app_startup_plan_row(plan_hash)
+    if plan_row is None or plan_row.get("verification_status") == "not_started":
+        return JSONResponse(status_code=404, content={"status": "pending"})
+    return {
+        "session_id": session_id,
+        "repo_set_hash": plan_row["repo_set_hash"],
+        "verification_status": plan_row["verification_status"],
+        "verification": plan_row["verification"],
+        "updated_at": plan_row["updated_at"],
+    }
+
+
+@app.post("/sessions/{session_id}/startup-verification/retry")
+async def post_session_startup_verification_retry_endpoint(session_id: str, payload: dict | None = None):
+    reason = ((payload or {}).get("reason") or "").strip()
+    repo_urls = await get_session_repo_urls(session_id)
+    if not repo_urls:
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
+    handle = app.state.temporal_client.get_workflow_handle(f"chat-{session_id}")
+    await handle.signal("retry_verification", reason)
+    return JSONResponse(status_code=202, content={"status": "retrying", "session_id": session_id})
+
+
+@app.delete("/sessions/{session_id}/sandbox")
+async def delete_session_sandbox_endpoint(session_id: str):
+    repo_urls = await get_session_repo_urls(session_id)
+    if not repo_urls:
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
+    handle = app.state.temporal_client.get_workflow_handle(f"chat-{session_id}")
+    await handle.signal("kill_sandbox")
+    return JSONResponse(status_code=202, content={"status": "killing", "session_id": session_id})
 
 
 @app.post("/sessions/{session_id}/startup-plan/export")
