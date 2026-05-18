@@ -68,6 +68,40 @@ URLs are normalised (`rstrip("/")`, deduped, sorted). The session is keyed on `r
 
 ---
 
+### `GET /sessions/recent`
+
+List recent sessions for the recent sessions page. Results are ordered by `last_seen_at` descending, then `created_at` descending.
+
+**Query params**
+
+| Param | Default | Notes |
+|---|---:|---|
+| `limit` | `20` | Clamped to `1..100`. |
+
+**Response**
+```json
+{
+  "sessions": [
+    {
+      "session_id": "uuid",
+      "status": "ready",
+      "repo_set_hash": "<sha256>",
+      "repos": [
+        {
+          "name": "repo-a",
+          "url": "https://github.com/org/repo-a"
+        }
+      ],
+      "repo_names": ["repo-a"],
+      "created_at": "2026-04-17T04:03:27.951813+00:00",
+      "last_seen_at": "2026-04-17T04:05:12.123456+00:00"
+    }
+  ]
+}
+```
+
+---
+
 ### `GET /sessions/{session_id}`
 
 Check session status.

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 from agents import Runner
 from agents.exceptions import MaxTurnsExceeded
@@ -218,6 +219,16 @@ def _compute_repo_set_hash(repo_urls: list[str]) -> str:
     return hashlib.sha256("\n".join(sorted(repo_urls)).encode("utf-8")).hexdigest()
 
 
+def _repo_display_name(repo_url: str) -> str:
+    cleaned = repo_url.rstrip("/")
+    if "://" not in cleaned and ":" in cleaned:
+        path = cleaned.split(":", 1)[1]
+    else:
+        path = urlparse(cleaned).path or cleaned
+    name = path.rstrip("/").split("/")[-1].removesuffix(".git")
+    return name or cleaned
+
+
 @app.post("/sessions")
 async def create_session_endpoint(payload: dict):
     payload = payload or {}
@@ -255,6 +266,53 @@ async def create_session_endpoint(payload: dict):
         task_queue="onboarding-queue",
     )
     return {"session_id": session_id, "repo_urls": repo_urls}
+
+
+@app.get("/sessions/recent")
+async def get_recent_sessions_endpoint(limit: int = 20):
+    limit = max(1, min(limit, 100))
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT
+                s.id,
+                s.status,
+                s.app_plan_hash,
+                s.created_at,
+                s.last_seen_at,
+                COALESCE(
+                    array_agg(sr.repo_url ORDER BY sr.repo_url)
+                        FILTER (WHERE sr.repo_url IS NOT NULL),
+                    '{}'
+                ) AS repo_urls
+            FROM sessions s
+            LEFT JOIN session_repos sr ON sr.session_id = s.id
+            GROUP BY s.id
+            ORDER BY s.last_seen_at DESC, s.created_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = await cur.fetchall()
+
+    sessions = []
+    for row in rows:
+        repo_urls = list(row[5] or [])
+        sessions.append({
+            "session_id": str(row[0]),
+            "status": row[1],
+            "repo_set_hash": row[2],
+            "repos": [
+                {"name": _repo_display_name(repo_url), "url": repo_url}
+                for repo_url in repo_urls
+            ],
+            "repo_names": [_repo_display_name(repo_url) for repo_url in repo_urls],
+            "created_at": row[3].isoformat(),
+            "last_seen_at": row[4].isoformat(),
+        })
+
+    return {"sessions": sessions}
 
 
 @app.get("/sessions/{session_id}")
