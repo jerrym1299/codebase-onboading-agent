@@ -605,7 +605,7 @@ def _ingest_event(ev, builder) -> None:
                         stdout_tail="",
                         stderr_tail="",
                     )
-                elif name == "update_app_startup_plan":
+                elif name in ("update_app_startup_plan", "update_startup_plan"):
                     builder.add_plan_update(
                         iteration=len(builder.report["attempts"]) + 1,
                         change_summary=args.get("change_summary", ""),
