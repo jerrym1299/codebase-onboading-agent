@@ -23,6 +23,7 @@ from services.db import (
 from services.startup_analysis import PLAN_JSON_SCHEMA
 
 from services.event_bus import publish
+from services.sandbox_runner import current_sandbox
 
 _PLAN_VALIDATOR = Draft202012Validator(PLAN_JSON_SCHEMA["schema"])
 
@@ -633,6 +634,27 @@ async def run_shell(
     if not command or not command.strip():
         return "ERROR: command is empty."
 
+    sandbox = current_sandbox.get(None)
+    if sandbox is not None:
+        r = await sandbox.run_shell(command, cwd or None, timeout_seconds, max_output_lines)
+        if r.denied:
+            return (
+                f"$ {command}\n"
+                f"(cwd={cwd or '<default>'}, exit_code={r.exit_code}, "
+                f"duration_ms={r.duration_ms}, timed_out=False, denied=True)\n"
+                f"--- stderr ---\n{r.stderr_tail}"
+            )
+        return _format_shell_result(
+            command=command,
+            cwd=cwd,
+            exit_code=r.exit_code,
+            duration_ms=r.duration_ms,
+            timed_out=False,
+            stdout=r.stdout_tail,
+            stderr=r.stderr_tail,
+            max_output_lines=max_output_lines,
+        )
+
     start = time.monotonic()
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -748,13 +770,28 @@ async def start_background_process(
 
     Returns a handle string plus the pid and command for confirmation.
     """
+    if not command or not command.strip():
+        return "ERROR: command is empty."
+
+    sandbox = current_sandbox.get(None)
+    if sandbox is not None:
+        try:
+            h = await sandbox.start_background(command, cwd or None, name or None)
+        except RuntimeError as e:
+            return f"ERROR: {e}"
+        return (
+            f"Started background process.\n"
+            f"handle: {h.handle}\n"
+            f"pid: {h.pid}\n"
+            f"command: {h.command}\n"
+            f"cwd: {h.cwd or '<default>'}\n"
+            f"Use read_background_process_output(handle) to see what it prints."
+        )
+
     try:
         session_id = current_session_id.get()
     except LookupError:
         return "[start_background_process unavailable: no active session context]"
-
-    if not command or not command.strip():
-        return "ERROR: command is empty."
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -803,6 +840,20 @@ async def read_background_process_output(handle: str, tail_lines: int = 200) -> 
     The response includes process status: running (with pid) or exited
     (with exit code).
     """
+    sandbox = current_sandbox.get(None)
+    if sandbox is not None:
+        tail_lines = max(1, min(int(tail_lines), _BG_LOG_MAX_LINES))
+        info = await sandbox.read_background(handle, tail_lines)
+        if info.get("error"):
+            return f"ERROR: {info['error']}"
+        status = f"running (pid={info['pid']})" if info["running"] else "exited"
+        body = info.get("output_tail") or "<no output yet>"
+        return (
+            f"handle: {handle}\n"
+            f"status: {status}\n"
+            f"--- output ---\n{body}"
+        )
+
     try:
         session_id = current_session_id.get()
     except LookupError:
@@ -849,6 +900,13 @@ async def stop_background_process(handle: str, grace_seconds: int = 5) -> str:
     `read_background_process_output` to inspect the final output afterwards.
     Returns the exit code and the last 20 lines of output.
     """
+    sandbox = current_sandbox.get(None)
+    if sandbox is not None:
+        result = await sandbox.stop_background(handle, grace_seconds)
+        if result.get("error"):
+            return f"ERROR: {result['error']}"
+        return f"handle: {handle}\nstopped: True"
+
     try:
         session_id = current_session_id.get()
     except LookupError:
