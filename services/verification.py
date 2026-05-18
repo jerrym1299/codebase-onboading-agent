@@ -19,13 +19,6 @@ class VerificationStatus(str, Enum):
 ResultToken = Literal["PASS", "PARTIAL", "BLOCKED", "FAIL"]
 
 
-class StepRun(BaseModel):
-    command: str
-    cwd: str | None = None
-    exit_code: int
-    outcome: str = Field(description="One-line description of what the command proved")
-
-
 class PlanUpdateRecord(BaseModel):
     change_summary: str = Field(description="One-line summary of what was changed in the plan")
 
@@ -43,10 +36,14 @@ class Blocker(BaseModel):
 
 
 class VerificationResult(BaseModel):
-    """Structured output the Verifier agent must emit when it finishes."""
+    """Structured assessment the Verifier agent emits when it finishes.
+
+    Note: this object does NOT enumerate commands run — those are captured
+    from the streamed tool-call events by the activity / chat layer. The
+    agent only owns the assessment fields below.
+    """
     task: str = Field(description="One sentence restating what was verified")
     result: ResultToken
-    steps_run: list[StepRun] = Field(default_factory=list)
     findings: str = Field(
         default="",
         description=(
@@ -70,15 +67,41 @@ class VerificationResult(BaseModel):
     )
 
 
-def render_verification_markdown(result: VerificationResult) -> str:
-    """Render a VerificationResult as markdown for chat-time display."""
+def _summarise_outcome(stdout_tail: str, stderr_tail: str, exit_code: int) -> str:
+    """Pick a short, useful one-liner from a captured shell result for display."""
+    for stream in (stdout_tail, stderr_tail):
+        if not stream:
+            continue
+        for line in reversed(stream.splitlines()):
+            line = line.strip()
+            if line:
+                return line[:200]
+    return "no output" if exit_code == 0 else f"exit {exit_code} with no output"
+
+
+def render_verification_markdown(
+    result: VerificationResult,
+    commands: list[dict] | None = None,
+) -> str:
+    """Render a VerificationResult + captured commands as markdown for display.
+
+    `commands` is the streaming-captured shell-command log — entries shaped like
+    `{command, cwd, exit_code, stdout_tail, stderr_tail, denied}`. When passed,
+    a `## Steps run` section is emitted before `## Result`."""
     parts: list[str] = []
     parts.append(f"## Task\n{result.task}")
-    if result.steps_run:
+    if commands:
         parts.append("## Steps run")
-        for i, s in enumerate(result.steps_run, 1):
-            cwd_str = f" (cwd={s.cwd})" if s.cwd else ""
-            parts.append(f"{i}. `{s.command}`{cwd_str} → exit {s.exit_code}, {s.outcome}")
+        for i, c in enumerate(commands, 1):
+            cwd_str = f" (cwd={c['cwd']})" if c.get("cwd") else ""
+            outcome = _summarise_outcome(
+                c.get("stdout_tail") or "",
+                c.get("stderr_tail") or "",
+                int(c.get("exit_code") or 0),
+            )
+            parts.append(
+                f"{i}. `{c.get('command','')}`{cwd_str} → exit {c.get('exit_code','?')} — {outcome}"
+            )
     parts.append(f"## Result\n{result.result}")
     if result.findings:
         parts.append(f"## Findings\n{result.findings}")

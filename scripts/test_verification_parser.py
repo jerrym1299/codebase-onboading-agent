@@ -10,20 +10,14 @@ from services.verification import (
     render_verification_markdown,
 )
 
-# Schema parses from raw dict
+# Schema parses from raw dict — assessment fields only, no steps_run.
 parsed = VerificationResult.model_validate({
     "task": "Verify install + smoke test for p-map",
     "result": "PASS",
-    "steps_run": [
-        {"command": "npm install", "cwd": "/repos/p-map", "exit_code": 0,
-         "outcome": "dependencies installed"},
-        {"command": "npm test", "cwd": "/repos/p-map", "exit_code": 0,
-         "outcome": "50 tests passed"},
-    ],
     "final_summary": "Plan worked as written.",
 })
 assert parsed.result == "PASS"
-assert len(parsed.steps_run) == 2
+assert parsed.findings == ""
 
 # Status mapping
 assert result_to_status("PASS", 1) == VerificationStatus.PASSED
@@ -32,18 +26,32 @@ assert result_to_status("FAIL", 1) == VerificationStatus.RUNNING
 assert result_to_status("FAIL", 0) == VerificationStatus.FAILED
 assert result_to_status("PARTIAL", 0) == VerificationStatus.FAILED
 
-# Markdown renderer covers each conditional section
+# Renderer without commands: no "Steps run" section.
 md = render_verification_markdown(parsed)
-assert "## Task" in md and "## Steps run" in md and "## Result\nPASS" in md
-assert "## Findings" not in md  # absent when result == PASS / no findings
+assert "## Task" in md and "## Result\nPASS" in md
+assert "## Steps run" not in md
+assert "## Findings" not in md
 
+# Renderer with commands: each command rendered with its outcome.
+commands = [
+    {"command": "npm install", "cwd": "/repos/p-map", "exit_code": 0,
+     "stdout_tail": "added 626 packages in 4s", "stderr_tail": ""},
+    {"command": "npm test", "cwd": "/repos/p-map", "exit_code": 0,
+     "stdout_tail": "50 tests passed", "stderr_tail": ""},
+]
+md2 = render_verification_markdown(parsed, commands=commands)
+assert "## Steps run" in md2
+assert "`npm install`" in md2 and "added 626 packages" in md2
+assert "`npm test`" in md2 and "50 tests passed" in md2
+
+# BLOCKED case with blockers.
 blocked = VerificationResult(
     task="Verify hobbesBackend boot",
     result="BLOCKED",
     findings="DATABASE_URL not supplied by the user; cannot synthesize.",
     blockers=[{"kind": "missing_secret", "detail": "DATABASE_URL"}],
 )
-md2 = render_verification_markdown(blocked)
-assert "## Blockers" in md2 and "missing_secret" in md2
+md3 = render_verification_markdown(blocked, commands=[])
+assert "## Blockers" in md3 and "missing_secret" in md3
 
 print("ok")

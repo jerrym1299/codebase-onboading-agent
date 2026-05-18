@@ -772,22 +772,12 @@ async def verify_startup_activity(params: VerifyStartupParams) -> dict:
             )
         elif typed_result is not None:
             result = typed_result.result
-            summary = render_verification_markdown(typed_result)
-            # Typed result is authoritative at end-of-run. Replace the
-            # streaming-ingest's best-effort entries with the canonical lists
-            # the verifier itself produced.
-            builder.report["commands"] = [
-                {
-                    "command": step.command,
-                    "cwd": step.cwd,
-                    "exit_code": step.exit_code,
-                    "duration_ms": 0,
-                    "stdout_tail": step.outcome[:2000],
-                    "stderr_tail": "",
-                    "denied": False,
-                }
-                for step in typed_result.steps_run
-            ]
+            # Streaming-ingested commands are the authoritative shell log — the
+            # agent no longer enumerates them in its typed output. Render the
+            # assessment fields alongside the captured commands.
+            summary = render_verification_markdown(
+                typed_result, commands=builder.report["commands"]
+            )
             builder.report["plan_updates"] = [
                 {"iteration": 1, "change_summary": pu.change_summary}
                 for pu in typed_result.plan_updates
@@ -1001,6 +991,10 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
         # from agents with structured output (the deltas would be JSON
         # fragments of the typed object, which is unreadable for users).
         current_agent_name = router_agent.name
+        # Capture verifier shell commands as they stream so we can include
+        # them in the final rendered markdown — the typed VerificationResult
+        # no longer enumerates them itself.
+        verifier_builder = ReportBuilder()
 
         async for event in result.stream_events():
             if isinstance(event, RawResponsesStreamEvent):
@@ -1013,6 +1007,12 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
 
             elif isinstance(event, RunItemStreamEvent):
                 item = event.item
+
+                # Feed the verifier's shell events into a builder so we can
+                # render the final markdown with the full command log. Safe
+                # for non-verifier turns: _ingest_event ignores unrelated calls.
+                if current_agent_name == "Verifier":
+                    _ingest_event(event, verifier_builder)
 
                 if isinstance(item, ToolCallItem) and event.name == "tool_called":
                     raw = item.raw_item
@@ -1054,8 +1054,11 @@ async def agent_turn_activity(params: AgentTurnParams) -> dict:
 
         raw_final = result.final_output
         if isinstance(raw_final, VerificationResult):
-            # Verifier ran last — render the typed result as markdown for the user.
-            text = render_verification_markdown(raw_final)
+            # Verifier ran last — render the typed assessment plus the
+            # streaming-captured shell commands as markdown for the user.
+            text = render_verification_markdown(
+                raw_final, commands=verifier_builder.report["commands"]
+            )
         else:
             text = str(raw_final)
         final_part = {"type": "text", "text": text}
