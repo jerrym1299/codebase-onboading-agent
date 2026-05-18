@@ -13,7 +13,7 @@ from agents.items import (
 )
 from agents.exceptions import MaxTurnsExceeded
 
-from agent_defs import boundary_extractor_agent, router_agent, consolidator_agent
+from agent_defs import boundary_extractor_agent, router_agent, consolidator_agent, verifier_agent
 from services.boundary_extractor import BoundaryReport, build_developer_prompt
 from services.clone_repo import ensure_repo_dir
 from services.dependency_graph import build_graph
@@ -24,7 +24,15 @@ from services.chunk_and_embed import chunk_file_list
 from services.db import (
     get_app_startup_plan_row, get_pool, get_repo_boundaries_row, get_session_repo_urls,
     get_startup_plan_row, store_chunks, store_dir_summaries, upsert_app_startup_plan,
-    upsert_repo_boundaries, upsert_startup_plan,
+    upsert_repo_boundaries, upsert_startup_plan, update_app_startup_plan_verification,
+)
+from services.sandbox_runner import (
+    DockerSidecarSandbox, current_sandbox,
+    register_sandbox, get_sandbox, unregister_sandbox,
+)
+from services.verification import (
+    ReportBuilder, VerificationStatus,
+    parse_verifier_result, result_to_status,
 )
 
 from services.startup_analysis import (
@@ -102,6 +110,14 @@ class PipelineFailedParams:
     session_id: str
     phase: str
     message: str
+
+
+@dataclass
+class VerifyStartupParams:
+    session_id: str
+    repo_set_hash: str
+    repo_urls: list[str]
+    force: bool = False
 
 
 @dataclass
@@ -540,6 +556,190 @@ async def consolidate_plan_activity(params: ConsolidateParams) -> dict:
     })
 
     return {"status": status, "markdown_len": len(markdown)}
+
+
+def _iso_now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _build_verify_prompt(row: dict, params: "VerifyStartupParams",
+                         iteration: int, max_iters: int, remaining: int) -> str:
+    return (
+        "# Automatic startup verification\n\n"
+        f"You are iteration {iteration} of {max_iters}. Time remaining: {remaining}s.\n"
+        f"session_id: {params.session_id}\n"
+        f"repo_set_hash: {params.repo_set_hash}\n"
+        f"repos cloned in sidecar at /repos/<repo_name>:\n"
+        + "\n".join(f"  - {u}" for u in params.repo_urls) + "\n\n"
+        "Current consolidated app startup plan:\n\n"
+        "```markdown\n"
+        f"{row.get('plan_markdown','')}\n"
+        "```\n"
+    )
+
+
+def _ingest_event(ev, builder) -> None:
+    # Best-effort: map streamed tool-call/tool-output events into the verification report.
+    try:
+        from agents.items import ToolCallItem, ToolCallOutputItem
+    except Exception:
+        return
+    try:
+        if isinstance(ev, RunItemStreamEvent):
+            item = ev.item
+            if isinstance(item, ToolCallItem) and ev.name == "tool_called":
+                raw = item.raw_item
+                name = getattr(raw, "name", "")
+                args_raw = getattr(raw, "arguments", "") or "{}"
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+                except Exception:
+                    args = {}
+                if name == "run_shell":
+                    builder.add_command(
+                        command=args.get("command", ""),
+                        cwd=args.get("cwd"),
+                        exit_code=0,
+                        duration_ms=0,
+                        stdout_tail="",
+                        stderr_tail="",
+                    )
+                elif name == "update_app_startup_plan":
+                    builder.add_plan_update(
+                        iteration=len(builder.report["attempts"]) + 1,
+                        change_summary=args.get("change_summary", ""),
+                    )
+            elif isinstance(item, ToolCallOutputItem) and ev.name == "tool_output":
+                out_raw = item.output
+                # `output` may be a string (formatted shell result) — we only update on dicts
+                if isinstance(out_raw, dict) and "exit_code" in out_raw and builder.report["commands"]:
+                    cmd = builder.report["commands"][-1]
+                    cmd["exit_code"] = out_raw.get("exit_code", 0)
+                    cmd["duration_ms"] = out_raw.get("duration_ms", 0)
+                    cmd["stdout_tail"] = (out_raw.get("stdout_tail") or "")[-2000:]
+                    cmd["stderr_tail"] = (out_raw.get("stderr_tail") or "")[-2000:]
+                    cmd["denied"] = bool(out_raw.get("denied"))
+    except Exception:
+        # ingestion is best-effort — never crash the verify loop because of an event we don't understand
+        pass
+
+
+@activity.defn
+async def verify_startup_activity(params: VerifyStartupParams) -> dict:
+    """Run automatic startup verification in a per-session Docker sidecar.
+
+    Spins up the sidecar, clones repos into it, runs verifier_agent in a
+    bounded loop, persists structured report. On terminal status the sidecar
+    is REGISTERED (kept alive) for chat-time verifier turns. On crash before
+    terminal, the sidecar is torn down."""
+    import time
+
+    max_iters = int(os.environ.get("VERIFY_MAX_ITERATIONS", "2"))
+    budget_seconds = int(os.environ.get("VERIFY_BUDGET_SECONDS", "1200"))
+
+    row = await get_app_startup_plan_row(params.repo_set_hash)
+    if row is None:
+        return {"status": "skipped", "reason": "no consolidated plan"}
+
+    if not params.force and row.get("verification_status") in (
+        VerificationStatus.PASSED.value, VerificationStatus.BLOCKED.value,
+        VerificationStatus.FAILED.value,
+    ):
+        return {"status": "skipped", "reason": "already verified"}
+
+    builder = ReportBuilder()
+    builder.set_status(VerificationStatus.RUNNING)
+    await update_app_startup_plan_verification(
+        params.repo_set_hash, VerificationStatus.RUNNING.value, builder.report)
+    await publish(params.session_id, {
+        "type": "data-verification-started", "repo_set_hash": params.repo_set_hash})
+
+    existing = get_sandbox(params.session_id)
+    if existing is not None and params.force:
+        try:
+            await existing.cleanup()
+        finally:
+            unregister_sandbox(params.session_id)
+
+    sandbox = DockerSidecarSandbox(params.session_id, params.repo_urls)
+    sandbox_token = None
+    session_token = current_session_id.set(params.session_id)
+    deadline = time.monotonic() + budget_seconds
+    final_status = VerificationStatus.FAILED
+    sandbox_started = False
+    reached_terminal = False
+
+    try:
+        await sandbox.start()
+        sandbox_started = True
+        sandbox_token = current_sandbox.set(sandbox)
+
+        for iteration in range(1, max_iters + 1):
+            if time.monotonic() >= deadline:
+                builder.set_final("budget exhausted before iteration could start")
+                final_status = VerificationStatus.FAILED
+                reached_terminal = True
+                break
+            iter_start = _iso_now()
+            developer_prompt = _build_verify_prompt(
+                row, params, iteration, max_iters,
+                remaining=int(deadline - time.monotonic()),
+            )
+            streamed = Runner.run_streamed(verifier_agent, developer_prompt)
+            async for ev in streamed.stream_events():
+                _ingest_event(ev, builder)
+                await update_app_startup_plan_verification(
+                    params.repo_set_hash, VerificationStatus.RUNNING.value, builder.report)
+            agent_text = str(streamed.final_output) if streamed.final_output else ""
+            result = parse_verifier_result(agent_text)
+            iter_end = _iso_now()
+            builder.add_attempt(iteration, iter_start, iter_end, result,
+                                summary=agent_text[:1000])
+            row = await get_app_startup_plan_row(params.repo_set_hash)
+
+            status = result_to_status(result, iterations_remaining=max_iters - iteration)
+            if status in (VerificationStatus.PASSED, VerificationStatus.BLOCKED):
+                final_status = status
+                reached_terminal = True
+                break
+            if iteration == max_iters:
+                final_status = VerificationStatus.FAILED
+                reached_terminal = True
+                break
+    except Exception as exc:
+        builder.set_final(f"verifier raised: {type(exc).__name__}: {exc}")
+        final_status = VerificationStatus.FAILED
+        reached_terminal = False
+    finally:
+        if sandbox_token is not None:
+            current_sandbox.reset(sandbox_token)
+        current_session_id.reset(session_token)
+
+        if reached_terminal and sandbox_started:
+            register_sandbox(params.session_id, sandbox)
+            builder.set_cleanup({"kept_alive": True, "container": sandbox.container_name})
+        else:
+            if sandbox_started:
+                cleanup = await sandbox.cleanup()
+            else:
+                cleanup = {"kept_alive": False, "container": sandbox.container_name,
+                           "sidecar_removed": False, "reason": "never started"}
+            builder.set_cleanup(cleanup)
+
+        builder.set_status(final_status)
+        if not builder.report["final_summary"]:
+            builder.set_final(f"verification {final_status.value}")
+        await update_app_startup_plan_verification(
+            params.repo_set_hash, final_status.value, builder.report)
+        await publish(params.session_id, {
+            "type": "data-verification-finished",
+            "repo_set_hash": params.repo_set_hash,
+            "status": final_status.value,
+        })
+
+    return {"status": final_status.value, "sandbox_kept_alive": reached_terminal and sandbox_started}
+
 
 @activity.defn
 async def publish_pipeline_failed_activity(params: PipelineFailedParams) -> None:
