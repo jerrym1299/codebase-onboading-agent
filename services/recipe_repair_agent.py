@@ -20,6 +20,7 @@ from services.db import (
     list_sandbox_runs_for_session,
     update_sandbox_run,
 )
+from services.github_app import GitHubAppError, GitHubAppService
 from services.sandbox_runner import (
     DaytonaSandboxRunner,
     DockerSidecarSandbox,
@@ -140,9 +141,17 @@ recipe_sandbox_repair_agent = Agent[RecipeRepairAgentResult](
         "Use start_background_process for dev servers, then read logs and stop "
         "the process before finishing. Do not leave background processes running. "
         "Never run destructive commands. Never include raw secrets in output.\n\n"
+        "Hobbes launch plans run dependency setup before service startup. When "
+        "validating Node/JavaScript services, run the appropriate install command "
+        "(`npm install`, `pnpm install`, or `yarn install`) in the service cwd "
+        "before treating missing local binaries such as vite/next/react-scripts "
+        "as blockers. Do not prepend dependency installation to the final service "
+        "command unless the candidate explicitly lacks any separate setup path; "
+        "the revised service command should normally be the steady-state startup "
+        "command only.\n\n"
         "Prefer small, decisive trials:\n"
         "1. Inspect package manifests/config files if observations are insufficient.\n"
-        "2. Run the minimum install/check command required to validate the proposed "
+        "2. Run the minimum setup/check command required to validate the proposed "
         "startup command.\n"
         "3. If validating a dev server, start it in the background, read logs, "
         "optionally curl the local port, then stop it.\n"
@@ -189,7 +198,13 @@ async def run_sandbox_repair_agent(
         "RECIPE_REPAIR_SANDBOX_PROVIDER",
         "sidecar",
     ).strip().lower()
-    sandbox = _sandbox_for_provider(provider, session_id=session_id, repo_url=repo_url)
+    repo_auth_tokens = await _repo_auth_tokens_from_bundle(repair_bundle)
+    sandbox = _sandbox_for_provider(
+        provider,
+        session_id=session_id,
+        repo_url=repo_url,
+        repo_auth_tokens=repo_auth_tokens,
+    )
 
     session_token = current_session_id.set(session_id)
     sandbox_token = current_sandbox.set(sandbox)
@@ -311,6 +326,13 @@ def _build_repair_prompt(
             "must_stop_background_processes": True,
             "do_not_emit_raw_secrets": True,
             "return_full_revised_candidate_when_repaired": True,
+            "dependency_setup_contract": (
+                "Hobbes launch plans run package-manager install steps before "
+                "starting services. During sandbox validation, run the relevant "
+                "install command before treating missing local package binaries "
+                "as terminal blockers. Keep revised service commands focused on "
+                "steady-state startup."
+            ),
         },
     }
     return json.dumps(prompt, sort_keys=True)
@@ -429,6 +451,12 @@ async def _generate_repair_strategy(
             "max_turns": _max_turns(),
             "must_be_decisive": True,
             "do_not_emit_raw_secrets": True,
+            "dependency_setup_contract": (
+                "For Node/JavaScript services, include package-manager install "
+                "as a validation step before startup when node_modules may be "
+                "absent or local binaries are missing. Missing dependencies are "
+                "only a blocker if install fails or requires unavailable secrets."
+            ),
         },
     }
     try:
@@ -447,14 +475,40 @@ async def _generate_repair_strategy(
     raise RecipeRepairAgentError("repair strategy generation did not return a strategy.")
 
 
-def _sandbox_for_provider(provider: str, *, session_id: str, repo_url: str):
+def _sandbox_for_provider(
+    provider: str,
+    *,
+    session_id: str,
+    repo_url: str,
+    repo_auth_tokens: dict[str, str] | None = None,
+):
     if provider == "local":
         return LocalSandboxRunner()
     if provider == "daytona":
-        return DaytonaSandboxRunner()
+        return DaytonaSandboxRunner(repo_auth_tokens=repo_auth_tokens)
     if provider == "sidecar":
         return DockerSidecarSandbox(session_id, [repo_url])
     raise ValueError(f"Unknown RECIPE_REPAIR_SANDBOX_PROVIDER={provider!r}")
+
+
+async def _repo_auth_tokens_from_bundle(repair_bundle: dict[str, Any]) -> dict[str, str]:
+    repo_context = repair_bundle.get("repo_context")
+    if not isinstance(repo_context, dict):
+        return {}
+
+    repo_url = str(repo_context.get("repo_url") or "").strip()
+    installation_id = repo_context.get("github_installation_id")
+    if not repo_url or not installation_id:
+        return {}
+
+    try:
+        token = await GitHubAppService().create_installation_access_token(
+            installation_id,
+            repository_id=repo_context.get("github_repository_id"),
+        )
+    except GitHubAppError:
+        return {}
+    return {repo_url: token.token}
 
 
 async def _create_repair_session(repo_url: str, *, metadata: dict[str, Any]) -> str:

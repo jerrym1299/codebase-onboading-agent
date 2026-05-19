@@ -557,9 +557,11 @@ class DaytonaSandboxRunner(SandboxRunner):
         *,
         sdk_loader: Callable[[], SimpleNamespace] | None = None,
         client_factory: Callable[[], Any] | None = None,
+        repo_auth_tokens: dict[str, str] | None = None,
     ) -> None:
         self._sdk_loader = sdk_loader or _load_daytona_sdk
         self._client_factory = client_factory
+        self._repo_auth_tokens = repo_auth_tokens or {}
 
     def _sdk(self) -> SimpleNamespace:
         return self._sdk_loader()
@@ -721,7 +723,7 @@ class DaytonaSandboxRunner(SandboxRunner):
         return sandbox.process.exec(command, cwd=cwd, env=env, timeout=timeout)
 
     def _clone_repository(self, sandbox: Any, repo_url: str, remote_path: str) -> None:
-        github_token = os.environ.get("GITHUB_TOKEN")
+        github_token = self._repo_auth_tokens.get(repo_url) or os.environ.get("GITHUB_TOKEN")
         env: dict[str, str] | None = None
         setup_prefix = ""
         if github_token and repo_url.startswith("https://") and "github.com" in repo_url:
