@@ -50,6 +50,7 @@ from services.exact_search import build_text_lines
 from services.event_bus import subscribe, unsubscribe
 from services.pdf_output import write_markdown_pdf
 from services.recipe_proposal import RecipeCandidateError, generate_recipe_candidate
+from services.recipe_repair import RecipeRepairError, repair_recipe_candidate
 from services.repo_manifest import build_repo_manifest
 from services.walk_repo import collect_file_paths, walk_repo
 from workflows import CodebaseChatWorkflow
@@ -179,6 +180,25 @@ async def create_repo_recipe_candidate_endpoint(repo_index_id: str, payload: dic
     except RecipeCandidateError as exc:
         return JSONResponse(status_code=409, content={"error": str(exc)})
     return candidate
+
+
+@app.post("/recipe-candidates/repair")
+async def repair_repo_recipe_candidate_endpoint(payload: dict | None = None):
+    payload = payload or {}
+    repair_bundle = payload.get("repair_bundle")
+    metadata = payload.get("metadata")
+    if not isinstance(repair_bundle, dict):
+        return JSONResponse(status_code=400, content={"error": "Missing 'repair_bundle' object."})
+    if metadata is not None and not isinstance(metadata, dict):
+        return JSONResponse(status_code=400, content={"error": "'metadata' must be an object."})
+
+    try:
+        return await repair_recipe_candidate(
+            repair_bundle,
+            metadata=metadata if isinstance(metadata, dict) else None,
+        )
+    except RecipeRepairError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
 @app.get("/walkrepo")
