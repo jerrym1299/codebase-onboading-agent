@@ -68,7 +68,11 @@ services:
       - TEMPORAL_HOST=temporal:7233
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/codebase_agent
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_APP_ID=${GITHUB_APP_ID:-}
+      - GITHUB_APP_PRIVATE_KEY=${GITHUB_APP_PRIVATE_KEY:-}
+      - GITHUB_APP_PRIVATE_KEY_BASE64=${GITHUB_APP_PRIVATE_KEY_BASE64:-}
+      - GITHUB_API_BASE_URL=${GITHUB_API_BASE_URL:-}
       - DAYTONA_API_KEY=${DAYTONA_API_KEY}
       - DAYTONA_JWT_TOKEN=${DAYTONA_JWT_TOKEN}
       - DAYTONA_ORGANIZATION_ID=${DAYTONA_ORGANIZATION_ID}
@@ -88,9 +92,33 @@ services:
     networks:
       - backend
 
+  index-worker:
+    build:
+      context: .
+      dockerfile: dockerfile
+    restart: unless-stopped
+    command: python -m workers.index_worker --poll-seconds ${INDEX_WORKER_POLL_SECONDS:-5}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/codebase_agent
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_APP_ID=${GITHUB_APP_ID:-}
+      - GITHUB_APP_PRIVATE_KEY=${GITHUB_APP_PRIVATE_KEY:-}
+      - GITHUB_APP_PRIVATE_KEY_BASE64=${GITHUB_APP_PRIVATE_KEY_BASE64:-}
+      - GITHUB_API_BASE_URL=${GITHUB_API_BASE_URL:-}
+    volumes:
+      - .:/app
+      - repo_workdirs:/repos
+    networks:
+      - backend
+
 networks:
   backend:
     driver: bridge
 
 volumes:
   postgres_data:
+  repo_workdirs:
