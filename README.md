@@ -169,6 +169,13 @@ The consolidator's markdown now requires seven headings (in order):
 - Per-repo verification is not implemented yet (only app-level).
 - FastAPI `--reload` orphans the sidecar; cleanup happens on next `end_session`.
 
+## Daytona and Repo-Demo E2E
+
+For the current repo-demo indexing, candidate generation, Daytona verification,
+and repair workflows, use [docs/daytona-e2e-workflows.md](docs/daytona-e2e-workflows.md).
+It covers no-cloud local smokes, Docker sidecar repair E2E, live Daytona checks,
+and how HobbesBackend connects to this service during the full UI flow.
+
 
 ## Development Notes
 
