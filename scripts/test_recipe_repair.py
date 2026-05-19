@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import os
 import sys
 from pathlib import Path
@@ -6,8 +7,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 os.environ["RECIPE_REPAIR_DISABLE_LLM"] = "true"
+os.environ["RECIPE_REPAIR_DISABLE_INSPECTION"] = "true"
 
 from services.recipe_repair import (  # noqa: E402
+    _deterministic_repair_from_observations,
     _normalize_repair_response,
     repair_recipe_candidate,
 )
@@ -123,6 +126,40 @@ async def main() -> None:
     )
     assert invalid["status"] == "blocked"
     assert any(b["kind"] == "invalid_repair_output" for b in invalid["blockers"])
+
+    repairable_bundle = copy.deepcopy(BUNDLE)
+    repairable_bundle["candidate"]["package_manager"] = "npm"
+    repairable_bundle["candidate"]["config"]["services"]["frontend"]["command"] = "npm run missing"
+    repairable_bundle["execution"]["error"] = "Missing script: missing"
+    deterministic = _deterministic_repair_from_observations(
+        repairable_bundle,
+        {
+            "enabled": True,
+            "clone_status": "available",
+            "package_manager": "pnpm",
+            "services": [
+                {
+                    "service": "frontend",
+                    "command_script": "missing",
+                    "script_exists": False,
+                    "port": 5173,
+                    "framework_signals": ["vite"],
+                    "recommended_script": {
+                        "script": "dev",
+                        "cwd": "",
+                        "path": "package.json",
+                    },
+                }
+            ],
+        },
+    )
+    assert deterministic is not None
+    assert deterministic["status"] == "repaired"
+    assert "frontend.command" in deterministic["commands_changed"]
+    repaired_service = deterministic["revised_candidate"]["config"]["services"]["frontend"]
+    assert repaired_service["command"] == "pnpm run dev -- --host 0.0.0.0 --port 5173 --strictPort"
+    assert deterministic["revised_candidate"]["package_manager"] == "pnpm"
+    assert deterministic["revised_candidate"]["env_template"]["SECRET_TOKEN"] == ""
 
     print("ok")
 
