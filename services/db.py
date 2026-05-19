@@ -437,6 +437,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE IF EXISTS sessions
+    ADD COLUMN IF NOT EXISTS app_plan_hash TEXT;
+
 CREATE INDEX IF NOT EXISTS sessions_app_plan_hash_idx
     ON sessions (app_plan_hash);
 
@@ -1065,6 +1068,31 @@ async def store_chunks(
     pool = await get_pool()
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
+            if replace:
+                identity_rows = [
+                    (
+                        repo_url,
+                        c.file_path,
+                        c.start_line,
+                        c.chunk_type,
+                        c.name,
+                        c.chunk_sha256,
+                    )
+                    for c in chunks
+                    if c.embedding is not None
+                ]
+                await cur.executemany(
+                    """
+                    DELETE FROM code_chunks
+                    WHERE repo_url = %s
+                      AND file_path = %s
+                      AND start_line = %s
+                      AND chunk_type = %s
+                      AND name IS NOT DISTINCT FROM %s
+                      AND chunk_sha256 IS DISTINCT FROM %s
+                    """,
+                    identity_rows,
+                )
             await cur.executemany(sql, rows)
             if replace:
                 chunk_hashes = [c.chunk_sha256 for c in chunks if c.chunk_sha256]
