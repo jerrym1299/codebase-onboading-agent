@@ -558,6 +558,8 @@ Backend-to-codebase-agent contract used after Daytona candidate verification fai
 
 In `indexing_api.py`, the endpoint is protected by `X-Hobbes-Code-Indexing-Key` when `CODE_INDEXING_API_KEY` is set. The local `main.py` route is unauthenticated, matching the existing local/debug API shape.
 
+Before calling the repair model, the service can clone the repo, inspect `package.json` manifests, compare the failed candidate command against available scripts, and build a deterministic repair baseline when the fix is obvious. When `RECIPE_REPAIR_ENABLE_SANDBOX_AGENT=true`, the endpoint creates an ephemeral repair session, has a strategy agent generate hypotheses from the actual failure evidence, then lets a bounded repair agent inspect files and run commands through the shared `SandboxRunner` abstraction before returning a structured repair decision plus `repair_strategy`, `repair_transcript`, and `candidate_diff` metadata.
+
 **Request**
 ```json
 {
@@ -622,4 +624,12 @@ Repair env vars:
 
 - `RECIPE_REPAIR_MODEL`: model used by the repair agent. Defaults to `RECIPE_CANDIDATE_MODEL`, `RECIPE_PROPOSAL_MODEL`, then `gpt-5.4`.
 - `RECIPE_REPAIR_DISABLE_LLM=true`: disables model repair and returns a safe structured `blocked` response.
+- `RECIPE_REPAIR_DISABLE_INSPECTION=true`: skips repo clone/manifest inspection and relies only on the supplied repair bundle.
+- `RECIPE_REPAIR_MAX_PACKAGE_MANIFESTS`: maximum `package.json` files to inspect per repair attempt. Defaults to `40`.
+- `REPO_WORKDIR`: local clone root used for manifest inspection. Defaults to `/repos`.
+- `RECIPE_REPAIR_ENABLE_SANDBOX_AGENT=true`: enables the sandbox-aware repair agent. Requires `OPENAI_API_KEY`.
+- `RECIPE_REPAIR_SANDBOX_PROVIDER`: sandbox provider for the repair agent: `sidecar`, `daytona`, or `local`. Defaults to `sidecar`.
+- `RECIPE_REPAIR_AGENT_MODEL`: model used by the sandbox repair agent. Defaults to `RECIPE_REPAIR_MODEL`, then `RECIPE_CANDIDATE_MODEL`, then `gpt-5.4`.
+- `RECIPE_REPAIR_AGENT_MAX_TURNS`: maximum tool/agent turns for sandbox repair. Defaults to `24`, capped at `80`.
+- `RECIPE_REPAIR_KEEP_SANDBOX=true`: keeps the repair sandbox/session alive for debugging instead of cleaning up the execution surface.
 - `CODE_INDEXING_API_KEY`: required by `indexing_api.py` when set; backend sends it via `X-Hobbes-Code-Indexing-Key`.
