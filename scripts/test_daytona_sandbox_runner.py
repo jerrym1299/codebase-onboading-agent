@@ -197,7 +197,11 @@ async def main() -> None:
     await init_schema()
     session_id = await create_session()
     client = FakeClient()
-    runner = DaytonaSandboxRunner(sdk_loader=fake_sdk, client_factory=lambda: client)
+    runner = DaytonaSandboxRunner(
+        sdk_loader=fake_sdk,
+        client_factory=lambda: client,
+        repo_auth_tokens={REPO_URL: "repo-token-123"},
+    )
     print(f"created session {session_id}")
 
     try:
@@ -211,6 +215,11 @@ async def main() -> None:
         assert_true(result.exit_code == 0, "daytona one-shot command exits cleanly")
         assert_true("daytona-ok" in result.stdout, "daytona stdout is captured")
         assert_true(client.sandbox.last_command_cwd == "/workspace/widget", "cwd maps to workspace repo path")
+        clone_call = next(call for call in client.sandbox.exec_calls if "git clone" in call["command"])
+        assert_true(
+            clone_call["env"]["GIT_PASSWORD"] == "repo-token-123",
+            "repo-specific clone token is passed to Daytona",
+        )
 
         failed = await runner.run_command(
             session_id=session_id,
