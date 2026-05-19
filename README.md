@@ -189,7 +189,12 @@ The consolidator's markdown now requires seven headings (in order):
   `/explore`, `/search`, and `/search-exact`.
 - Phase 1 indexing job endpoints are `/repo-connections`, `/repo-index-jobs`,
   and `/repo-index-jobs/<job_id>`.
-- Run one queued indexing job locally with
+- Docker Compose starts an `index-worker` service that polls queued
+  `/repo-index-jobs` rows and processes them automatically. For private GitHub
+  App repositories, set `GITHUB_APP_ID` and either
+  `GITHUB_APP_PRIVATE_KEY_BASE64` or `GITHUB_APP_PRIVATE_KEY` in the local
+  `.env` before starting the stack.
+- To process one queued indexing job manually, run
   `python -m workers.index_one --job-id <job_id>` inside the FastAPI runtime.
 - Run `python3 scripts/eval_indexing.py` against the Docker stack to validate
   manifest stability, DB persistence, exact search, and embedding-cache
