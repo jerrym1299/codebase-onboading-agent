@@ -22,6 +22,7 @@ from services.db import (
     init_schema,
 )
 from services.recipe_proposal import RecipeCandidateError, generate_recipe_candidate
+from services.recipe_repair import RecipeRepairError, repair_recipe_candidate
 
 
 API_KEY_HEADER = "X-Hobbes-Code-Indexing-Key"
@@ -149,3 +150,25 @@ async def create_repo_recipe_candidate_endpoint(
     except RecipeCandidateError as exc:
         return JSONResponse(status_code=409, content={"error": str(exc)})
     return candidate
+
+
+@app.post("/recipe-candidates/repair")
+async def repair_repo_recipe_candidate_endpoint(
+    payload: dict | None = None,
+    _auth: None = Depends(require_api_key),
+):
+    payload = payload or {}
+    repair_bundle = payload.get("repair_bundle")
+    metadata = payload.get("metadata")
+    if not isinstance(repair_bundle, dict):
+        return JSONResponse(status_code=400, content={"error": "Missing 'repair_bundle' object."})
+    if metadata is not None and not isinstance(metadata, dict):
+        return JSONResponse(status_code=400, content={"error": "'metadata' must be an object."})
+
+    try:
+        return await repair_recipe_candidate(
+            repair_bundle,
+            metadata=metadata if isinstance(metadata, dict) else None,
+        )
+    except RecipeRepairError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})

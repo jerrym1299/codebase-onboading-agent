@@ -542,9 +542,84 @@ These endpoints predate the session-based flow and are useful for debugging:
 | `POST /repo-connections` | Create or update a tenant-scoped repo connection |
 | `POST /repo-index-jobs` | Create a durable repo indexing job |
 | `GET /repo-index-jobs/{job_id}` | Read indexing job status, metrics, and errors |
+| `POST /repo-indexes/{repo_index_id}/recipe-candidate` | Generate an initial Hobbes repo-demo recipe candidate from a completed index |
+| `POST /recipe-candidates/repair` | Repair or block a failed Hobbes repo-demo recipe candidate from a backend repair bundle |
 | `GET /chunks?repo_url=...` | Chunk + embed a repo, return metadata |
 | `GET /manifest?repo_url=...` | Chunk without embeddings, return/persist file and chunk hashes |
 | `GET /ast?repo_url=...` | Tree-sitter AST dump |
 | `GET /explore?repo_url=...&query=...` | One-shot agent query (no session) |
 | `GET /search?repo_url=...&query=...` | Raw pgvector similarity search |
 | `GET /search-exact?repo_url=...&query=...` | Exact string or regex search over indexed lines |
+
+### `POST /recipe-candidates/repair`
+
+Backend-to-codebase-agent contract used after Daytona candidate verification fails. The Hobbes backend sends the persisted repair bundle from
+`GET /api/daytona/sandboxes/repo-demo/recipes/{recipe_id}/recipe-candidate/repair-bundle`.
+
+In `indexing_api.py`, the endpoint is protected by `X-Hobbes-Code-Indexing-Key` when `CODE_INDEXING_API_KEY` is set. The local `main.py` route is unauthenticated, matching the existing local/debug API shape.
+
+**Request**
+```json
+{
+  "repair_bundle": {
+    "schema_version": 1,
+    "status": "repair_ready",
+    "candidate": { "config": { "services": { "...": "..." } } },
+    "execution": { "status": "failed", "error": "..." },
+    "repo_context": { "repo_url": "https://github.com/org/repo.git" }
+  },
+  "metadata": {
+    "source": "hobbes_backend_repo_demo_candidate_repair",
+    "organization_id": "uuid",
+    "recipe_id": "uuid",
+    "candidate_id": "candidate-uuid",
+    "sandbox_run_id": "uuid"
+  }
+}
+```
+
+**Response**
+```json
+{
+  "status": "repaired",
+  "revised_candidate": {
+    "status": "ok",
+    "package_manager": "npm",
+    "config": {
+      "services": {
+        "frontend": {
+          "command": "npm run dev -- --host 0.0.0.0 --port 5173 --strictPort",
+          "cwd": "",
+          "port": 5173,
+          "primary": true,
+          "preview": true
+        }
+      }
+    },
+    "env_template": {},
+    "demo": {},
+    "warnings": [],
+    "evidence": [],
+    "confidence": 0.82
+  },
+  "change_summary": "Updated the frontend startup command based on sandbox logs.",
+  "commands_changed": ["frontend.command"],
+  "confidence": 0.82,
+  "blockers": [],
+  "evidence": [],
+  "model": "gpt-5.4",
+  "usage": {}
+}
+```
+
+Status semantics:
+
+- `repaired`: `revised_candidate` is present and includes valid `config.services`; backend stores it and re-enables verification.
+- `blocked`: the agent could not safely repair the candidate; `blockers` explains what is missing or unsafe.
+- `no_change`: the agent found no supported candidate change; backend records the attempt without replacing the candidate.
+
+Repair env vars:
+
+- `RECIPE_REPAIR_MODEL`: model used by the repair agent. Defaults to `RECIPE_CANDIDATE_MODEL`, `RECIPE_PROPOSAL_MODEL`, then `gpt-5.4`.
+- `RECIPE_REPAIR_DISABLE_LLM=true`: disables model repair and returns a safe structured `blocked` response.
+- `CODE_INDEXING_API_KEY`: required by `indexing_api.py` when set; backend sends it via `X-Hobbes-Code-Indexing-Key`.
